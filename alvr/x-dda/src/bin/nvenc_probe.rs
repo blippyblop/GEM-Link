@@ -273,12 +273,12 @@ fn run_feeder(seconds: f64, fps: u32, bit10: bool) -> Result<serde_json::Value, 
     for k in 0..2 {
         unsafe {
             fill_frame(&context, &staging, w, h, 10_000 + k, bit10)?;
-            context.CopyResource(&pool[k % pool.len()], &staging);
+            context.CopyResource(&pool[k as usize % pool.len()], &staging);
         }
         let _ = if bit10 {
-            encoder.encode_10bit(unsafe { pool[k % pool.len()].as_raw() }, pitch)
+            encoder.encode_10bit(unsafe { pool[k as usize % pool.len()].as_raw() }, pitch)
         } else {
-            encoder.encode(unsafe { pool[k % pool.len()].as_raw() }, pitch)
+            encoder.encode(unsafe { pool[k as usize % pool.len()].as_raw() }, pitch)
         }
         .map_err(|e| format!("warmup encode failed: {e}"))?;
     }
