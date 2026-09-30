@@ -958,7 +958,7 @@ mod tests {
         let _guard = serial_lock();
         let s = scenario("frame_ncm").unwrap();
         let m = run_loopback(&s, 7, 8).expect("loopback run");
-        assert_eq!(m.negotiation.codec, VideoCodec::Av1);
+        assert_eq!(m.negotiation.codec, VideoCodec::Hevc); // Frame kernel: no AV1 (ADR-0008)
         assert!(m.latency.p50_ms > 0.0 && m.latency.p50_ms <= m.latency.max_ms);
         let json = serde_json::to_string(&m).expect("serialize");
         let back: RunMetrics = serde_json::from_str(&json).expect("deserialize");
