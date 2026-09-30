@@ -284,6 +284,10 @@ fn real_main(args: &[String]) -> Result<(), String> {
             if record {
                 let _ = std::fs::create_dir_all("bench/baselines");
                 let mut baseline = m.clone();
+                baseline["recorded_at"] = serde_json::Value::String(chrono_like_timestamp());
+                baseline["host"] = serde_json::Value::String(
+                    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into()),
+                );
                 if let Ok(existing) = std::fs::read_to_string(&baseline_path) {
                     if let Ok(mut prev) = serde_json::from_str::<serde_json::Value>(&existing) {
                         baseline["history"] = prev["history"].take();
@@ -309,7 +313,7 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 )
                 .map_err(|e| format!("baseline write: {e}"))?;
                 println!(
-                    "RECORDED baseline nvenc_{mode} (history now {hlen} entries) — \
+                    "RECORDED baseline nvenc_{mode} (history now {hlen} entries) - \
                      commit bench/baselines/ so the trend lives in git"
                 );
             } else if baseline_path.exists() {
