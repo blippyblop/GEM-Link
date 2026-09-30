@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "scenario": "quest_pro_wifi6",
   "seed": 42,
   "iterations": 50,
@@ -13,20 +13,22 @@
     "per_eye_width": 1832,
     "per_eye_height": 1920
   },
-  "connect_ms": 0.101869,
+  "connect_ms": 0.09886,
   "latency": {
-    "p50_ms": 12.096573,
-    "p95_ms": 14.151178,
-    "p99_ms": 14.183978,
-    "mean_ms": 12.25250078,
-    "max_ms": 14.183978
+    "p50_ms": 12.201424000000001,
+    "p95_ms": 14.336157,
+    "p99_ms": 14.429326,
+    "mean_ms": 12.387278959999998,
+    "max_ms": 14.429326
   },
   "delivery": {
-    "deadline_ms": 11.11111111111111,
-    "missed_deadline_pct": 76.0,
-    "max_lateness_ms": 3.072866888888889,
+    "mandatory_ms": 11.11111111111111,
+    "optimal_ms": 8.333333333333334,
+    "missed_mandatory_pct": 86.0,
+    "within_optimal_pct": 0.0,
+    "max_lateness_ms": 3.318214888888889,
     "late_over_1frame_pct": 0.0,
-    "best_streak": 3
+    "best_streak": 2
   },
   "events": [],
   "profile": {

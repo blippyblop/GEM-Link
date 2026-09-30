@@ -20,7 +20,7 @@ use std::{
 };
 use x_protocol::{ClientCapabilities, ServerCapabilities, SessionPlan, negotiate, samples};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LOSS_PENALTY_MS: f64 = 12.0;
 
@@ -139,10 +139,13 @@ pub fn profile(name: &str) -> Option<ImpairmentProfile> {
 // Scenarios — (profile × device) pairs. Gating scenarios (ADR-0004: Steam Frame)
 // block merges; informational scenarios record Tier-2 behavior.
 
-/// Per-frame presentation budget. **90 Hz cadence (11.11 ms)** — the primary
-/// metric is not the average, it is how many frames blow this deadline and by
-/// how much. A beautiful mean with 1% late frames is a broken experience.
-pub const FRAME_DEADLINE_MS: f64 = 1000.0 / 90.0;
+/// Per-frame presentation budgets. **90 Hz (11.11 ms) is the MANDATORY
+/// deadline — the gate. 120 Hz (8.33 ms) is the OPTIMAL deadline — the
+/// published target: tracked and trended, not enforced.** The primary metric
+/// is never the average: it is how many frames blow a deadline and by how
+/// much. A beautiful mean with 1% late frames is a broken experience.
+pub const MANDATORY_DEADLINE_MS: f64 = 1000.0 / 90.0;
+pub const OPTIMAL_DEADLINE_MS: f64 = 1000.0 / 120.0;
 
 #[derive(Clone, Debug)]
 pub struct Scenario {
@@ -151,7 +154,10 @@ pub struct Scenario {
     pub client: ClientCapabilities,
     pub server: ServerCapabilities,
     pub gating: bool,
+    /// Mandatory per-frame budget (gate): 90 Hz cadence.
     pub deadline_ms: f64,
+    /// Optimal per-frame budget (target): 120 Hz cadence.
+    pub optimal_ms: f64,
 }
 
 pub fn scenarios() -> Vec<Scenario> {
@@ -172,7 +178,8 @@ pub fn scenarios() -> Vec<Scenario> {
             client,
             server: samples::server(),
             gating,
-            deadline_ms: FRAME_DEADLINE_MS,
+            deadline_ms: MANDATORY_DEADLINE_MS,
+            optimal_ms: OPTIMAL_DEADLINE_MS,
         }
     };
     vec![
@@ -206,28 +213,42 @@ pub struct LatencyStats {
 /// magnitude late.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DeliveryStats {
-    pub deadline_ms: f64,
-    /// % of samples that missed the deadline.
-    pub missed_deadline_pct: f64,
-    /// Worst overshoot past the deadline (0 if none missed).
+    pub mandatory_ms: f64,
+    pub optimal_ms: f64,
+    /// % of samples that missed the MANDATORY deadline. Gate: 0.0 for
+    /// gating scenarios.
+    pub missed_mandatory_pct: f64,
+    /// % of samples that met the OPTIMAL deadline. Tracked, trended,
+    /// published \u{2014} not enforced.
+    pub within_optimal_pct: f64,
+    /// Worst overshoot past the mandatory deadline (0 if none missed).
     pub max_lateness_ms: f64,
-    /// % of samples late by more than a full extra frame (deadline * 2).
+    /// % of samples late by more than a full extra frame (mandatory * 2).
     pub late_over_1frame_pct: f64,
-    /// Longest consecutive run of on-time samples (hitch detector).
+    /// Longest consecutive run of samples within the mandatory deadline
+    /// (hitch detector).
     pub best_streak: usize,
 }
 
-pub fn delivery_stats(samples: &[f64], deadline_ms: f64) -> DeliveryStats {
-    let missed = samples.iter().filter(|s| **s > deadline_ms).count();
-    let over1 = samples.iter().filter(|s| **s > deadline_ms * 2.0).count();
+pub fn delivery_stats(samples: &[f64], mandatory_ms: f64, optimal_ms: f64) -> DeliveryStats {
+    let pct = |n: usize| -> f64 {
+        if samples.is_empty() {
+            0.0
+        } else {
+            n as f64 / samples.len() as f64 * 100.0
+        }
+    };
+    let missed = samples.iter().filter(|s| **s > mandatory_ms).count();
+    let within_opt = samples.iter().filter(|s| **s <= optimal_ms).count();
+    let over1 = samples.iter().filter(|s| **s > mandatory_ms * 2.0).count();
     let max_lateness = samples
         .iter()
-        .map(|s| (s - deadline_ms).max(0.0))
+        .map(|s| (s - mandatory_ms).max(0.0))
         .fold(0.0, f64::max);
     let mut best_streak = 0usize;
     let mut streak = 0usize;
     for s in samples {
-        if *s <= deadline_ms {
+        if *s <= mandatory_ms {
             streak += 1;
             best_streak = best_streak.max(streak);
         } else {
@@ -235,18 +256,12 @@ pub fn delivery_stats(samples: &[f64], deadline_ms: f64) -> DeliveryStats {
         }
     }
     DeliveryStats {
-        deadline_ms,
-        missed_deadline_pct: if samples.is_empty() {
-            0.0
-        } else {
-            missed as f64 / samples.len() as f64 * 100.0
-        },
+        mandatory_ms,
+        optimal_ms,
+        missed_mandatory_pct: pct(missed),
+        within_optimal_pct: pct(within_opt),
         max_lateness_ms: max_lateness,
-        late_over_1frame_pct: if samples.is_empty() {
-            0.0
-        } else {
-            over1 as f64 / samples.len() as f64 * 100.0
-        },
+        late_over_1frame_pct: pct(over1),
         best_streak,
     }
 }
@@ -395,7 +410,7 @@ pub fn run_loopback(scenario: &Scenario, seed: u64, iterations: u32) -> Result<R
         negotiation,
         connect_ms,
         latency: latency_stats(samples.clone()),
-        delivery: delivery_stats(&samples, scenario.deadline_ms),
+        delivery: delivery_stats(&samples, scenario.deadline_ms, scenario.optimal_ms),
         events,
         profile: scenario.profile.clone(),
         gemlink_rev: option_env!("GEMLINK_GIT_REV").unwrap_or("dev").into(),
@@ -594,10 +609,14 @@ pub fn gate(run: &RunMetrics, golden: &RunMetrics) -> Result<(), String> {
         record(
             &mut failures,
             "missed_deadlines",
-            run.delivery.missed_deadline_pct == 0.0,
+            run.delivery.missed_mandatory_pct == 0.0,
             format!(
-                "gating scenario: {:.1}% of frames missed the {:.2} ms deadline",
-                run.delivery.missed_deadline_pct, run.delivery.deadline_ms
+                "gating scenario: {:.1}% missed the mandatory {:.2} ms deadline \
+                 ({:.0}% within the optimal {:.2} ms target)",
+                run.delivery.missed_mandatory_pct,
+                run.delivery.mandatory_ms,
+                run.delivery.within_optimal_pct,
+                run.delivery.optimal_ms
             ),
         );
     }
@@ -739,15 +758,24 @@ mod tests {
     fn delivery_stats_catch_the_one_percent_outlier() {
         let mut samples = vec![2.0; 99];
         samples.push(100.0); // the extreme example: gorgeous average, one bad frame
-        let d = delivery_stats(&samples, 11.11);
-        assert_eq!(d.missed_deadline_pct, 1.0);
-        assert!((d.max_lateness_ms - (100.0 - 11.11)).abs() < 0.01);
+        let d = delivery_stats(&samples, MANDATORY_DEADLINE_MS, OPTIMAL_DEADLINE_MS);
+        assert_eq!(d.missed_mandatory_pct, 1.0);
+        assert!((d.max_lateness_ms - (100.0 - MANDATORY_DEADLINE_MS)).abs() < 0.01);
         assert_eq!(d.late_over_1frame_pct, 1.0);
         assert_eq!(d.best_streak, 99);
+        // the 100 ms outlier also misses the optimal target (2 ms samples hit it)
+        assert_eq!(d.within_optimal_pct, 99.0);
 
-        let clean = delivery_stats(&vec![3.0; 50], 11.11);
-        assert_eq!(clean.missed_deadline_pct, 0.0);
+        let clean = delivery_stats(&vec![3.0; 50], MANDATORY_DEADLINE_MS, OPTIMAL_DEADLINE_MS);
+        assert_eq!(clean.missed_mandatory_pct, 0.0);
         assert_eq!(clean.max_lateness_ms, 0.0);
         assert_eq!(clean.best_streak, 50);
+        // 3 ms is within the 8.33 ms optimal budget
+        assert_eq!(clean.within_optimal_pct, 100.0);
+
+        // between the two budgets: mandatory-clean, optimal-imperfect
+        let mid = delivery_stats(&vec![9.5; 10], MANDATORY_DEADLINE_MS, OPTIMAL_DEADLINE_MS);
+        assert_eq!(mid.missed_mandatory_pct, 0.0);
+        assert_eq!(mid.within_optimal_pct, 0.0);
     }
 }
