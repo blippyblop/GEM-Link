@@ -1,0 +1,34 @@
+name: GemLink Linux CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  x-protocol:
+    name: x-protocol (build, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt -p x-protocol -- --check
+      - name: Build
+        run: cargo build -p x-protocol
+      - name: Clippy
+        run: cargo clippy -p x-protocol -- -D warnings
+      - name: Test
+        run: cargo test -p x-protocol
+
+  windows-gpu-tier:
+    name: Windows GPU tier (placeholder)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Pending self-hosted runner
+        run: echo "Windows GPU runner + bench harness pending. See ROADMAP M0."

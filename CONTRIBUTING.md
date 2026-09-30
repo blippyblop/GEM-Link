@@ -1,13 +1,29 @@
-# Contributing
+# CONTRIBUTING
 
-Everybody is welcome to contribute to ALVR. We have some rules:
+Thanks for helping build a free, open VR streaming stack.
 
-- Be respectful to other people
-- Respect our AI policy (below)
-- Try to adhere to our coding style (below)
-- Big PRs are difficult to review; try to break them into minimum size PRs that if merged would still leave the project in working condition
-- Creating a PR will not guarantee that it will be merged. It could be delayed or dismissed depending on the current state and direction of the project.
-- If you contributed a reasonably sized PR, you can request the contributor role on our Discord server.
+## Legal
+- **DCO sign-off** required on every commit (`git commit -s`): you certify you have the right to contribute under **MIT**. No CLA — we don't want your copyright, just your code.
+- New files: add `SPDX-License-Identifier: MIT`.
+- Don't paste code from proprietary VR software; *parameters and behavior* are fine — see `docs/PRESETS.md` provenance note. Also: GPL/NC-licensed third-party code can't be merged (MIT stays pure) — ideas and APIs fine, code no.
+
+## Engineering rules
+1. Every feature ships with a bench scenario (`bench/`) and a gate (latency/SSIM/stability) — no measurements, no merge.
+2. `cargo fmt` + `cargo clippy -D warnings` clean.
+3. Roadmap work goes in the `x-*` crates; changes to shared upstream crates must be recorded in `PATCHES.md` (one line each — this is our rebase budget).
+4. Encryption, network, and driver code requires a second reviewer once the team has 2+ maintainers.
+5. Determinism: scenarios take seeds; no wall-clock-dependent assertions.
+
+## Process
+1. Open an issue or claim one tagged `good-first-bench`.
+2. PR against `main`; CI must be green (build, clippy, bench gates).
+3. One maintainer review (two for security/driver code).
+
+## Where to start
+See `ROADMAP.md` milestone marked `help-wanted`, and `docs/BENCH.md` for the testing setup.
+
+---
+# Code style & AI policy (inherited from upstream ALVR)
 
 ## AI policy
 We follow roughly the policy of the [`rustc` project](https://rustfoundation.org/policy/internal-ai-usage-policy/).
