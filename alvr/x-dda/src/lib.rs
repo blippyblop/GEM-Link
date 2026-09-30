@@ -289,6 +289,23 @@ impl Duplicator {
     pub fn qpc_freq(&self) -> i64 {
         self.qpc_freq
     }
+
+    /// Raw ID3D11Device pointer for encoder-session registration (NVENC).
+    pub fn device_ptr(&self) -> *mut core::ffi::c_void {
+        unsafe { self.device.as_raw() }
+    }
+
+    /// The capture device, for creating pool textures.
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    /// GPU-to-GPU copy (still zero CPU involvement).
+    pub unsafe fn copy_resource(&self, dst: &ID3D11Texture2D, src: &ID3D11Texture2D) {
+        if let Some(ctx) = &self.context {
+            ctx.CopyResource(dst, src);
+        }
+    }
 }
 
 /// Run a timed capture session: poll at 20 ms (the latency playbook's poll

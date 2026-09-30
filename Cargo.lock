@@ -8165,6 +8165,15 @@ dependencies = [
  "serde",
  "serde_json",
  "windows 0.58.0",
+ "x-nvenc",
+]
+
+[[package]]
+name = "x-nvenc"
+version = "21.0.0-dev14"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

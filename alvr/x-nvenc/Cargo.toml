@@ -1,0 +1,12 @@
+[package]
+name = "x-nvenc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["GemLink contributors"]
+description = "GemLink NVENC plug-in: zero-copy D3D11 texture encoding via the driver-shipped NVENC runtime"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

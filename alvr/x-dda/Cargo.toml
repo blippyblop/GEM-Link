@@ -10,6 +10,7 @@ description = "GemLink zero-copy desktop capture: Desktop Duplication with GPU-r
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+x-nvenc = { path = "../x-nvenc" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
