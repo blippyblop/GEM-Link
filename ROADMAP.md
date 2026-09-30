@@ -25,7 +25,7 @@ with **minimum measured glass-to-glass latency** as the score that outranks all 
 - [x] Identity: GemLink (provisional, ADR-0003); target platform steered (ADR-0003)
 - [ ] `x-protocol` crate: versioned protocol + capability negotiation (`decoders`, `foveation_hw`, `link_class`, `client_os`, `max_fps`, display caps)
 - [ ] CI: Linux tier (build + clippy + bench-loopback) green; Windows GPU tier stub
-- [ ] Bench walk-skeleton: fake-headset speaks current wire protocol; `metrics.json`; 3 impairment profiles modeled on Frame RF reality (`wifi7_160_clean`, `wifi7_regrace`, `ncm_wired`)
+- [x] Bench walk-skeleton: `x-bench` speaks the real control-plane protocol by driving upstream crates; `metrics.json`; 6 scenarios across 5 impairment profiles (`ncm_wired`, `wifi7_160_clean`, `wifi7_regrace`, `cqm_churn`, `wifi6_lan`)
 - **Gate (parity release `v0.1.0`):** fork streams ≥ upstream on identical scenarios
 
 ### M1 — Latency & trust (weeks 5–12)
