@@ -11,7 +11,7 @@ with **minimum measured glass-to-glass latency** as the score that outranks all 
 
 ## Definition of done (project-level)
 
-1. A Steam Frame streams PC VR **and** the Windows desktop from a PC with **SteamVR not installed**.
+1. **VR game streaming through SteamVR is the primary path** (upstream driver architecture, maintained — ADR-0005): a Steam Frame streams PC VR with GemLink as the streamer. Desktop streaming additionally works **without** SteamVR installed as the modular second source.
 2. 2160²-class presets at 90–120 Hz hold inside the 300 Mbps envelope using **gaze-driven foveated encoding** (AV1/HEVC10), fixed foveation as fallback.
 3. Bench-measured glass-to-glass ≤ Steam Link/VR Link on identical hardware and link; no wobble — motion synthesis happens **once, client-side** (never baked into encoded PC frames).
 4. Codec / foveation / bitrate hot-switch mid-session, zero dropped frames; Noise-encrypted transport default-on.
@@ -29,23 +29,24 @@ with **minimum measured glass-to-glass latency** as the score that outranks all 
 - **Gate (parity release `v0.1.0`):** fork streams ≥ upstream on identical scenarios
 
 ### M1 — Latency & trust (weeks 5–12)
+- [ ] **SteamVR source (server_openvr) builds + streams as Source #1** (ADR-0005): upstream driver architecture, GemLink encoder seam behind it, Windows build green in CI
 - [ ] Zero-copy GPU pipeline (DDA texture → encoder, no CPU stage) + per-frame metadata sidecar (timestamps, foveation params, motion vectors)
 - [ ] Noise-XX pairing + AEAD transport, default ON (no plaintext mode)
 - [ ] Realtime priority + high-resolution timer discipline in the capture host
 - [ ] Gaze pipeline: OpenXR eye-gaze (Frame) → predicted foveation centers → encoder per-frame centers
 - **Gate:** measured encode-path drop vs M0; encrypted bench scenario green; foveation tracks scripted gaze ≤ 1 frame behind → `v0.2.0`
 
-### M2 — Desktop mode (weeks 9–20)
+### M2 — Desktop mode (second source plug-in; weeks 9–20)
 - [ ] `x-dda`: DuplicateOutput1 HDR formats, LastPresentTime gating, suspend/resume, protected-content stop, cursor path
 - [ ] `x-idd`: indirect display driver, AddIfNecessary(count), portrait; signing path documented
 - [ ] Multi-monitor + per-session LUID pinning
-- **Gate:** desktop session with SteamVR uninstalled, streamed to Frame → `v0.3.0`
+- **Gate:** desktop session streamed **without SteamVR installed** (the modular second source; the SteamVR path remains primary) → `v0.3.0`
 
 ### M3 — Client & runtime (weeks 15–32) 🚧 long pole
 - [ ] Frame client: OpenXR app on the Frame's bundled SteamVR runtime (aarch64); `client_core` port (wgpu/turnip, V4L2-iris decode path)
 - [ ] ADR: Monado-adopt vs stay-on-Valve-runtime (OpenXR-CTS counter in CI either way); no GPL code merge
 - [ ] Client-side extrapolation (synthesis-once rule): depth/motion-vector assisted, using Phase-1 sidecar
-- **Gate:** GemLink server → Frame client end-to-end with SteamVR absent on PC; CTS count published → `v0.4.0`
+- **Gate:** GemLink server → Frame client end-to-end (SteamVR driver as the PC source); CTS count published → `v0.4.0`
 
 ### M4 — Transport v2 (parallel to M2/M3)
 - [ ] Frame-agnostic typed chunks (video/audio/tracking/events), per-class reliability
