@@ -169,6 +169,87 @@ fn real_main(args: &[String]) -> Result<(), String> {
             let golden = load(&golden_path)?;
             gate(&run, &golden)
         }
+        "nvenc" => {
+            // Windows GPU tier: wraps nvenc_probe (feeder mode = no desktop
+            // needed). Gates: 0% missed mandatory; the 120 Hz optimal target
+            // is published, not enforced.
+            let mut bit10 = false;
+            let mut seconds = 6.0f64;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--bit10" => {
+                        bit10 = true;
+                        i += 1;
+                    }
+                    "--seconds" => {
+                        seconds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(6.0);
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown flag {other:?}")),
+                }
+            }
+            let exe = [
+                "target/release/nvenc_probe.exe",
+                "target/debug/nvenc_probe.exe",
+            ]
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .ok_or("nvenc_probe.exe not found — build it first (x-dda)")?;
+
+            let out = std::process::Command::new(exe)
+                .args([
+                    "--feeder",
+                    "--seconds",
+                    &seconds.to_string(),
+                    "--fps",
+                    "120",
+                ])
+                .args(if bit10 { vec!["--bit10"] } else { vec![] })
+                .output()
+                .map_err(|e| format!("probe spawn failed: {e}"))?;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let json_line = stdout
+                .lines()
+                .rev()
+                .find(|l| l.trim_start().starts('{'))
+                .ok_or_else(|| {
+                    format!(
+                        "probe produced no JSON. stderr: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )
+                })?;
+            let m: serde_json::Value =
+                serde_json::from_str(json_line).map_err(|e| format!("probe JSON parse: {e}"))?;
+
+            let missed = m["delivery_on_processing"]["missed_mandatory_pct"]
+                .as_f64()
+                .ok_or("probe JSON missing delivery stats")?;
+            let optimal = m["delivery_on_processing"]["within_optimal_pct"]
+                .as_f64()
+                .unwrap_or(0.0);
+            let frames = m["frames"].as_u64().unwrap_or(0);
+            let mut failures = Vec::new();
+            if frames == 0 {
+                failures.push("no frames encoded".into());
+            }
+            if missed > 0.0 {
+                failures.push(format!("{missed:.2}% frames missed the mandatory deadline"));
+            }
+            println!(
+                "PASS-CHECK nvenc_{}: frames={frames} missed_mandatory={missed:.2}%                  within_optimal(target, published)={optimal:.1}%",
+                if bit10 { "10bit" } else { "8bit" }
+            );
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} gate(s) failed: {}",
+                    failures.len(),
+                    failures.join("; ")
+                ))
+            }
+        }
         other => Err(format!("unknown command {other:?}\n{}", usage())),
     }
 }

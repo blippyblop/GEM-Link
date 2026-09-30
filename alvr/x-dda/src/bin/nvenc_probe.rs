@@ -215,6 +215,7 @@ fn run_capture(seconds: f64, output: u32, fps: u32) -> Result<serde_json::Value,
     let achieved_fps = frames as f64 / seconds.max(0.001);
     Ok(serde_json::json!({
         "mode": "capture",
+        "hdr_active": x_dda::hdr_active().unwrap_or(false),
         "negotiated_api": api_version_json(encoder.api_version()),
         "resolution": [w, h],
         "frames": frames,

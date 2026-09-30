@@ -313,6 +313,61 @@ impl Duplicator {
     }
 }
 
+/// Is the primary active display currently in HDR (advanced color) mode?
+/// Uses the CCD advanced-color API — this is the gate for the FP16 capture
+/// path (FP16 duplication only exists while HDR is active).
+pub fn hdr_active() -> std::result::Result<bool, String> {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
+        QueryDisplayConfig,
+    };
+    unsafe {
+        let mut path_count = 0u32;
+        let mut mode_count = 0u32;
+        let status =
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count);
+        if status.0 != 0 {
+            return Err(format!("GetDisplayConfigBufferSizes: {:?}", status.0));
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        let status = QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        );
+        if status.0 != 0 {
+            return Err(format!("QueryDisplayConfig: {:?}", status.0));
+        }
+        paths.truncate(path_count as usize);
+        for path in &paths {
+            let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO {
+                header: windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+                    size: std::mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32,
+                    adapterId: path.sourceInfo.adapterId,
+                    id: path.sourceInfo.id,
+                },
+                ..Default::default()
+            };
+            let status = DisplayConfigGetDeviceInfo(&mut info.header as *mut _ as *mut _);
+            if status != 0 {
+                continue;
+            }
+            // AdvancedColorActive is bit 0 of the value/anonymous bitfield.
+            if unsafe { info.Anonymous.Anonymous._bitfield } & 0x1 != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// Run a timed capture session: poll at 20 ms (the latency playbook's poll
 /// cadence), acquire-release immediately, and measure everything.
 pub fn capture_session(
