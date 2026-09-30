@@ -12,7 +12,7 @@ with **minimum measured glass-to-glass latency** as the score that outranks all 
 ## Definition of done (project-level)
 
 1. **VR game streaming through SteamVR is the primary path** (upstream driver architecture, maintained — ADR-0005): a Steam Frame streams PC VR with GemLink as the streamer. Desktop streaming additionally works **without** SteamVR installed as the modular second source.
-2. 2160²-class presets at 90–120 Hz hold inside the 300 Mbps envelope using **gaze-driven foveated encoding** (AV1/HEVC10), fixed foveation as fallback.
+2. 2160²-class presets at 90–120 Hz hold inside the 300 Mbps envelope using **gaze-driven foveated encoding** (HEVC/H.264 on the Frame — its kernel decodes neither AV1 nor 10-bit today, ADR-0008; AV1/10-bit are nice-to-haves), fixed foveation as fallback.
 3. Bench-measured glass-to-glass ≤ Steam Link/VR Link on identical hardware and link; no wobble — motion synthesis happens **once, client-side** (never baked into encoded PC frames).
 4. Codec / foveation / bitrate hot-switch mid-session, zero dropped frames; Noise-encrypted transport default-on.
 5. Wired USB-C NCM reaches the same presets as the lowest-latency profile.

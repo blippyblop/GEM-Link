@@ -291,12 +291,10 @@ pub mod samples {
             protocol_version: PROTOCOL_VERSION,
             hostname: "steam-frame".into(),
             client_os: ClientOs::SteamosVrAarch64,
-            codecs: BTreeSet::from([
-                VideoCodec::H264,
-                VideoCodec::Hevc,
-                VideoCodec::Hevc10Bit,
-                VideoCodec::Av1,
-            ]),
+                        // Kernel decode reality (ADR-0008): no AV1, no 10-bit on the
+            // current kernel. HEVC 8-bit pending device verification; H.264
+            // is the guaranteed floor (and lowest decode latency).
+            codecs: BTreeSet::from([VideoCodec::Hevc, VideoCodec::H264]),
             foveation_hw: FoveationHw::EyeGaze,
             max_fps: 144,
             display: DisplayCaps {
@@ -387,9 +385,11 @@ mod tests {
     use samples::*;
 
     #[test]
-    fn steam_frame_negotiates_av1_gaze_300mbps_wired_first() {
+    fn steam_frame_negotiates_hevc_gaze_300mbps_wired_first() {
         let plan = negotiate(&steam_frame(), &server()).expect("steam frame negotiates");
-        assert_eq!(plan.codec, VideoCodec::Av1);
+        // kernel decode reality: best available is HEVC 8-bit; AV1 must
+        // never be selected for the Frame (ADR-0008)
+        assert_eq!(plan.codec, VideoCodec::Hevc);
         assert_eq!(plan.foveation, FoveationMode::EyeGazeDriven);
         // wired beats Wi-Fi when both exist (definition-of-done #5)
         assert_eq!(plan.link_class, LinkClass::UsbNcm);

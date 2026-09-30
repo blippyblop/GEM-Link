@@ -12,7 +12,7 @@ not our default.
 
 | Device | Tier | Panel | Refresh (Hz) | Codec preference | Foveation | Ceiling bitrate (default / max) | GemLink scenario default |
 |---|---|---|---|---|---|---|---|
-| **Steam Frame** | 1 | 2160² LCD/eye | 72 / 80 / 90 / 120 (144 exp.) | AV1 → HEVC10 → H264 | **EyeGaze** (2× IR cams) | 200 / 500 (H264+HP) | 300 Mbps foveated, AV1, 90–120 Hz (`frame_wifi7_160`, `frame_ncm`) |
+| **Steam Frame** | 1 | 2160² LCD/eye | 72 / 80 / 90 / 120 (144 exp.) | HEVC → H264 (AV1/10-bit: kernel-limited nice-to-have, ADR-0008) | **EyeGaze** (2× IR cams) | 200 / 500 (H264+HP) | 300 Mbps foveated, HEVC/H264, 90–120 Hz (`frame_wifi7_160`, `frame_ncm`) |
 | **Quest Pro** | 2 | ~1832×1920/eye | 72 / 90 | HEVC10 → H264 | EyeGaze | 200 / 200 | 200 Mbps, HEVC10, 90 Hz (`quest_pro_wifi6`) |
 | **Quest 3** | 2 | 2064×2208/eye | 72 / 80 / 90 / 120 | AV1 → HEVC10 → H264 | Fixed | 200 / 200 (H264+HP 500–600) | 200 Mbps, AV1, 90 Hz (`quest3_wifi6`) |
 
