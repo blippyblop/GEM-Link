@@ -267,6 +267,22 @@ fn run_feeder(seconds: f64, fps: u32, bit10: bool) -> Result<serde_json::Value, 
     };
     let pitch = w * if bit10 { 4 } else { 4 };
 
+    // Warmup: the first real frame carries the IDR + SPS/PPS + driver-side
+    // allocations. Encode two untimed frames so timed delivery measures the
+    // steady state, not initialization.
+    for k in 0..2 {
+        unsafe {
+            fill_frame(&context, &staging, w, h, 10_000 + k, bit10)?;
+            context.CopyResource(&pool[k % pool.len()], &staging);
+        }
+        let _ = if bit10 {
+            encoder.encode_10bit(unsafe { pool[k % pool.len()].as_raw() }, pitch)
+        } else {
+            encoder.encode(unsafe { pool[k % pool.len()].as_raw() }, pitch)
+        }
+        .map_err(|e| format!("warmup encode failed: {e}"))?;
+    }
+
     let target_frames = (seconds * fps as f64) as u32;
     let mut proc_times: Vec<f64> = Vec::new();
     let mut bitstream: Vec<f64> = Vec::new();
