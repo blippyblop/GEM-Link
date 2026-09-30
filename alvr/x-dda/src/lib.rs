@@ -300,6 +300,11 @@ impl Duplicator {
         &self.device
     }
 
+    /// The immediate context, for GPU copies and pool management.
+    pub fn context(&self) -> Option<&ID3D11DeviceContext> {
+        self.context.as_ref()
+    }
+
     /// GPU-to-GPU copy (still zero CPU involvement).
     pub unsafe fn copy_resource(&self, dst: &ID3D11Texture2D, src: &ID3D11Texture2D) {
         if let Some(ctx) = &self.context {

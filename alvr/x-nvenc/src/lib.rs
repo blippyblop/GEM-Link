@@ -77,6 +77,7 @@ const NV_ENC_DEVICE_TYPE_DIRECTX: u32 = 0x0;
 const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0x0;
 /// Matches DXGI_FORMAT_B8G8R8A8_UNORM — our DDA/pool texture format.
 const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x0100_0000;
+const NV_ENC_BUFFER_FORMAT_ARGB10: u32 = 0x0200_0000;
 const NV_ENC_PIC_STRUCT_FRAME: u32 = 0x1;
 const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x2;
 const NV_ENC_PIC_FLAG_OUTPUT_SPSPPS: u32 = 0x4;
@@ -404,7 +405,7 @@ pub struct NvEncoder {
     bitstream: *mut c_void,
     width: u32,
     height: u32,
-    registered: Vec<(*mut c_void, *mut c_void)>,
+    registered: Vec<(*mut c_void, u32, *mut c_void)>,
     frame_idx: u32,
 }
 
@@ -524,8 +525,17 @@ impl NvEncoder {
     }
 
     /// Register a GPU texture once; subsequent frames reuse the registration.
-    fn register(&mut self, texture: *mut c_void, pitch: u32) -> Result<*mut c_void, String> {
-        if let Some((_, reg)) = self.registered.iter().find(|(t, _)| *t == texture) {
+    fn register(
+        &mut self,
+        texture: *mut c_void,
+        pitch: u32,
+        buffer_fmt: u32,
+    ) -> Result<*mut c_void, String> {
+        if let Some((_, _, reg)) = self
+            .registered
+            .iter()
+            .find(|(t, f, _)| *t == texture && *f == buffer_fmt)
+        {
             return Ok(*reg);
         }
         unsafe {
@@ -538,7 +548,7 @@ impl NvEncoder {
                 sub_resource_index: 0,
                 resource_to_register: texture,
                 registered_resource: std::ptr::null_mut(),
-                buffer_format: NV_ENC_BUFFER_FORMAT_ARGB,
+                buffer_format: buffer_fmt,
                 buffer_usage: NV_ENC_BUFFER_USAGE_INPUT_IMAGE,
                 p_input_fence_point: std::ptr::null_mut(),
                 chroma_offset: [0; 2],
@@ -552,15 +562,41 @@ impl NvEncoder {
             if status != NV_OK_OR_AGAIN {
                 return Err(format!("RegisterResource failed: {status}"));
             }
-            self.registered.push((texture, rr.registered_resource));
+            self.registered
+                .push((texture, buffer_fmt, rr.registered_resource));
             Ok(rr.registered_resource)
         }
     }
 
-    /// Encode one GPU-resident frame; returns the encoded bitstream bytes.
+    pub fn frames_encoded(&self) -> u32 {
+        self.frame_idx
+    }
+
+    /// The API version the driver's runtime negotiated (raw form: major in
+    /// low byte, minor in bits 24-31).
+    pub fn api_version(&self) -> u32 {
+        self.ver.raw
+    }
+
+    /// ARGB (B8G8R8A8) encode — the default 8-bit path.
     pub fn encode(&mut self, texture: *mut c_void, pitch: u32) -> Result<Vec<u8>, String> {
+        self.encode_with_format(texture, pitch, NV_ENC_BUFFER_FORMAT_ARGB)
+    }
+
+    /// ARGB10 (A2R10G10B10 — matches DXGI R10G10B10A2) — the 10-bit path for
+    /// HEVC Main10 / AV1 10-bit.
+    pub fn encode_10bit(&mut self, texture: *mut c_void, pitch: u32) -> Result<Vec<u8>, String> {
+        self.encode_with_format(texture, pitch, NV_ENC_BUFFER_FORMAT_ARGB10)
+    }
+
+    fn encode_with_format(
+        &mut self,
+        texture: *mut c_void,
+        pitch: u32,
+        buffer_fmt: u32,
+    ) -> Result<Vec<u8>, String> {
         unsafe {
-            let registered = self.register(texture, pitch)?;
+            let registered = self.register(texture, pitch, buffer_fmt)?;
 
             let mut map = MapInputResource {
                 version: self.ver.map_input(),
@@ -593,7 +629,7 @@ impl NvEncoder {
                 input_buffer: map.mapped_resource,
                 output_bitstream: self.bitstream,
                 completion_event: std::ptr::null_mut(),
-                buffer_fmt: NV_ENC_BUFFER_FORMAT_ARGB,
+                buffer_fmt: buffer_fmt,
                 picture_struct: NV_ENC_PIC_STRUCT_FRAME,
                 picture_type: 0,
                 codec_pic_params: [0; 821],
@@ -643,10 +679,6 @@ impl NvEncoder {
             Ok(bytes)
         }
     }
-
-    pub fn frames_encoded(&self) -> u32 {
-        self.frame_idx
-    }
 }
 
 impl Drop for NvEncoder {
@@ -654,7 +686,7 @@ impl Drop for NvEncoder {
         unsafe {
             let unreg_fn: NvEncUnregisterResourceFn =
                 (*self.list).nv_enc_unregister_resource.expect("slot");
-            for (_, reg) in &self.registered {
+            for (_, _, reg) in &self.registered {
                 let _ = unreg_fn(self.session, *reg);
             }
             let destroy_bs_fn: NvEncDestroyBitstreamBufferFn =
