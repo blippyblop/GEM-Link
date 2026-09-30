@@ -51,9 +51,34 @@ jobs:
           done
 
   windows-gpu-tier:
-    name: Windows GPU tier (placeholder)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    name: windows GPU tier (nvenc delivery gates)
+    runs-on: [self-hosted, gpu]
     steps:
-      - name: Pending self-hosted runner
-        run: echo "Windows GPU runner + bench harness pending. See ROADMAP M0."
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Build (portable toolchain, C:\Gemlink\tools)
+        shell: cmd
+        run: |
+          set RUSTUP_HOME=C:\Gemlink\tools\rustup
+          set CARGO_HOME=C:\Gemlink\tools\cargo
+          set PATH=C:\Gemlink\tools\cargo\bin;%PATH%
+          cargo --version
+          cargo build --release -p x-dda --bin nvenc_probe -p x-bench --bin bench
+      - name: Unit tests
+        shell: cmd
+        run: |
+          set RUSTUP_HOME=C:\Gemlink\tools\rustup
+          set CARGO_HOME=C:\Gemlink\tools\cargo
+          set PATH=C:\Gemlink\tools\cargo\bin;%PATH%
+          cargo test -p x-protocol -p x-bench
+      - name: NVENC delivery gates (8-bit)
+        shell: cmd
+        run: |
+          set PATH=C:\Gemlink\tools\cargo\bin;%PATH%
+          target\release\bench.exe nvenc --seconds 6
+      - name: NVENC delivery gates (10-bit)
+        shell: cmd
+        run: |
+          set PATH=C:\Gemlink\tools\cargo\bin;%PATH%
+          target\release\bench.exe nvenc --bit10 --seconds 6
