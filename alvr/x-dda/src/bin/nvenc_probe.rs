@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_MAP_WRITE_DISCARD, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_MAP_WRITE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -121,7 +121,7 @@ unsafe fn fill_frame(
     ten_bit: bool,
 ) -> Result<(), String> {
     let mut mapped = windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE::default();
-    ctx.Map(staging, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+    ctx.Map(staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped))
         .map_err(|e| format!("Map failed: {e}"))?;
     let row_pitch = mapped.RowPitch as usize;
     let base = mapped.pData as *mut u8;
