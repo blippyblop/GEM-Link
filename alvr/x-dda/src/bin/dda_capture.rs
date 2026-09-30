@@ -4,7 +4,7 @@
 #![allow(unsafe_code)]
 
 use std::process::ExitCode;
-use x_dda::{capture_session, Duplicator};
+use x_dda::{Duplicator, capture_session};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,7 +40,10 @@ fn main() -> ExitCode {
     if list_only {
         return ExitCode::SUCCESS;
     }
-    if !outputs.iter().any(|(a, o, _)| *a == adapter && *o == output) {
+    if !outputs
+        .iter()
+        .any(|(a, o, _)| *a == adapter && *o == output)
+    {
         eprintln!("adapter {adapter} output {output} not found — use --list");
         return ExitCode::from(2);
     }

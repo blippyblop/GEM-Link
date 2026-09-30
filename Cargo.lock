@@ -8159,6 +8159,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "x-dda"
+version = "21.0.0-dev14"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "x-protocol"
 version = "21.0.0-dev14"
 dependencies = [

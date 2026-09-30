@@ -18,25 +18,26 @@
 
 use serde::{Deserialize, Serialize};
 use windows::{
-    core::*,
+    Win32::Foundation::{E_FAIL, HMODULE},
     Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
+        ID3D11DeviceContext, ID3D11Texture2D,
     },
     Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
         DXGI_FORMAT_R16G16B16A16_FLOAT,
     },
     Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-        IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_NOT_FOUND,
-        DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
+        CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
+        DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+        IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
     },
     Win32::Media::timeBeginPeriod,
     Win32::System::Performance::QueryPerformanceFrequency,
     Win32::System::Threading::{
-        GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+        GetCurrentProcess, HIGH_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS, SetPriorityClass,
     },
+    core::*,
 };
 
 /// Source pixel formats we accept from the desktop, in preference order
@@ -158,9 +159,14 @@ impl Duplicator {
                         Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
                         Err(e) => return Err(e),
                     };
-                    let desc = output.Desc()?;
+                    let desc = output.GetDesc()?;
                     let name = String::from_utf16_lossy(
-                        &desc.DeviceName.as_wide().to_vec(),
+                        &desc
+                            .DeviceName
+                            .iter()
+                            .copied()
+                            .take_while(|c: &u16| *c != 0)
+                            .collect::<Vec<u16>>(),
                     );
                     out.push((ai, oi, name));
                 }
@@ -188,11 +194,13 @@ impl Duplicator {
                 None,
                 D3D11_SDK_VERSION,
                 Some(&mut device),
-                Some(&mut context),
                 None,
+                Some(&mut context),
             )?;
             let device = device.ok_or(Error::from(E_FAIL))?;
 
+            // (windows-rs 0.58 parameter order: ppdevice, pfeaturelevel,
+            // ppimmediatecontext — the context comes LAST)
             let duplication: IDXGIOutputDuplication = match output.cast::<IDXGIOutput5>() {
                 Ok(output5) => output5.DuplicateOutput1(&device, 0, &SOURCE_FORMATS)?,
                 Err(_) => {
@@ -215,11 +223,7 @@ impl Duplicator {
     }
 
     pub fn desc(&self) -> Result<DXGI_OUTDUPL_DESC> {
-        let mut desc = DXGI_OUTDUPL_DESC::default();
-        unsafe {
-            self.duplication.GetDesc(&mut desc);
-        }
-        Ok(desc)
+        Ok(unsafe { self.duplication.GetDesc() })
     }
 
     pub fn desktop_desc(&self) -> Result<DesktopDesc> {
@@ -239,7 +243,11 @@ impl Duplicator {
     pub unsafe fn acquire(&self, timeout_ms: u32) -> Result<Option<AcquiredFrame>> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        match self.duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
+        let acquired = unsafe {
+            self.duplication
+                .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
+        };
+        match acquired {
             Ok(()) => {}
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
             Err(e) => return Err(e),
