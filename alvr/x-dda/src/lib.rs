@@ -319,9 +319,8 @@ impl Duplicator {
 pub fn hdr_active() -> std::result::Result<bool, String> {
     use windows::Win32::Devices::Display::{
         DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO,
-        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
-        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
-        QueryDisplayConfig,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DisplayConfigGetDeviceInfo,
+        GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
     };
     unsafe {
         let mut path_count = 0u32;

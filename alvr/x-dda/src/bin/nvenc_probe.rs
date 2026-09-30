@@ -36,6 +36,34 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[idx - 1]
 }
 
+/// Full distribution — raw numbers are the point: gates say "acceptable",
+/// trends say "excellent".
+fn stats_json(v: &[f64]) -> serde_json::Value {
+    let mut sorted: Vec<f64> = v.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let n = sorted.len();
+    let mean = if n == 0 {
+        0.0
+    } else {
+        sorted.iter().sum::<f64>() / n as f64
+    };
+    let var = if n == 0 {
+        0.0
+    } else {
+        sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64
+    };
+    serde_json::json!({
+        "mean": mean,
+        "p50": percentile(&sorted, 0.50),
+        "p90": percentile(&sorted, 0.90),
+        "p95": percentile(&sorted, 0.95),
+        "p99": percentile(&sorted, 0.99),
+        "max": sorted.last().copied().unwrap_or(0.0),
+        "stdev": var.sqrt(),
+        "n": n,
+    })
+}
+
 fn stats(mut v: Vec<f64>) -> (f64, f64, f64) {
     v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
@@ -160,7 +188,6 @@ fn run_capture(seconds: f64, output: u32, fps: u32) -> Result<serde_json::Value,
         NvEncoder::new(dup.device_ptr(), w, h, fps).map_err(|e| format!("nvenc session: {e}"))?;
     let pool = create_pool(dup.device(), w, h, DXGI_FORMAT_B8G8R8A8_UNORM)?;
     let pitch = w * 4;
-    let ctx = dup.context().ok_or("no device context")?.clone();
 
     let deadline = Instant::now() + Duration::from_secs_f64(seconds);
     let mut wait_times: Vec<f64> = Vec::new();
@@ -207,9 +234,9 @@ fn run_capture(seconds: f64, output: u32, fps: u32) -> Result<serde_json::Value,
         pool_idx = (pool_idx + 1) % pool.len();
     }
 
-    let (wm, w95, wmax) = stats(wait_times);
+    let (wm, w95, wmax) = stats(wait_times.clone());
     let (pm, p95, pmax) = stats(proc_times.clone());
-    let (cm, _, _) = stats(cadence);
+    let (cm, _, _) = stats(cadence.clone());
     let (bm, _, _) = stats(bitstream.clone());
     let (missed, optimal) = delivery(&proc_times);
     let achieved_fps = frames as f64 / seconds.max(0.001);
@@ -220,9 +247,9 @@ fn run_capture(seconds: f64, output: u32, fps: u32) -> Result<serde_json::Value,
         "resolution": [w, h],
         "frames": frames,
         "empty_polls": empty_polls,
-        "acquire_wait_ms": {"mean": wm, "p95": w95, "max": wmax},
-        "processing_ms": {"mean": pm, "p95": p95, "max": pmax},
-        "source_cadence_ms": cm,
+        "acquire_wait_ms": stats_json(&wait_times),
+        "processing_ms": stats_json(&proc_times),
+        "source_cadence_ms": stats_json(&cadence),
         "delivery_on_processing": {"missed_mandatory_pct": missed, "within_optimal_pct": optimal},
         "mean_bitstream_bytes": bm,
         "achieved_fps": achieved_fps,
@@ -288,18 +315,30 @@ fn run_feeder(seconds: f64, fps: u32, bit10: bool) -> Result<serde_json::Value, 
     let mut bitstream: Vec<f64> = Vec::new();
     let mut pool_idx = 0usize;
 
+    let mut fill_times: Vec<f64> = Vec::new();
+    let mut copy_times: Vec<f64> = Vec::new();
+    let mut encode_times: Vec<f64> = Vec::new();
     for t in 0..target_frames {
         let t0 = Instant::now();
         unsafe {
             fill_frame(&context, &staging, w, h, t, bit10)?;
+        }
+        fill_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+
+        let t1 = Instant::now();
+        unsafe {
             context.CopyResource(&pool[pool_idx], &staging);
         }
+        copy_times.push(t1.elapsed().as_secs_f64() * 1000.0);
+
+        let t2 = Instant::now();
         let bytes = if bit10 {
             encoder.encode_10bit(unsafe { pool[pool_idx].as_raw() }, pitch)
         } else {
             encoder.encode(unsafe { pool[pool_idx].as_raw() }, pitch)
         }
         .map_err(|e| format!("encode failed: {e}"))?;
+        encode_times.push(t2.elapsed().as_secs_f64() * 1000.0);
         proc_times.push(t0.elapsed().as_secs_f64() * 1000.0);
         bitstream.push(bytes.len() as f64);
         pool_idx = (pool_idx + 1) % pool.len();
@@ -312,10 +351,13 @@ fn run_feeder(seconds: f64, fps: u32, bit10: bool) -> Result<serde_json::Value, 
     let elapsed = target_frames as f64 / fps.max(1) as f64;
     Ok(serde_json::json!({
         "mode": if bit10 { "feeder_10bit" } else { "feeder_8bit" },
+        "encode_ms": stats_json(&encode_times),
+        "fill_ms": stats_json(&fill_times),
+        "copy_ms": stats_json(&copy_times),
         "negotiated_api": api_version_json(encoder.api_version()),
         "resolution": [w, h],
         "frames": target_frames,
-        "processing_ms": {"mean": pm, "p95": p95, "max": pmax},
+        "processing_ms": stats_json(&proc_times),
         "delivery_on_processing": {"missed_mandatory_pct": missed, "within_optimal_pct": optimal},
         "mean_bitstream_bytes": bm,
         "achieved_fps": target_frames as f64 / elapsed.max(0.001),

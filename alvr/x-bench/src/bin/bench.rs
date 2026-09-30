@@ -13,6 +13,31 @@ use x_bench::{
     RunMetrics, compare, gate, parse_gate, run_loopback, scenario, scenarios, write_run,
 };
 
+fn chrono_like_timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let days = secs / 86400;
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 10 { y + 1 } else { y };
+    let rem = secs % 86400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
 fn usage() -> String {
     "usage:\n\
      bench run <scenario> [--seed N] [--iterations N] [--out DIR]\n\
@@ -170,11 +195,13 @@ fn real_main(args: &[String]) -> Result<(), String> {
             gate(&run, &golden)
         }
         "nvenc" => {
-            // Windows GPU tier: wraps nvenc_probe (feeder mode = no desktop
-            // needed). Gates: 0% missed mandatory; the 120 Hz optimal target
-            // is published, not enforced.
+            // Windows GPU tier, device-neutral scenarios (server capability).
+            // Gates: 0% missed mandatory. Everything else is RAW NUMBERS for
+            // trend monitoring: --record checkpoints a baseline, every other
+            // run prints deltas vs it and WARNs on >15% mean regressions.
             let mut bit10 = false;
             let mut seconds = 6.0f64;
+            let mut record = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -185,6 +212,10 @@ fn real_main(args: &[String]) -> Result<(), String> {
                     "--seconds" => {
                         seconds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(6.0);
                         i += 2;
+                    }
+                    "--record" => {
+                        record = true;
+                        i += 1;
                     }
                     other => return Err(format!("unknown flag {other:?}")),
                 }
@@ -222,6 +253,7 @@ fn real_main(args: &[String]) -> Result<(), String> {
             let m: serde_json::Value =
                 serde_json::from_str(json_line).map_err(|e| format!("probe JSON parse: {e}"))?;
 
+            let mode = if bit10 { "10bit" } else { "8bit" };
             let missed = m["delivery_on_processing"]["missed_mandatory_pct"]
                 .as_f64()
                 .ok_or("probe JSON missing delivery stats")?;
@@ -229,6 +261,7 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 .as_f64()
                 .unwrap_or(0.0);
             let frames = m["frames"].as_u64().unwrap_or(0);
+
             let mut failures = Vec::new();
             if frames == 0 {
                 failures.push("no frames encoded".into());
@@ -236,9 +269,89 @@ fn real_main(args: &[String]) -> Result<(), String> {
             if missed > 0.0 {
                 failures.push(format!("{missed:.2}% frames missed the mandatory deadline"));
             }
+
+            let baseline_path =
+                std::path::PathBuf::from(format!("bench/baselines/nvenc_{mode}.json"));
+            let tracked = [
+                ("encode_ms.mean", "/encode_ms/mean"),
+                ("encode_ms.p95", "/encode_ms/p95"),
+                ("encode_ms.p99", "/encode_ms/p99"),
+                ("encode_ms.max", "/encode_ms/max"),
+                ("processing_ms.mean", "/processing_ms/mean"),
+                ("processing_ms.p95", "/processing_ms/p95"),
+                ("processing_ms.p99", "/processing_ms/p99"),
+            ];
+            if record {
+                let _ = std::fs::create_dir_all("bench/baselines");
+                let mut baseline = m.clone();
+                if let Ok(existing) = std::fs::read_to_string(&baseline_path) {
+                    if let Ok(mut prev) = serde_json::from_str::<serde_json::Value>(&existing) {
+                        baseline["history"] = prev["history"].take();
+                    }
+                }
+                let mut hist_array = match baseline["history"].take() {
+                    serde_json::Value::Array(a) => a,
+                    _ => Vec::new(),
+                };
+                hist_array.push(serde_json::json!({
+                    "recorded_at": chrono_like_timestamp(),
+                    "encode_ms_mean": m["encode_ms"]["mean"],
+                    "processing_ms_mean": m["processing_ms"]["mean"],
+                }));
+                let hlen = hist_array.len();
+                if hlen > 20 {
+                    hist_array = hist_array.split_off(hlen - 20);
+                }
+                baseline["history"] = serde_json::Value::Array(hist_array);
+                std::fs::write(
+                    &baseline_path,
+                    serde_json::to_string_pretty(&baseline).unwrap(),
+                )
+                .map_err(|e| format!("baseline write: {e}"))?;
+                println!(
+                    "RECORDED baseline nvenc_{mode} (history now {hlen} entries) — \
+                     commit bench/baselines/ so the trend lives in git"
+                );
+            } else if baseline_path.exists() {
+                let prev: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(&baseline_path)
+                        .map_err(|e| format!("baseline read: {e}"))?,
+                )
+                .map_err(|e| format!("baseline parse: {e}"))?;
+                println!(
+                    "RAW NUMBERS nvenc_{mode} (vs baseline of {}):",
+                    prev["recorded_at"].as_str().unwrap_or("?")
+                );
+                for (name, ptr) in tracked {
+                    let cur = m.pointer(ptr).and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+                    let base = prev
+                        .pointer(ptr)
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(f64::NAN);
+                    if base.is_nan() || cur.is_nan() {
+                        continue;
+                    }
+                    let delta_pct = if base > 0.0 {
+                        (cur - base) / base * 100.0
+                    } else {
+                        f64::NAN
+                    };
+                    let flag = if delta_pct > 15.0 {
+                        "  <-- REGRESSION?"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  {name:22} cur {cur:8.3}  base {base:8.3}  delta {delta_pct:+7.1}%{flag}"
+                    );
+                }
+            } else {
+                println!("no baseline for nvenc_{mode} yet — run with --record to start tracking");
+            }
+
             println!(
-                "PASS-CHECK nvenc_{}: frames={frames} missed_mandatory={missed:.2}%                  within_optimal(target, published)={optimal:.1}%",
-                if bit10 { "10bit" } else { "8bit" }
+                "PASS-CHECK nvenc_{mode}: frames={frames} missed_mandatory={missed:.2}% \
+                 within_optimal(published)={optimal:.1}%"
             );
             if failures.is_empty() {
                 Ok(())
