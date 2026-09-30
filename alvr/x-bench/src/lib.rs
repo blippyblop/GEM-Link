@@ -717,19 +717,19 @@ fn secure_client_side(
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
-    let local = Identity::generate().map_err(|e| e)?;
+    let local = Identity::generate().map_err(|e| e.to_string())?;
     let mut hs = Handshake::new(
         HandshakeRole::Initiator,
         &local,
         &[], // peer pin exchanged via pairing store; empty in bench
     )
-    .map_err(|e| e)?;
+    .map_err(|e| e.to_string())?;
 
     let hs_start = Instant::now();
     let _ = hs_start;
     // msg1
     let mut buf = vec![0u8; 512];
-    let n = hs.write(&mut buf).map_err(|e| e)?;
+    let n = hs.write(&mut buf).map_err(|e| e.to_string())?;
     stream
         .write_all(&(n as u32).to_le_bytes())
         .map_err(|e| e.to_string())?;
@@ -741,16 +741,16 @@ fn secure_client_side(
     stream
         .read_exact(&mut buf[..n])
         .map_err(|e| e.to_string())?;
-    hs.read(&buf[..n]).map_err(|e| e)?;
+    hs.read(&buf[..n]).map_err(|e| e.to_string())?;
     // msg3
-    let n = hs.write(&mut buf).map_err(|e| e)?;
+    let n = hs.write(&mut buf).map_err(|e| e.to_string())?;
     stream
         .write_all(&(n as u32).to_le_bytes())
         .map_err(|e| e.to_string())?;
     stream.write_all(&buf[..n]).map_err(|e| e.to_string())?;
     *handshake_ms_out = hs_start.elapsed().as_secs_f64() * 1000.0;
 
-    let mut transport = hs.into_transport().map_err(|e| e)?;
+    let mut transport = hs.into_transport().map_err(|e| e.to_string())?;
     let mut sealed = Vec::with_capacity(128);
     let mut wire = vec![0u8; 128];
     let mut opened = vec![0u8; 128];
@@ -767,7 +767,7 @@ fn secure_client_side(
         let payload = format!("secure frame {i}");
         let n = transport
             .seal(payload.as_bytes(), &mut sealed)
-            .map_err(|e| e)?;
+            .map_err(|e| e.to_string())?;
         stream
             .write_all(&(n as u32).to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -777,7 +777,9 @@ fn secure_client_side(
         stream
             .read_exact(&mut wire[..n])
             .map_err(|e| e.to_string())?;
-        let m = transport.open(&wire[..n], &mut opened).map_err(|e| e)?;
+        let m = transport
+            .open(&wire[..n], &mut opened)
+            .map_err(|e| e.to_string())?;
         let _ = m;
         rtts_out.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
@@ -794,8 +796,9 @@ fn secure_server_side(
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
-    let local = Identity::generate().map_err(|e| e)?;
-    let mut hs = Handshake::new(HandshakeRole::Responder, &local, &[]).map_err(|e| e)?;
+    let local = Identity::generate().map_err(|e| e.to_string())?;
+    let mut hs =
+        Handshake::new(HandshakeRole::Responder, &local, &[]).map_err(|e| e.to_string())?;
 
     let mut buf = vec![0u8; 512];
     let mut lenb = [0u8; 4];
@@ -805,9 +808,9 @@ fn secure_server_side(
     stream
         .read_exact(&mut buf[..n])
         .map_err(|e| e.to_string())?;
-    hs.read(&buf[..n]).map_err(|e| e)?;
+    hs.read(&buf[..n]).map_err(|e| e.to_string())?;
     // msg2
-    let n = hs.write(&mut buf).map_err(|e| e)?;
+    let n = hs.write(&mut buf).map_err(|e| e.to_string())?;
     stream
         .write_all(&(n as u32).to_le_bytes())
         .map_err(|e| e.to_string())?;
@@ -818,9 +821,9 @@ fn secure_server_side(
     stream
         .read_exact(&mut buf[..n])
         .map_err(|e| e.to_string())?;
-    hs.read(&buf[..n]).map_err(|e| e)?;
+    hs.read(&buf[..n]).map_err(|e| e.to_string())?;
 
-    let mut transport = hs.into_transport().map_err(|e| e)?;
+    let mut transport = hs.into_transport().map_err(|e| e.to_string())?;
     let mut sealed = Vec::with_capacity(128);
     let mut opened = vec![0u8; 128];
     for _ in 0..iterations {
@@ -837,11 +840,13 @@ fn secure_server_side(
         stream
             .read_exact(&mut opened[..n])
             .map_err(|e| e.to_string())?;
-        let m = transport.open(&opened[..n], &mut sealed).map_err(|e| e)?;
+        let m = transport
+            .open(&opened[..n], &mut sealed)
+            .map_err(|e| e.to_string())?;
         let reply = format!("ack-{}", m);
         let n = transport
             .seal(reply.as_bytes(), &mut opened)
-            .map_err(|e| e)?;
+            .map_err(|e| e.to_string())?;
         stream
             .write_all(&(n as u32).to_le_bytes())
             .map_err(|e| e.to_string())?;
