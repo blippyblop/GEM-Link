@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "scenario": "frame_ncm",
   "seed": 42,
   "iterations": 50,
@@ -10,16 +10,17 @@
     "bitrate_mbps": 300,
     "foveation": "EyeGazeDriven",
     "link_class": "UsbNcm",
+    "encryption": "NoiseXx",
     "per_eye_width": 2160,
     "per_eye_height": 2160
   },
-  "connect_ms": 0.091709,
+  "connect_ms": 0.100649,
   "latency": {
-    "p50_ms": 2.272282,
-    "p95_ms": 2.4056509999999998,
-    "p99_ms": 2.439891,
-    "mean_ms": 2.26382836,
-    "max_ms": 2.439891
+    "p50_ms": 2.251613,
+    "p95_ms": 2.45527,
+    "p99_ms": 2.56697,
+    "mean_ms": 2.2637843199999996,
+    "max_ms": 2.56697
   },
   "delivery": {
     "mandatory_ms": 11.11111111111111,

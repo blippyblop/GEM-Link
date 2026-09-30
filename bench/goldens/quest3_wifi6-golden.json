@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "scenario": "quest3_wifi6",
   "seed": 42,
   "iterations": 50,
@@ -10,25 +10,26 @@
     "bitrate_mbps": 200,
     "foveation": "Fixed",
     "link_class": "Wifi6Lan",
+    "encryption": "NoiseXx",
     "per_eye_width": 2064,
     "per_eye_height": 2208
   },
-  "connect_ms": 0.098989,
+  "connect_ms": 0.0989,
   "latency": {
-    "p50_ms": 12.173074000000002,
-    "p95_ms": 14.146037999999999,
-    "p99_ms": 14.349226,
-    "mean_ms": 12.39114182,
-    "max_ms": 14.349226
+    "p50_ms": 12.005897,
+    "p95_ms": 14.120781000000001,
+    "p99_ms": 14.212461,
+    "mean_ms": 12.23388458,
+    "max_ms": 14.212461
   },
   "delivery": {
     "mandatory_ms": 11.11111111111111,
     "optimal_ms": 8.333333333333334,
-    "missed_mandatory_pct": 82.0,
+    "missed_mandatory_pct": 76.0,
     "within_optimal_pct": 0.0,
-    "max_lateness_ms": 3.238114888888889,
+    "max_lateness_ms": 3.1013498888888886,
     "late_over_1frame_pct": 0.0,
-    "best_streak": 2
+    "best_streak": 3
   },
   "events": [],
   "profile": {

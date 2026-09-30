@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "scenario": "frame_wifi7_regrace",
   "seed": 42,
   "iterations": 50,
@@ -10,23 +10,24 @@
     "bitrate_mbps": 300,
     "foveation": "EyeGazeDriven",
     "link_class": "UsbNcm",
+    "encryption": "NoiseXx",
     "per_eye_width": 2160,
     "per_eye_height": 2160
   },
-  "connect_ms": 0.098079,
+  "connect_ms": 0.101949,
   "latency": {
-    "p50_ms": 24.399407,
-    "p95_ms": 32.408473,
-    "p99_ms": 32.593463,
-    "mean_ms": 25.1970333,
-    "max_ms": 32.593463
+    "p50_ms": 24.349161000000002,
+    "p95_ms": 32.398258999999996,
+    "p99_ms": 32.513448,
+    "mean_ms": 25.156149659999993,
+    "max_ms": 32.513448
   },
   "delivery": {
     "mandatory_ms": 11.11111111111111,
     "optimal_ms": 8.333333333333334,
     "missed_mandatory_pct": 100.0,
     "within_optimal_pct": 0.0,
-    "max_lateness_ms": 21.48235188888889,
+    "max_lateness_ms": 21.402336888888886,
     "late_over_1frame_pct": 66.0,
     "best_streak": 0
   },

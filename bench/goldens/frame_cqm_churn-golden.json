@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "scenario": "frame_cqm_churn",
   "seed": 42,
   "iterations": 50,
@@ -10,34 +10,35 @@
     "bitrate_mbps": 300,
     "foveation": "EyeGazeDriven",
     "link_class": "UsbNcm",
+    "encryption": "NoiseXx",
     "per_eye_width": 2160,
     "per_eye_height": 2160
   },
-  "connect_ms": 0.090199,
+  "connect_ms": 0.10363,
   "latency": {
-    "p50_ms": 18.763322,
-    "p95_ms": 32.378794,
-    "p99_ms": 32.487943,
-    "mean_ms": 20.254149619999996,
-    "max_ms": 32.487943
+    "p50_ms": 18.805244,
+    "p95_ms": 32.18505,
+    "p99_ms": 32.416409,
+    "mean_ms": 20.12599718,
+    "max_ms": 32.416409
   },
   "delivery": {
     "mandatory_ms": 11.11111111111111,
     "optimal_ms": 8.333333333333334,
     "missed_mandatory_pct": 92.0,
     "within_optimal_pct": 2.0,
-    "max_lateness_ms": 21.37683188888889,
+    "max_lateness_ms": 21.30529788888889,
     "late_over_1frame_pct": 44.0,
     "best_streak": 2
   },
   "events": [
     {
-      "t_ms": 1077.4354580000002,
+      "t_ms": 1073.808453,
       "kind": "stall",
       "detail": "watchdog churn +30ms"
     },
     {
-      "t_ms": 2107.596301,
+      "t_ms": 2100.3837609999996,
       "kind": "stall",
       "detail": "watchdog churn +30ms"
     }

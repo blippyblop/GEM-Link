@@ -20,7 +20,7 @@ use std::{
 };
 use x_protocol::{ClientCapabilities, ServerCapabilities, SessionPlan, negotiate, samples};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LOSS_PENALTY_MS: f64 = 12.0;
 

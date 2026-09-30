@@ -79,7 +79,6 @@ pub enum HandshakeRole {
 
 pub struct Handshake {
     state: snow::HandshakeState,
-    role: HandshakeRole,
 }
 
 impl Handshake {
@@ -102,7 +101,7 @@ impl Handshake {
             HandshakeRole::Responder => builder.build_responder(),
         }
         .map_err(|e| format!("handshake build: {e:?}"))?;
-        Ok(Self { state, role })
+        Ok(Self { state })
     }
 
     /// Produce the next handshake message to send, if any.
