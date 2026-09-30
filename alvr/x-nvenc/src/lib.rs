@@ -17,15 +17,61 @@ use std::ffi::c_void;
 // ---------------------------------------------------------------------------
 // Constants (measured against SDK 13.1)
 
-const NVENCAPI_VERSION: u32 = 0x0100_000D; // major 13 | minor 1 << 24
-const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER: u32 = 0x7101_000D;
-const NV_ENCODE_API_FUNCTION_LIST_VER: u32 = 0x7102_000D;
-const NV_ENC_INITIALIZE_PARAMS_VER: u32 = 0xF107_000D;
-const NV_ENC_REGISTER_RESOURCE_VER: u32 = 0x7105_000D;
-const NV_ENC_MAP_INPUT_RESOURCE_VER: u32 = 0x7104_000D;
-const NV_ENC_CREATE_BITSTREAM_BUFFER_VER: u32 = 0x7101_000D;
-const NV_ENC_PIC_PARAMS_VER: u32 = 0xF107_000D;
-const NV_ENC_LOCK_BITSTREAM_VER: u32 = 0xF102_000D;
+/// NVENC runtimes ship with the driver and may be older than the newest
+/// SDK headers, so the API version is NEGOTIATED: every struct version embeds
+/// it, and OpenEncodeSessionEx reports NV_ENC_ERR_INVALID_VERSION on mismatch.
+#[derive(Clone, Copy, Debug)]
+pub struct ApiVersion {
+    pub raw: u32,
+}
+
+impl ApiVersion {
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self {
+            raw: major | (minor << 24),
+        }
+    }
+
+    const fn struct_version(&self, n: u32, with_flag31: bool) -> u32 {
+        self.raw | (n << 16) | (0x7 << 28) | if with_flag31 { 1 << 31 } else { 0 }
+    }
+
+    pub fn function_list(&self) -> u32 {
+        self.struct_version(2, false)
+    }
+    pub fn open_session(&self) -> u32 {
+        self.struct_version(1, false)
+    }
+    pub fn initialize(&self) -> u32 {
+        self.struct_version(7, true)
+    }
+    pub fn register_resource(&self) -> u32 {
+        self.struct_version(5, false)
+    }
+    pub fn map_input(&self) -> u32 {
+        self.struct_version(4, false)
+    }
+    pub fn create_bitstream(&self) -> u32 {
+        self.struct_version(1, false)
+    }
+    pub fn pic_params(&self) -> u32 {
+        self.struct_version(7, true)
+    }
+    pub fn lock_bitstream(&self) -> u32 {
+        self.struct_version(2, true)
+    }
+}
+
+pub const CANDIDATE_VERSIONS: [ApiVersion; 6] = [
+    ApiVersion::new(13, 1),
+    ApiVersion::new(13, 0),
+    ApiVersion::new(12, 2),
+    ApiVersion::new(12, 1),
+    ApiVersion::new(12, 0),
+    ApiVersion::new(11, 1),
+];
+
+const NV_ERR_INVALID_VERSION: i32 = 15;
 
 const NV_ENC_DEVICE_TYPE_DIRECTX: u32 = 0x0;
 const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0x0;
@@ -273,7 +319,7 @@ unsafe extern "system" {
     fn nv_enc_api_create_instance(function_list: *mut FunctionList) -> Status;
 }
 
-fn load_runtime() -> Result<*mut FunctionList, String> {
+fn load_runtime(ver: ApiVersion) -> Result<*mut FunctionList, String> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn LoadLibraryW(name: *const u16) -> *mut c_void;
@@ -292,7 +338,7 @@ fn load_runtime() -> Result<*mut FunctionList, String> {
         let list = Box::leak(Box::new(
             // zeroed with version set; the runtime fills every slot
             FunctionList {
-                version: NV_ENCODE_API_FUNCTION_LIST_VER,
+                version: ver.function_list(),
                 reserved: 0,
                 nv_enc_open_encode_session: std::ptr::null_mut(),
                 nv_enc_get_encode_guid_count: std::ptr::null_mut(),
@@ -352,6 +398,7 @@ fn load_runtime() -> Result<*mut FunctionList, String> {
 // Encoder — session lifecycle + per-frame register/map/encode on D3D11 textures
 
 pub struct NvEncoder {
+    ver: ApiVersion,
     list: *mut FunctionList,
     session: *mut c_void,
     bitstream: *mut c_void,
@@ -364,89 +411,116 @@ pub struct NvEncoder {
 impl NvEncoder {
     /// `device` is the capture pipeline's ID3D11Device (as raw pointer).
     pub fn new(device: *mut c_void, width: u32, height: u32, fps: u32) -> Result<Self, String> {
-        let list = load_runtime()?;
-        unsafe {
-            let mut session: *mut c_void = std::ptr::null_mut();
-            let mut open = OpenEncodeSessionExParams {
-                version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
-                device_type: NV_ENC_DEVICE_TYPE_DIRECTX,
-                device,
-                reserved: std::ptr::null_mut(),
-                api_version: NVENCAPI_VERSION,
-                reserved1: [0; 253],
-                reserved2: [std::ptr::null_mut(); 64],
-            };
-            let open_fn: NvEncOpenEncodeSessionExFn =
-                (*list).nv_enc_open_encode_session_ex.expect("slot");
-            let status = open_fn(&mut open, &mut session);
-            if status != NV_OK_OR_AGAIN {
-                return Err(format!("OpenEncodeSessionEx failed: {status}"));
-            }
+        // Negotiate the API version against the driver's runtime: the newest
+        // candidate that opens a session wins; INVALID_VERSION moves down the
+        // ladder. All struct versions derive from the adopted version.
+        let mut adopted: Option<(
+            ApiVersion,
+            *mut FunctionList,
+            *mut c_void,
+            CreateBitstreamBuffer,
+        )> = None;
+        let mut last_err = String::from("no candidate version tried");
 
-            let mut init = InitializeParams {
-                version: NV_ENC_INITIALIZE_PARAMS_VER,
-                encode_guid: Guid {
-                    bytes: CODEC_HEVC_GUID,
-                },
-                preset_guid: Guid {
-                    bytes: PRESET_P4_GUID,
-                },
-                encode_width: width,
-                encode_height: height,
-                dar_width: width,
-                dar_height: height,
-                frame_rate_num: fps,
-                frame_rate_den: 1,
-                enable_encode_async: 0,
-                enable_ptd: 1,
-                bitfields: 0,
-                priv_data_size: 0,
-                reserved: 0,
-                priv_data: std::ptr::null_mut(),
-                encode_config: std::ptr::null_mut(), // preset defaults
-                max_encode_width: width,
-                max_encode_height: height,
-                max_me_hint_counts_per_block: [0; 8],
-                tuning_info: NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-                buffer_format: NV_ENC_BUFFER_FORMAT_ARGB,
-                num_state_buffers: 0,
-                output_stats_level: 0,
-                reserved1: [0; 284],
-                reserved2: [std::ptr::null_mut(); 64],
+        for &ver in &CANDIDATE_VERSIONS {
+            let list = match load_runtime(ver) {
+                Ok(l) => l,
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
             };
-            let init_fn: NvEncInitializeEncoderFn =
-                (*list).nv_enc_initialize_encoder.expect("slot");
-            let status = init_fn(session, &mut init);
-            if status != NV_OK_OR_AGAIN {
-                return Err(format!("InitializeEncoder failed: {status}"));
-            }
+            unsafe {
+                let mut session: *mut c_void = std::ptr::null_mut();
+                let mut open = OpenEncodeSessionExParams {
+                    version: ver.open_session(),
+                    device_type: NV_ENC_DEVICE_TYPE_DIRECTX,
+                    device,
+                    reserved: std::ptr::null_mut(),
+                    api_version: ver.raw,
+                    reserved1: [0; 253],
+                    reserved2: [std::ptr::null_mut(); 64],
+                };
+                let open_fn = (*list).nv_enc_open_encode_session_ex.expect("slot");
+                let status = open_fn(&mut open, &mut session);
+                if status == NV_ERR_INVALID_VERSION {
+                    last_err = format!("api version 0x{:X} rejected", ver.raw);
+                    continue;
+                }
+                if status != NV_OK_OR_AGAIN {
+                    return Err(format!("OpenEncodeSessionEx failed: {status}"));
+                }
 
-            let mut bitstream = CreateBitstreamBuffer {
-                version: NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
-                reserved: 0,
-                _pad: std::ptr::null_mut(),
-                bitstream_buffer: std::ptr::null_mut(),
-                bitstream_buffer_ptr: std::ptr::null_mut(),
-                reserved1: [0; 58],
-                reserved2: [std::ptr::null_mut(); 64],
-            };
-            let bs_fn: NvEncCreateBitstreamBufferFn =
-                (*list).nv_enc_create_bitstream_buffer.expect("slot");
-            let status = bs_fn(session, &mut bitstream);
-            if status != NV_OK_OR_AGAIN {
-                return Err(format!("CreateBitstreamBuffer failed: {status}"));
-            }
+                let mut init = InitializeParams {
+                    version: ver.initialize(),
+                    encode_guid: Guid {
+                        bytes: CODEC_HEVC_GUID,
+                    },
+                    preset_guid: Guid {
+                        bytes: PRESET_P4_GUID,
+                    },
+                    encode_width: width,
+                    encode_height: height,
+                    dar_width: width,
+                    dar_height: height,
+                    frame_rate_num: fps,
+                    frame_rate_den: 1,
+                    enable_encode_async: 0,
+                    enable_ptd: 1,
+                    bitfields: 0,
+                    priv_data_size: 0,
+                    reserved: 0,
+                    priv_data: std::ptr::null_mut(),
+                    encode_config: std::ptr::null_mut(), // preset defaults
+                    max_encode_width: width,
+                    max_encode_height: height,
+                    max_me_hint_counts_per_block: [0; 8],
+                    tuning_info: NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                    buffer_format: NV_ENC_BUFFER_FORMAT_ARGB,
+                    num_state_buffers: 0,
+                    output_stats_level: 0,
+                    reserved1: [0; 284],
+                    reserved2: [std::ptr::null_mut(); 64],
+                };
+                let init_fn = (*list).nv_enc_initialize_encoder.expect("slot");
+                let status = init_fn(session, &mut init);
+                if status != NV_OK_OR_AGAIN {
+                    return Err(format!("InitializeEncoder failed: {status}"));
+                }
 
-            Ok(Self {
-                list,
-                session,
-                bitstream: bitstream.bitstream_buffer,
-                width,
-                height,
-                registered: Vec::new(),
-                frame_idx: 0,
-            })
+                let mut bitstream = CreateBitstreamBuffer {
+                    version: ver.create_bitstream(),
+                    reserved: 0,
+                    _pad: std::ptr::null_mut(),
+                    bitstream_buffer: std::ptr::null_mut(),
+                    bitstream_buffer_ptr: std::ptr::null_mut(),
+                    reserved1: [0; 58],
+                    reserved2: [std::ptr::null_mut(); 64],
+                };
+                let bs_fn = (*list).nv_enc_create_bitstream_buffer.expect("slot");
+                let status = bs_fn(session, &mut bitstream);
+                if status != NV_OK_OR_AGAIN {
+                    return Err(format!("CreateBitstreamBuffer failed: {status}"));
+                }
+
+                adopted = Some((ver, list, session, bitstream));
+                break;
+            }
         }
+
+        let (ver, list, session, bitstream) =
+            adopted.ok_or_else(|| format!("no compatible NVENC API version: {last_err}"))?;
+
+        Ok(Self {
+            ver,
+            list,
+            session,
+            bitstream: bitstream.bitstream_buffer,
+            width,
+            height,
+            registered: Vec::new(),
+            frame_idx: 0,
+        })
     }
 
     /// Register a GPU texture once; subsequent frames reuse the registration.
@@ -456,7 +530,7 @@ impl NvEncoder {
         }
         unsafe {
             let mut rr = RegisterResource {
-                version: NV_ENC_REGISTER_RESOURCE_VER,
+                version: self.ver.register_resource(),
                 resource_type: NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
                 width: self.width,
                 height: self.height,
@@ -489,7 +563,7 @@ impl NvEncoder {
             let registered = self.register(texture, pitch)?;
 
             let mut map = MapInputResource {
-                version: NV_ENC_MAP_INPUT_RESOURCE_VER,
+                version: self.ver.map_input(),
                 sub_resource_index: 0,
                 input_resource: texture,
                 registered_resource: registered,
@@ -505,7 +579,7 @@ impl NvEncoder {
             }
 
             let mut pic = PicParams {
-                version: NV_ENC_PIC_PARAMS_VER,
+                version: self.ver.pic_params(),
                 input_width: self.width,
                 input_height: self.height,
                 input_pitch: pitch,
@@ -536,7 +610,7 @@ impl NvEncoder {
             }
 
             let mut lock = LockBitstream {
-                version: NV_ENC_LOCK_BITSTREAM_VER,
+                version: self.ver.lock_bitstream(),
                 bitfields: 0,
                 output_bitstream: self.bitstream,
                 slice_offsets: std::ptr::null_mut(),
