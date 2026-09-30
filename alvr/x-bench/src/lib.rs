@@ -662,23 +662,35 @@ pub fn run_secure_loopback(
     let mut client_rng = Lcg::new(seed);
     let mut server_rng = Lcg::new(seed ^ 0x5EED_0000);
 
-    let handle = std::thread::spawn(move || -> Result<(), String> {
-        let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
-        stream.set_nodelay(true).map_err(|e| e.to_string())?;
-        secure_server_side(
+    let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = match listener.accept() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = err_tx.send(e.to_string());
+                return;
+            }
+        };
+        if let Err(e) = stream.set_nodelay(true) {
+            let _ = err_tx.send(e.to_string());
+            return;
+        }
+        if let Err(e) = secure_server_side(
             stream,
             &mut server_rng,
             one_way_latency_ms,
             jitter_ms,
             iterations,
-        )
+        ) {
+            let _ = err_tx.send(e);
+        }
     });
 
     let stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
     stream.set_nodelay(true).map_err(|e| e.to_string())?;
     let mut handshake_ms = 0.0f64;
     let mut rtts: Vec<f64> = Vec::new();
-    secure_client_side(
+    let client_result = secure_client_side(
         stream,
         &mut client_rng,
         one_way_latency_ms,
@@ -686,11 +698,22 @@ pub fn run_secure_loopback(
         iterations,
         &mut handshake_ms,
         &mut rtts,
-    )?;
+    );
 
     handle
         .join()
-        .map_err(|_| "server side panicked".to_string())??;
+        .map_err(|_| "server side panicked".to_string())?;
+    let server_err = err_rx.try_recv().ok();
+
+    let client_err = client_result.err();
+    if client_err.is_some() || server_err.is_some() {
+        return Err(match (client_err, server_err) {
+            (Some(ce), Some(se)) => format!("client: {ce} | server: {se}"),
+            (Some(ce), None) => ce,
+            (None, Some(se)) => se,
+            (None, None) => unreachable!(),
+        });
+    }
 
     let ls = latency_stats(rtts.clone());
     let ds = delivery_stats(&rtts, MANDATORY_DEADLINE_MS, OPTIMAL_DEADLINE_MS);
@@ -728,7 +751,7 @@ fn secure_client_side(
     let hs_start = Instant::now();
     let _ = hs_start;
     // msg1
-    let mut buf = vec![0u8; 512];
+    let mut buf = [0u8; 512];
     let n = hs.write(&mut buf).map_err(|e| e.to_string())?;
     stream
         .write_all(&(n as u32).to_le_bytes())
@@ -751,9 +774,9 @@ fn secure_client_side(
     *handshake_ms_out = hs_start.elapsed().as_secs_f64() * 1000.0;
 
     let mut transport = hs.into_transport().map_err(|e| e.to_string())?;
-    let mut sealed = Vec::with_capacity(128);
-    let mut wire = vec![0u8; 128];
-    let mut opened = vec![0u8; 128];
+    let mut sealed = [0u8; 128];
+    let mut wire = [0u8; 128];
+    let mut opened = [0u8; 128];
     for i in 0..iterations {
         let jitter = if jitter_ms > 0.0 {
             (rng.next_f64() * 2.0 - 1.0) * jitter_ms
@@ -800,7 +823,7 @@ fn secure_server_side(
     let mut hs =
         Handshake::new(HandshakeRole::Responder, &local, &[]).map_err(|e| e.to_string())?;
 
-    let mut buf = vec![0u8; 512];
+    let mut buf = [0u8; 512];
     let mut lenb = [0u8; 4];
     // msg1
     stream.read_exact(&mut lenb).map_err(|e| e.to_string())?;
@@ -824,8 +847,8 @@ fn secure_server_side(
     hs.read(&buf[..n]).map_err(|e| e.to_string())?;
 
     let mut transport = hs.into_transport().map_err(|e| e.to_string())?;
-    let mut sealed = Vec::with_capacity(128);
-    let mut opened = vec![0u8; 128];
+    let mut sealed = [0u8; 128];
+    let mut opened = [0u8; 128];
     for _ in 0..iterations {
         let jitter = if jitter_ms > 0.0 {
             (rng.next_f64() * 2.0 - 1.0) * jitter_ms

@@ -104,9 +104,9 @@ impl Handshake {
         Ok(Self { state })
     }
 
-    /// Produce the next handshake message to send, if any.
-    pub fn write(&mut self, out: &mut Vec<u8>) -> Result<usize, String> {
-        out.resize(out.capacity(), 0);
+    /// Produce the next handshake message to send, if any. `out` must be at
+    /// least 64 bytes (messages here carry no payload).
+    pub fn write(&mut self, out: &mut [u8]) -> Result<usize, String> {
         self.state
             .write_message(&[], out)
             .map_err(|e| format!("handshake write: {e:?}"))
@@ -161,9 +161,12 @@ pub struct SecureTransport {
 }
 
 impl SecureTransport {
-    /// Seal one outbound message (appends the 16-byte auth tag).
-    pub fn seal(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<usize, String> {
-        out.resize(plaintext.len() + 64, 0);
+    /// Seal one outbound message (appends the 16-byte auth tag). `out` must
+    /// have at least `plaintext.len() + 64` bytes of capacity.
+    pub fn seal(&mut self, plaintext: &[u8], out: &mut [u8]) -> Result<usize, String> {
+        if out.len() < plaintext.len() + 64 {
+            return Err("seal: output buffer too small".into());
+        }
         out[..plaintext.len()].copy_from_slice(plaintext);
         let n = self
             .state
@@ -174,8 +177,11 @@ impl SecureTransport {
     }
 
     /// Open one inbound message. Tampered or replayed messages fail here.
-    pub fn open(&mut self, ciphertext: &[u8], out: &mut Vec<u8>) -> Result<usize, String> {
-        out.resize(ciphertext.len() + 64, 0);
+    /// `out` must have at least `ciphertext.len()` bytes of capacity.
+    pub fn open(&mut self, ciphertext: &[u8], out: &mut [u8]) -> Result<usize, String> {
+        if out.len() < ciphertext.len() {
+            return Err("open: output buffer too small".into());
+        }
         let n = self
             .state
             .read_message(ciphertext, out)
@@ -212,10 +218,9 @@ mod tests {
         let mut resp = Handshake::new(HandshakeRole::Responder, &bob, &alice.public()).unwrap();
 
         // XX: initiator -> responder -> initiator (three empty-payload turns)
-        let mut msg = Vec::with_capacity(256);
+        let mut msg = [0u8; 256];
         let mut turn = 0;
         while !init.finished() {
-            msg.clear();
             let n = init.write(&mut msg).unwrap();
             let sent = msg[..n].to_vec();
             resp.read(&sent).unwrap();
@@ -223,7 +228,6 @@ mod tests {
             if resp.finished() {
                 break;
             }
-            msg.clear();
             let n = resp.write(&mut msg).unwrap();
             let sent = msg[..n].to_vec();
             init.read(&sent).unwrap();
@@ -240,9 +244,9 @@ mod tests {
         let mut b = resp.into_transport().unwrap();
 
         let frame = b"frames go here, encrypted";
-        let mut sealed = Vec::with_capacity(256);
+        let mut sealed = [0u8; 128];
         let n = a.seal(frame, &mut sealed).unwrap();
-        let mut opened = Vec::new();
+        let mut opened = [0u8; 128];
         let m = b.open(&sealed[..n], &mut opened).unwrap();
         assert_eq!(&opened[..m], frame);
         assert_eq!(a.messages_sealed(), 1);
@@ -256,15 +260,13 @@ mod tests {
         let mut init = Handshake::new(HandshakeRole::Initiator, &alice, &bob.public()).unwrap();
         let mut resp = Handshake::new(HandshakeRole::Responder, &bob, &alice.public()).unwrap();
 
-        let mut msg = Vec::with_capacity(256);
+        let mut msg = [0u8; 256];
         while !init.finished() {
-            msg.clear();
             let n = init.write(&mut msg).unwrap();
             resp.read(&msg[..n]).unwrap();
             if resp.finished() {
                 break;
             }
-            msg.clear();
             let n = resp.write(&mut msg).unwrap();
             init.read(&msg[..n]).unwrap();
         }
@@ -272,11 +274,11 @@ mod tests {
         let mut a = init.into_transport().unwrap();
         let mut b = resp.into_transport().unwrap();
 
-        let mut sealed = Vec::with_capacity(128);
+        let mut sealed = [0u8; 128];
         let n = a.seal(b"secret frame data", &mut sealed).unwrap();
         sealed[0] ^= 0xFF; // flip a bit — attacker or corruption
 
-        let mut opened = Vec::new();
+        let mut opened = [0u8; 128];
         assert!(b.open(&sealed[..n], &mut opened).is_err());
     }
 
