@@ -6,6 +6,11 @@
 use std::process::ExitCode;
 use x_dda::{Duplicator, capture_session};
 
+fn bad_flag(msg: &str) -> ExitCode {
+    eprintln!("{msg}");
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut seconds = 10.0f64;
@@ -13,20 +18,36 @@ fn main() -> ExitCode {
     let mut output = 0u32;
     let mut timeout_ms = 20u32;
     let mut list_only = false;
+    let need_num = |i: usize, name: &str| -> Result<f64, String> {
+        args.get(i + 1)
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| format!("{name} needs a number"))
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--seconds" => seconds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(10.0),
-            "--adapter" => adapter = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
-            "--output" => output = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
-            "--timeout" => timeout_ms = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(20),
-            "--list" => list_only = true,
-            other => {
-                eprintln!("unknown flag {other:?}");
-                return ExitCode::from(2);
+            "--seconds" => {
+                seconds = need_num(i, "--seconds")?;
+                i += 2;
             }
+            "--adapter" => {
+                adapter = need_num(i, "--adapter")? as u32;
+                i += 2;
+            }
+            "--output" => {
+                output = need_num(i, "--output")? as u32;
+                i += 2;
+            }
+            "--timeout" => {
+                timeout_ms = need_num(i, "--timeout")? as u32;
+                i += 2;
+            }
+            "--list" => {
+                list_only = true;
+                i += 1;
+            }
+            other => return bad_flag(&format!("unknown flag {other:?}")),
         }
-        i += 1 + (matches!(args.get(i), Some(v) if v.parse::<f64>().is_ok())) as usize;
     }
 
     let outputs = match Duplicator::enumerate() {
