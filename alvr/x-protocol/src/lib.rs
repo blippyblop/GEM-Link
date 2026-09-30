@@ -291,7 +291,7 @@ pub mod samples {
             protocol_version: PROTOCOL_VERSION,
             hostname: "steam-frame".into(),
             client_os: ClientOs::SteamosVrAarch64,
-                        // Kernel decode reality (ADR-0008): no AV1, no 10-bit on the
+            // Kernel decode reality (ADR-0008): no AV1, no 10-bit on the
             // current kernel. HEVC 8-bit pending device verification; H.264
             // is the guaranteed floor (and lowest decode latency).
             codecs: BTreeSet::from([VideoCodec::Hevc, VideoCodec::H264]),

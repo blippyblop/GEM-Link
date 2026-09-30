@@ -8320,6 +8320,7 @@ dependencies = [
  "alvr_sockets",
  "serde",
  "serde_json",
+ "x-crypto",
  "x-protocol",
 ]
 
