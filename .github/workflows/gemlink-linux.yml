@@ -7,11 +7,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  x-protocol:
-    name: x-protocol (build, clippy, test)
+  linux-tier:
+    name: linux tier (build, clippy, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97.1"
@@ -24,6 +26,29 @@ jobs:
         run: cargo clippy -p x-protocol -p x-bench -- -D warnings
       - name: Test
         run: cargo test -p x-protocol -p x-bench
+
+  bench-gates:
+    name: bench golden gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - name: Build bench
+        run: cargo build -p x-bench --bin bench
+      - name: Run scenarios and gate against goldens
+        run: |
+          set -e
+          for s in frame_ncm frame_wifi7_160 frame_wifi7_regrace frame_cqm_churn quest_pro_wifi6 quest3_wifi6; do
+            cargo run -q -p x-bench --bin bench -- run "$s" --seed 42 --iterations 50 --out runs
+          done
+          for f in runs/*/metrics.json; do
+            echo "=== gating $f ==="
+            cargo run -q -p x-bench --bin bench -- gate --run "$f" --goldens bench/goldens
+          done
 
   windows-gpu-tier:
     name: Windows GPU tier (placeholder)

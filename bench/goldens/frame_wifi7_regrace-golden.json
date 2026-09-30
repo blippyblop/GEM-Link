@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "scenario": "frame_wifi7_regrace",
+  "seed": 42,
+  "iterations": 50,
+  "gating": false,
+  "negotiation": {
+    "codec": "Av1",
+    "fps": 120,
+    "bitrate_mbps": 300,
+    "foveation": "EyeGazeDriven",
+    "link_class": "UsbNcm",
+    "per_eye_width": 2160,
+    "per_eye_height": 2160
+  },
+  "connect_ms": 0.090449,
+  "latency": {
+    "p50_ms": 24.380581,
+    "p95_ms": 32.433254000000005,
+    "p99_ms": 32.544625,
+    "mean_ms": 25.175656719999992,
+    "max_ms": 32.544625
+  },
+  "events": [],
+  "profile": {
+    "name": "wifi7_regrace",
+    "description": "regulatory race degradation — capped TX power settles firmware rate control low; marginal-link latency with occasional loss",
+    "one_way_latency_ms": 25.0,
+    "jitter_ms": 15.0,
+    "loss_pct": 0.5,
+    "bandwidth_mbps": 150,
+    "stall": null
+  },
+  "gemlink_rev": "dev"
+}

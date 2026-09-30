@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "scenario": "frame_wifi7_160",
+  "seed": 42,
+  "iterations": 50,
+  "gating": true,
+  "negotiation": {
+    "codec": "Av1",
+    "fps": 120,
+    "bitrate_mbps": 300,
+    "foveation": "EyeGazeDriven",
+    "link_class": "UsbNcm",
+    "per_eye_width": 2160,
+    "per_eye_height": 2160
+  },
+  "connect_ms": 0.093649,
+  "latency": {
+    "p50_ms": 8.123982999999999,
+    "p95_ms": 9.196426,
+    "p99_ms": 9.253295999999999,
+    "mean_ms": 8.248312060000002,
+    "max_ms": 9.253295999999999
+  },
+  "events": [],
+  "profile": {
+    "name": "wifi7_160_clean",
+    "description": "Wi-Fi 7 / 6 GHz / 160 MHz, strong signal, dedicated airtime",
+    "one_way_latency_ms": 8.0,
+    "jitter_ms": 2.0,
+    "loss_pct": 0.1,
+    "bandwidth_mbps": 1200,
+    "stall": null
+  },
+  "gemlink_rev": "dev"
+}

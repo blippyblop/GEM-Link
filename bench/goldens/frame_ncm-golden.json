@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "scenario": "frame_ncm",
+  "seed": 42,
+  "iterations": 50,
+  "gating": true,
+  "negotiation": {
+    "codec": "Av1",
+    "fps": 120,
+    "bitrate_mbps": 300,
+    "foveation": "EyeGazeDriven",
+    "link_class": "UsbNcm",
+    "per_eye_width": 2160,
+    "per_eye_height": 2160
+  },
+  "connect_ms": 0.094399,
+  "latency": {
+    "p50_ms": 2.266294,
+    "p95_ms": 2.403984,
+    "p99_ms": 2.4684630000000003,
+    "mean_ms": 2.2476833999999997,
+    "max_ms": 2.4684630000000003
+  },
+  "events": [],
+  "profile": {
+    "name": "ncm_wired",
+    "description": "USB-C NCM tether — near-deterministic micro-latency path",
+    "one_way_latency_ms": 2.0,
+    "jitter_ms": 0.3,
+    "loss_pct": 0.0,
+    "bandwidth_mbps": 400,
+    "stall": null
+  },
+  "gemlink_rev": "dev"
+}

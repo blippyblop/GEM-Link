@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "scenario": "quest_pro_wifi6",
+  "seed": 42,
+  "iterations": 50,
+  "gating": false,
+  "negotiation": {
+    "codec": "Hevc10Bit",
+    "fps": 90,
+    "bitrate_mbps": 200,
+    "foveation": "EyeGazeDriven",
+    "link_class": "Wifi6Lan",
+    "per_eye_width": 1832,
+    "per_eye_height": 1920
+  },
+  "connect_ms": 0.103149,
+  "latency": {
+    "p50_ms": 12.203875,
+    "p95_ms": 14.234412,
+    "p99_ms": 14.44733,
+    "mean_ms": 12.26241188,
+    "max_ms": 14.44733
+  },
+  "events": [],
+  "profile": {
+    "name": "wifi6_lan",
+    "description": "shared home-LAN Wi-Fi 6 — the Tier-2 device baseline",
+    "one_way_latency_ms": 12.0,
+    "jitter_ms": 4.0,
+    "loss_pct": 0.2,
+    "bandwidth_mbps": 350,
+    "stall": null
+  },
+  "gemlink_rev": "dev"
+}

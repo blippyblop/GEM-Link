@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "scenario": "frame_cqm_churn",
+  "seed": 42,
+  "iterations": 50,
+  "gating": false,
+  "negotiation": {
+    "codec": "Av1",
+    "fps": 120,
+    "bitrate_mbps": 300,
+    "foveation": "EyeGazeDriven",
+    "link_class": "UsbNcm",
+    "per_eye_width": 2160,
+    "per_eye_height": 2160
+  },
+  "connect_ms": 0.09426,
+  "latency": {
+    "p50_ms": 18.80405,
+    "p95_ms": 32.250955999999995,
+    "p99_ms": 32.624574,
+    "mean_ms": 20.12465786,
+    "max_ms": 32.624574
+  },
+  "events": [
+    {
+      "t_ms": 1073.361583,
+      "kind": "stall",
+      "detail": "watchdog churn +30ms"
+    },
+    {
+      "t_ms": 2100.343427,
+      "kind": "stall",
+      "detail": "watchdog churn +30ms"
+    }
+  ],
+  "profile": {
+    "name": "cqm_churn",
+    "description": "connection-quality watchdog churn — channel hops and transient stalls on a degraded wireless link",
+    "one_way_latency_ms": 20.0,
+    "jitter_ms": 25.0,
+    "loss_pct": 1.0,
+    "bandwidth_mbps": 300,
+    "stall": {
+      "every_n_exchanges": 25,
+      "duration_ms": 30.0
+    }
+  },
+  "gemlink_rev": "dev"
+}

@@ -432,6 +432,112 @@ pub fn compare(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Golden gates — machine-independent CI checks: structural equality against a
+// checked-in golden run, plus profile-derived latency sanity caps. Percent
+// regression gating (`bench compare`) is for same-machine A/B runs.
+
+/// Loose upper bound that only trips on catastrophic regressions (accidental
+/// sleeps, retry storms), never on runner variance.
+pub fn sanity_cap_ms(profile: &ImpairmentProfile) -> f64 {
+    let stall = profile.stall.map(|s| s.duration_ms).unwrap_or(0.0);
+    4.0 * profile.one_way_latency_ms
+        + 4.0 * profile.jitter_ms
+        + stall
+        + 3.0 * LOSS_PENALTY_MS
+        + 50.0
+}
+
+fn record(failures: &mut Vec<String>, name: &str, ok: bool, detail: String) {
+    println!("{} {name}: {detail}", if ok { "PASS" } else { "FAIL" });
+    if !ok {
+        failures.push(name.into());
+    }
+}
+
+/// Gate a run against its golden: structure must match exactly, latency must
+/// stay under the profile-derived sanity cap.
+pub fn gate(run: &RunMetrics, golden: &RunMetrics) -> Result<(), String> {
+    if run.scenario != golden.scenario {
+        return Err(format!(
+            "scenario mismatch: run={} golden={}",
+            run.scenario, golden.scenario
+        ));
+    }
+    let mut failures = Vec::new();
+    record(
+        &mut failures,
+        "schema_version",
+        run.schema_version == golden.schema_version,
+        format!(
+            "run {} / golden {}",
+            run.schema_version, golden.schema_version
+        ),
+    );
+    record(
+        &mut failures,
+        "seed",
+        run.seed == golden.seed,
+        format!("run {} / golden {}", run.seed, golden.seed),
+    );
+    record(
+        &mut failures,
+        "iterations",
+        run.iterations == golden.iterations,
+        format!("run {} / golden {}", run.iterations, golden.iterations),
+    );
+    record(
+        &mut failures,
+        "profile",
+        run.profile == golden.profile,
+        format!("run {} / golden {}", run.profile.name, golden.profile.name),
+    );
+    record(
+        &mut failures,
+        "negotiation",
+        run.negotiation == golden.negotiation,
+        format!(
+            "run codec={:?} fps={} bitrate={} link={:?} / golden codec={:?} fps={} bitrate={} link={:?}",
+            run.negotiation.codec,
+            run.negotiation.fps,
+            run.negotiation.bitrate_mbps,
+            run.negotiation.link_class,
+            golden.negotiation.codec,
+            golden.negotiation.fps,
+            golden.negotiation.bitrate_mbps,
+            golden.negotiation.link_class
+        ),
+    );
+    let events = |m: &RunMetrics| -> Vec<(String, String)> {
+        m.events
+            .iter()
+            .map(|e| (e.kind.clone(), e.detail.clone()))
+            .collect()
+    };
+    record(
+        &mut failures,
+        "event_sequence",
+        events(run) == events(golden),
+        format!(
+            "run {} events / golden {} events (kind+detail sequence)",
+            events(run).len(),
+            events(golden).len()
+        ),
+    );
+    let cap = sanity_cap_ms(&golden.profile);
+    record(
+        &mut failures,
+        "latency_p99_sanity",
+        run.latency.p99_ms <= cap,
+        format!("p99 {:.2} ms / cap {cap:.2} ms", run.latency.p99_ms),
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} gate check(s) failed", failures.len()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +636,32 @@ mod tests {
             "cqm churn scenario must record stall events"
         );
         assert!(m.latency.p99_ms >= m.latency.p50_ms);
+    }
+
+    #[test]
+    fn gate_passes_for_deterministic_reruns() {
+        let _guard = serial_lock();
+        let s = scenario("frame_ncm").unwrap();
+        let golden = run_loopback(&s, 7, 8).expect("golden");
+        let rerun = run_loopback(&s, 7, 8).expect("rerun");
+        gate(&rerun, &golden).expect("same-seed rerun must gate clean");
+    }
+
+    #[test]
+    fn gate_catches_negotiation_drift() {
+        let _guard = serial_lock();
+        let s = scenario("frame_ncm").unwrap();
+        let golden = run_loopback(&s, 7, 8).expect("golden");
+        let mut run = golden.clone();
+        run.negotiation.codec = VideoCodec::H264;
+        assert!(gate(&run, &golden).is_err());
+    }
+
+    #[test]
+    fn sanity_caps_are_profile_derived() {
+        let cap = sanity_cap_ms(&profile("ncm_wired").unwrap());
+        assert!(cap > 80.0 && cap < 110.0, "ncm cap {cap}");
+        let cap = sanity_cap_ms(&profile("cqm_churn").unwrap());
+        assert!(cap > 250.0 && cap < 350.0, "cqm cap {cap}");
     }
 }
