@@ -212,7 +212,7 @@ fn real_main(args: &[String]) -> Result<(), String> {
             let json_line = stdout
                 .lines()
                 .rev()
-                .find(|l| l.trim_start().starts('{'))
+                .find(|l| l.trim_start().starts_with('{'))
                 .ok_or_else(|| {
                     format!(
                         "probe produced no JSON. stderr: {}",
