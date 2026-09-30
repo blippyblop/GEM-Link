@@ -27,19 +27,19 @@ fn main() -> ExitCode {
     while i < args.len() {
         match args[i].as_str() {
             "--seconds" => {
-                seconds = need_num(i, "--seconds")?;
+                seconds = need_num(i, "--seconds").map_err(|m| return bad_flag(&m))?;
                 i += 2;
             }
             "--adapter" => {
-                adapter = need_num(i, "--adapter")? as u32;
+                adapter = need_num(i, "--adapter").map_err(|m| return bad_flag(&m))? as u32;
                 i += 2;
             }
             "--output" => {
-                output = need_num(i, "--output")? as u32;
+                output = need_num(i, "--output").map_err(|m| return bad_flag(&m))? as u32;
                 i += 2;
             }
             "--timeout" => {
-                timeout_ms = need_num(i, "--timeout")? as u32;
+                timeout_ms = need_num(i, "--timeout").map_err(|m| return bad_flag(&m))? as u32;
                 i += 2;
             }
             "--list" => {
