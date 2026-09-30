@@ -293,7 +293,7 @@ mod tests {
         let mut init = Handshake::new(HandshakeRole::Initiator, &alice, &mallory.public()).unwrap();
         let mut resp = Handshake::new(HandshakeRole::Responder, &bob, &alice.public()).unwrap();
 
-        let mut msg = Vec::with_capacity(256);
+        let mut msg = [0u8; 256];
         let n = init.write(&mut msg).unwrap();
         resp.read(&msg[..n]).unwrap();
         // The responder received Alice's real static key, which does NOT
