@@ -14,22 +14,22 @@
     "per_eye_width": 1832,
     "per_eye_height": 1920
   },
-  "connect_ms": 0.119659,
+  "connect_ms": 0.108389,
   "latency": {
-    "p50_ms": 11.971097,
-    "p95_ms": 14.118210000000001,
-    "p99_ms": 14.1532,
-    "mean_ms": 12.191907559999997,
-    "max_ms": 14.1532
+    "p50_ms": 12.061028,
+    "p95_ms": 14.118513,
+    "p99_ms": 14.183533,
+    "mean_ms": 12.239654040000005,
+    "max_ms": 14.183533
   },
   "delivery": {
     "mandatory_ms": 11.11111111111111,
     "optimal_ms": 8.333333333333334,
-    "missed_mandatory_pct": 76.0,
+    "missed_mandatory_pct": 78.0,
     "within_optimal_pct": 0.0,
-    "max_lateness_ms": 3.0420888888888893,
+    "max_lateness_ms": 3.07242188888889,
     "late_over_1frame_pct": 0.0,
-    "best_streak": 3
+    "best_streak": 2
   },
   "events": [],
   "profile": {

@@ -5,7 +5,7 @@
   "iterations": 50,
   "gating": false,
   "negotiation": {
-    "codec": "Av1",
+    "codec": "Hevc",
     "fps": 120,
     "bitrate_mbps": 300,
     "foveation": "EyeGazeDriven",
@@ -14,20 +14,20 @@
     "per_eye_width": 2160,
     "per_eye_height": 2160
   },
-  "connect_ms": 0.101949,
+  "connect_ms": 0.09383899999999999,
   "latency": {
-    "p50_ms": 24.349161000000002,
-    "p95_ms": 32.398258999999996,
-    "p99_ms": 32.513448,
-    "mean_ms": 25.156149659999993,
-    "max_ms": 32.513448
+    "p50_ms": 24.570543999999998,
+    "p95_ms": 32.472894000000004,
+    "p99_ms": 32.618482,
+    "mean_ms": 25.252749240000007,
+    "max_ms": 32.618482
   },
   "delivery": {
     "mandatory_ms": 11.11111111111111,
     "optimal_ms": 8.333333333333334,
     "missed_mandatory_pct": 100.0,
     "within_optimal_pct": 0.0,
-    "max_lateness_ms": 21.402336888888886,
+    "max_lateness_ms": 21.50737088888889,
     "late_over_1frame_pct": 66.0,
     "best_streak": 0
   },
