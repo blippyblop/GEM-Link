@@ -167,7 +167,7 @@ impl SecureTransport {
         out[..plaintext.len()].copy_from_slice(plaintext);
         let n = self
             .state
-            .write_message(&plaintext, out)
+            .write_message(plaintext, out)
             .map_err(|e| format!("seal: {e:?}"))?;
         self.seq_out += 1;
         Ok(n)
