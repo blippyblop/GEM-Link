@@ -199,10 +199,22 @@ impl Duplicator {
             )?;
             let device = device.ok_or(Error::from(E_FAIL))?;
 
+            // HDR-capable path first; legacy duplication as the graceful
+            // fallback (with the reason, so field diagnosis stays possible).
             // (windows-rs 0.58 parameter order: ppdevice, pfeaturelevel,
             // ppimmediatecontext — the context comes LAST)
             let duplication: IDXGIOutputDuplication = match output.cast::<IDXGIOutput5>() {
-                Ok(output5) => output5.DuplicateOutput1(&device, 0, &SOURCE_FORMATS)?,
+                Ok(output5) => match output5.DuplicateOutput1(&device, 0, &SOURCE_FORMATS) {
+                    Ok(d) => d,
+                    Err(hdr_err) => {
+                        eprintln!(
+                            "DuplicateOutput1 unavailable (0x{:08X}) — legacy fallback",
+                            hdr_err.code().0
+                        );
+                        let output1: IDXGIOutput1 = output.cast()?;
+                        output1.DuplicateOutput(&device)?
+                    }
+                },
                 Err(_) => {
                     let output1: IDXGIOutput1 = output.cast()?;
                     output1.DuplicateOutput(&device)?
