@@ -8147,6 +8147,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
+name = "x-bench"
+version = "21.0.0-dev14"
+dependencies = [
+ "alvr_packets",
+ "alvr_session",
+ "alvr_sockets",
+ "serde",
+ "serde_json",
+ "x-protocol",
+]
+
+[[package]]
 name = "x-protocol"
 version = "21.0.0-dev14"
 dependencies = [
