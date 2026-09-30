@@ -1,0 +1,16 @@
+[package]
+name = "x-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["GemLink contributors"]
+description = "GemLink transport security: Noise-XX handshakes + AEAD media framing (encrypted always-on; plaintext exists only under the insecure-debug-transport feature for protocol debugging)"
+
+[dependencies]
+snow = "0.9"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+
+[features]
+insecure-debug-transport = []

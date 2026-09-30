@@ -31,7 +31,7 @@ with **minimum measured glass-to-glass latency** as the score that outranks all 
 ### M1 — Latency & trust (weeks 5–12)
 - [ ] **SteamVR source (server_openvr) builds + streams as Source #1** (ADR-0005): upstream driver architecture, GemLink encoder seam behind it, Windows build green in CI
 - [ ] Zero-copy GPU pipeline (DDA texture → encoder, no CPU stage) + per-frame metadata sidecar (timestamps, foveation params, motion vectors)
-- [ ] Noise-XX pairing + AEAD transport, default ON (no plaintext mode)
+- [x] `x-crypto`: Noise-XX handshake + AEAD transport, default ON (ADR-0006: plaintext exists only under the compile-time `insecure-debug-transport` feature for wire debugging); identity fingerprints + pairing pins + tamper tests
 - [ ] Realtime priority + high-resolution timer discipline in the capture host
 - [ ] Gaze pipeline: OpenXR eye-gaze (Frame) → predicted foveation centers → encoder per-frame centers
 - **Gate:** measured encode-path drop vs M0; encrypted bench scenario green; foveation tracks scripted gaze ≤ 1 frame behind → `v0.2.0`

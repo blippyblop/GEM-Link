@@ -122,6 +122,9 @@ pub struct ClientCapabilities {
     /// The device's bandwidth envelope for this session class (GemLink primary
     /// scenario: 300 Mbps *with foveated encoding*, ADR-0003).
     pub bitrate_envelope_mbps: u32,
+    /// True iff this build ships the insecure-debug transport. Release
+    /// builds hard-code `false`.
+    pub insecure_debug: bool,
 }
 
 /// What the server can do, at session setup.
@@ -130,6 +133,7 @@ pub struct ServerCapabilities {
     pub protocol_version: ProtocolVersion,
     pub codecs: BTreeSet<VideoCodec>,
     pub foveation_supported: bool,
+    pub insecure_debug: bool,
     pub max_fps: u16,
     pub max_bitrate_mbps: u32,
     pub link_classes: BTreeSet<LinkClass>,
@@ -158,8 +162,19 @@ pub struct SessionPlan {
     pub bitrate_mbps: u32,
     pub foveation: FoveationMode,
     pub link_class: LinkClass,
+    pub encryption: EncryptionMode,
     pub per_eye_width: u32,
     pub per_eye_height: u32,
+}
+
+/// Transport encryption mode. `NoiseXx` is the default and the only mode
+/// release builds ship; `InsecureDebugOnly` exists solely for wire debugging
+/// and is only negotiable when BOTH sides are built with the
+/// `insecure-debug-transport` feature (compile-time, default OFF; ADR-0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EncryptionMode {
+    NoiseXx,
+    InsecureDebugOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +267,11 @@ pub fn negotiate(
         bitrate_mbps,
         foveation,
         link_class,
+        encryption: if client.insecure_debug && server.insecure_debug {
+            EncryptionMode::InsecureDebugOnly
+        } else {
+            EncryptionMode::NoiseXx
+        },
         per_eye_width: client.display.per_eye_width.min(server.per_eye_width),
         per_eye_height: client.display.per_eye_height.min(server.per_eye_height),
     })
@@ -285,6 +305,7 @@ pub mod samples {
                 refresh_rates: vec![72, 80, 90, 120, 144],
             },
             link_classes: BTreeSet::from([LinkClass::Wifi7SoftAp, LinkClass::UsbNcm]),
+            insecure_debug: false,
             bitrate_envelope_mbps: 300,
         }
     }
@@ -304,6 +325,7 @@ pub mod samples {
                 refresh_rates: vec![72, 90],
             },
             link_classes: BTreeSet::from([LinkClass::Wifi6Lan]),
+            insecure_debug: false,
             bitrate_envelope_mbps: 200,
         }
     }
@@ -328,6 +350,7 @@ pub mod samples {
                 refresh_rates: vec![72, 80, 90, 120],
             },
             link_classes: BTreeSet::from([LinkClass::Wifi6Lan]),
+            insecure_debug: false,
             bitrate_envelope_mbps: 200,
         }
     }
@@ -335,6 +358,7 @@ pub mod samples {
     /// A reasonably capable GemLink server (NVENC-class).
     pub fn server() -> ServerCapabilities {
         ServerCapabilities {
+            insecure_debug: false,
             protocol_version: PROTOCOL_VERSION,
             codecs: BTreeSet::from([
                 VideoCodec::H264,

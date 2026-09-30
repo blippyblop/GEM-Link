@@ -16,3 +16,7 @@ Report via **GitHub private vulnerability reporting** (no project domain yet; em
 - Pairing is explicit and mutual; unknown clients require physical confirmation on the PC.
 - Drivers (IDD/audio) are the highest-risk surface: signed builds only, least privilege, and a documented rollback path.
 - The desktop-streaming path treats protected-content detection as a hard stop (frames are never captured or transmitted).
+
+## Transport security posture (ADR-0006)
+
+Noise-XX transport encryption is unconditional in release builds. A plaintext transport exists **only** under the compile-time feature `insecure-debug-transport` (default OFF), for wire debugging — it cannot be enabled at runtime and does not exist in release binaries.

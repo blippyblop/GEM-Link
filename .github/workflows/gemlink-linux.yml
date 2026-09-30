@@ -19,13 +19,13 @@ jobs:
           toolchain: "1.97.1"
           components: rustfmt, clippy
       - name: Format
-        run: cargo fmt -p x-protocol -p x-bench -- --check
+        run: cargo fmt -p x-protocol -p x-bench -p x-crypto -- --check
       - name: Build
-        run: cargo build -p x-protocol -p x-bench
+        run: cargo build -p x-protocol -p x-bench -p x-crypto
       - name: Clippy
-        run: cargo clippy -p x-protocol -p x-bench -- -D warnings
+        run: cargo clippy -p x-protocol -p x-bench -p x-crypto -- -D warnings
       - name: Test
-        run: cargo test -p x-protocol -p x-bench
+        run: cargo test -p x-protocol -p x-bench -p x-crypto
 
   bench-gates:
     name: bench golden gates
@@ -71,7 +71,7 @@ jobs:
           set RUSTUP_HOME=C:\Gemlink\tools\rustup
           set CARGO_HOME=C:\Gemlink\tools\cargo
           set PATH=C:\Gemlink\tools\cargo\bin;%PATH%
-          cargo test -p x-protocol -p x-bench
+          cargo test -p x-protocol -p x-bench -p x-crypto
       - name: NVENC delivery gates (8-bit)
         shell: cmd
         run: |
