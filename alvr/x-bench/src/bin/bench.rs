@@ -288,10 +288,10 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 baseline["host"] = serde_json::Value::String(
                     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into()),
                 );
-                if let Ok(existing) = std::fs::read_to_string(&baseline_path) {
-                    if let Ok(mut prev) = serde_json::from_str::<serde_json::Value>(&existing) {
-                        baseline["history"] = prev["history"].take();
-                    }
+                if let Ok(existing) = std::fs::read_to_string(&baseline_path)
+                    && let Ok(mut prev) = serde_json::from_str::<serde_json::Value>(&existing)
+                {
+                    baseline["history"] = prev["history"].take();
                 }
                 let mut hist_array = match baseline["history"].take() {
                     serde_json::Value::Array(a) => a,
