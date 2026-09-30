@@ -48,6 +48,11 @@ pub const SOURCE_FORMATS: [DXGI_FORMAT; 3] = [
     DXGI_FORMAT_B8G8R8A8_UNORM,
 ];
 
+/// SDR-only list (no FP16): diagnoses whether the OS refuses the HDR-capable
+/// list merely because the desktop is in SDR mode.
+pub const SDR_FORMATS: [DXGI_FORMAT; 2] =
+    [DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM];
+
 /// Per-frame metadata sidecar — travels WITH the texture (same timestamps,
 /// never a second copy of pixels). This is the substrate later phases use for
 /// client-side synthesis and hot reconfiguration.
@@ -178,7 +183,7 @@ impl Duplicator {
     /// Open a duplicator for one output. Prefers `DuplicateOutput1` with the
     /// HDR-capable format list; falls back to legacy duplication when the OS
     /// is too old.
-    pub fn new(adapter_idx: u32, output_idx: u32) -> Result<Self> {
+    pub fn new(adapter_idx: u32, output_idx: u32, formats: &[DXGI_FORMAT]) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
             let adapter: IDXGIAdapter1 = factory.EnumAdapters1(adapter_idx)?;
@@ -204,11 +209,11 @@ impl Duplicator {
             // (windows-rs 0.58 parameter order: ppdevice, pfeaturelevel,
             // ppimmediatecontext — the context comes LAST)
             let duplication: IDXGIOutputDuplication = match output.cast::<IDXGIOutput5>() {
-                Ok(output5) => match output5.DuplicateOutput1(&device, 0, &SOURCE_FORMATS) {
+                Ok(output5) => match output5.DuplicateOutput1(&device, 0, formats) {
                     Ok(d) => d,
                     Err(hdr_err) => {
                         eprintln!(
-                            "DuplicateOutput1 unavailable (0x{:08X}) — legacy fallback",
+                            "DuplicateOutput1 unavailable (0x{:08X}) - legacy fallback",
                             hdr_err.code().0
                         );
                         let output1: IDXGIOutput1 = output.cast()?;
@@ -293,9 +298,10 @@ pub fn capture_session(
     output_idx: u32,
     seconds: f64,
     timeout_ms: u32,
+    formats: &[DXGI_FORMAT],
 ) -> Result<CaptureStats> {
     let realtime = apply_scheduling_hygiene();
-    let dup = Duplicator::new(adapter_idx, output_idx)?;
+    let dup = Duplicator::new(adapter_idx, output_idx, formats)?;
     let desktop = dup.desktop_desc()?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
@@ -316,12 +322,16 @@ pub fn capture_session(
                 if f.meta.protected_content_masked {
                     protected_events += 1;
                 }
-                if let Some(prev) = last_present {
-                    if f.meta.last_present_ms > prev {
-                        present_gaps.push(f.meta.last_present_ms - prev);
+                // LastPresentTime == 0 means "no new composition" in some
+                // driver states - skipping it keeps present-gap honest.
+                if f.meta.last_present_ms > 0.0 {
+                    if let Some(prev) = last_present {
+                        if f.meta.last_present_ms > prev {
+                            present_gaps.push(f.meta.last_present_ms - prev);
+                        }
                     }
+                    last_present = Some(f.meta.last_present_ms);
                 }
-                last_present = Some(f.meta.last_present_ms);
                 frames += 1;
                 dup.release();
             }

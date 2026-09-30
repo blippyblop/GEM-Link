@@ -4,7 +4,7 @@
 #![allow(unsafe_code)]
 
 use std::process::ExitCode;
-use x_dda::{Duplicator, capture_session};
+use x_dda::{Duplicator, SDR_FORMATS, SOURCE_FORMATS, capture_session};
 
 const USAGE: &str = "usage: dda-capture [--seconds N] [--adapter N] [--output N] \
                      [--timeout MS] [--list]";
@@ -26,6 +26,7 @@ fn real_main() -> Result<(), String> {
     let mut output = 0u32;
     let mut timeout_ms = 20u32;
     let mut list_only = false;
+    let mut sdr_list = false;
 
     let need_num = |i: usize, name: &str| -> Result<f64, String> {
         args.get(i + 1)
@@ -56,6 +57,10 @@ fn real_main() -> Result<(), String> {
                 list_only = true;
                 i += 1;
             }
+            "--sdr-list" => {
+                sdr_list = true;
+                i += 1;
+            }
             other => return Err(format!("{USAGE}\nunknown flag {other:?}")),
         }
     }
@@ -81,7 +86,12 @@ fn real_main() -> Result<(), String> {
         ));
     }
 
-    let stats = capture_session(adapter, output, seconds, timeout_ms)
+    let formats: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT] = if sdr_list {
+        &SDR_FORMATS
+    } else {
+        &SOURCE_FORMATS
+    };
+    let stats = capture_session(adapter, output, seconds, timeout_ms, formats)
         .map_err(|e| format!("capture failed: {e} (code 0x{:08X})", e.code().0))?;
     println!("{}", serde_json::to_string_pretty(&stats).unwrap());
     Ok(())

@@ -20,7 +20,7 @@ use std::{
 };
 use x_protocol::{ClientCapabilities, ServerCapabilities, SessionPlan, negotiate, samples};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LOSS_PENALTY_MS: f64 = 12.0;
 
@@ -139,6 +139,11 @@ pub fn profile(name: &str) -> Option<ImpairmentProfile> {
 // Scenarios — (profile × device) pairs. Gating scenarios (ADR-0004: Steam Frame)
 // block merges; informational scenarios record Tier-2 behavior.
 
+/// Per-frame presentation budget. **90 Hz cadence (11.11 ms)** — the primary
+/// metric is not the average, it is how many frames blow this deadline and by
+/// how much. A beautiful mean with 1% late frames is a broken experience.
+pub const FRAME_DEADLINE_MS: f64 = 1000.0 / 90.0;
+
 #[derive(Clone, Debug)]
 pub struct Scenario {
     pub name: &'static str,
@@ -146,6 +151,7 @@ pub struct Scenario {
     pub client: ClientCapabilities,
     pub server: ServerCapabilities,
     pub gating: bool,
+    pub deadline_ms: f64,
 }
 
 pub fn scenarios() -> Vec<Scenario> {
@@ -166,6 +172,7 @@ pub fn scenarios() -> Vec<Scenario> {
             client,
             server: samples::server(),
             gating,
+            deadline_ms: FRAME_DEADLINE_MS,
         }
     };
     vec![
@@ -194,6 +201,56 @@ pub struct LatencyStats {
     pub max_ms: f64,
 }
 
+/// Delivery consistency against the per-frame deadline. These are the gates
+/// that matter: an average says nothing if 1% of frames arrive an order of
+/// magnitude late.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DeliveryStats {
+    pub deadline_ms: f64,
+    /// % of samples that missed the deadline.
+    pub missed_deadline_pct: f64,
+    /// Worst overshoot past the deadline (0 if none missed).
+    pub max_lateness_ms: f64,
+    /// % of samples late by more than a full extra frame (deadline * 2).
+    pub late_over_1frame_pct: f64,
+    /// Longest consecutive run of on-time samples (hitch detector).
+    pub best_streak: usize,
+}
+
+pub fn delivery_stats(samples: &[f64], deadline_ms: f64) -> DeliveryStats {
+    let missed = samples.iter().filter(|s| **s > deadline_ms).count();
+    let over1 = samples.iter().filter(|s| **s > deadline_ms * 2.0).count();
+    let max_lateness = samples
+        .iter()
+        .map(|s| (s - deadline_ms).max(0.0))
+        .fold(0.0, f64::max);
+    let mut best_streak = 0usize;
+    let mut streak = 0usize;
+    for s in samples {
+        if *s <= deadline_ms {
+            streak += 1;
+            best_streak = best_streak.max(streak);
+        } else {
+            streak = 0;
+        }
+    }
+    DeliveryStats {
+        deadline_ms,
+        missed_deadline_pct: if samples.is_empty() {
+            0.0
+        } else {
+            missed as f64 / samples.len() as f64 * 100.0
+        },
+        max_lateness_ms: max_lateness,
+        late_over_1frame_pct: if samples.is_empty() {
+            0.0
+        } else {
+            over1 as f64 / samples.len() as f64 * 100.0
+        },
+        best_streak,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BenchEvent {
     pub t_ms: f64,
@@ -211,6 +268,7 @@ pub struct RunMetrics {
     pub negotiation: SessionPlan,
     pub connect_ms: f64,
     pub latency: LatencyStats,
+    pub delivery: DeliveryStats,
     pub events: Vec<BenchEvent>,
     pub profile: ImpairmentProfile,
     pub gemlink_rev: String,
@@ -336,7 +394,8 @@ pub fn run_loopback(scenario: &Scenario, seed: u64, iterations: u32) -> Result<R
         gating: scenario.gating,
         negotiation,
         connect_ms,
-        latency: latency_stats(samples),
+        latency: latency_stats(samples.clone()),
+        delivery: delivery_stats(&samples, scenario.deadline_ms),
         events,
         profile: scenario.profile.clone(),
         gemlink_rev: option_env!("GEMLINK_GIT_REV").unwrap_or("dev").into(),
@@ -531,6 +590,17 @@ pub fn gate(run: &RunMetrics, golden: &RunMetrics) -> Result<(), String> {
         run.latency.p99_ms <= cap,
         format!("p99 {:.2} ms / cap {cap:.2} ms", run.latency.p99_ms),
     );
+    if run.gating {
+        record(
+            &mut failures,
+            "missed_deadlines",
+            run.delivery.missed_deadline_pct == 0.0,
+            format!(
+                "gating scenario: {:.1}% of frames missed the {:.2} ms deadline",
+                run.delivery.missed_deadline_pct, run.delivery.deadline_ms
+            ),
+        );
+    }
     if failures.is_empty() {
         Ok(())
     } else {
@@ -663,5 +733,21 @@ mod tests {
         assert!(cap > 80.0 && cap < 110.0, "ncm cap {cap}");
         let cap = sanity_cap_ms(&profile("cqm_churn").unwrap());
         assert!(cap > 250.0 && cap < 350.0, "cqm cap {cap}");
+    }
+
+    #[test]
+    fn delivery_stats_catch_the_one_percent_outlier() {
+        let mut samples = vec![2.0; 99];
+        samples.push(100.0); // the extreme example: gorgeous average, one bad frame
+        let d = delivery_stats(&samples, 11.11);
+        assert_eq!(d.missed_deadline_pct, 1.0);
+        assert!((d.max_lateness_ms - (100.0 - 11.11)).abs() < 0.01);
+        assert_eq!(d.late_over_1frame_pct, 1.0);
+        assert_eq!(d.best_streak, 99);
+
+        let clean = delivery_stats(&vec![3.0; 50], 11.11);
+        assert_eq!(clean.missed_deadline_pct, 0.0);
+        assert_eq!(clean.max_lateness_ms, 0.0);
+        assert_eq!(clean.best_streak, 50);
     }
 }

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "scenario": "frame_ncm",
   "seed": 42,
   "iterations": 50,
@@ -13,13 +13,20 @@
     "per_eye_width": 2160,
     "per_eye_height": 2160
   },
-  "connect_ms": 0.094399,
+  "connect_ms": 0.113029,
   "latency": {
-    "p50_ms": 2.266294,
-    "p95_ms": 2.403984,
-    "p99_ms": 2.4684630000000003,
-    "mean_ms": 2.2476833999999997,
-    "max_ms": 2.4684630000000003
+    "p50_ms": 2.2965910000000003,
+    "p95_ms": 2.436701,
+    "p99_ms": 2.55266,
+    "mean_ms": 2.2907202000000004,
+    "max_ms": 2.55266
+  },
+  "delivery": {
+    "deadline_ms": 11.11111111111111,
+    "missed_deadline_pct": 0.0,
+    "max_lateness_ms": 0.0,
+    "late_over_1frame_pct": 0.0,
+    "best_streak": 50
   },
   "events": [],
   "profile": {

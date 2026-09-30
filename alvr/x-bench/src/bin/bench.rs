@@ -88,7 +88,7 @@ fn real_main(args: &[String]) -> Result<(), String> {
             let path = write_run(&out, &metrics).map_err(|e| format!("write failed: {e}"))?;
             println!(
                 "scenario={} seed={} iterations={} codec={:?} fps={} bitrate={}Mbps \
-                 p50={:.2}ms p95={:.2}ms p99={:.2}ms events={}",
+                 p50={:.2}ms p95={:.2}ms p99={:.2}ms late={:.1}% events={}",
                 metrics.scenario,
                 metrics.seed,
                 metrics.iterations,
@@ -98,6 +98,7 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 metrics.latency.p50_ms,
                 metrics.latency.p95_ms,
                 metrics.latency.p99_ms,
+                metrics.delivery.missed_deadline_pct,
                 metrics.events.len(),
             );
             println!("{}", path.display());
