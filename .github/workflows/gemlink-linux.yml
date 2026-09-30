@@ -1,13 +1,18 @@
 name: GemLink Linux CI
 
+# SECURITY (ADR-0007): self-hosted runner policy.
+# - No pull_request trigger: fork PRs must never execute workflows on the
+#   self-hosted GPU runner (cargo build scripts = arbitrary code).
+# - push (master) + workflow_dispatch both require repo write access.
+# - Repository guard on every job: fork copies never touch the runner.
 on:
   push:
     branches: [master]
-  pull_request:
   workflow_dispatch:
 
 jobs:
   linux-tier:
+    if: github.repository == 'blippyblop/GEM-Link'
     name: linux tier (build, clippy, test)
     runs-on: ubuntu-latest
     steps:
@@ -28,6 +33,7 @@ jobs:
         run: cargo test -p x-protocol -p x-bench -p x-crypto
 
   bench-gates:
+    if: github.repository == 'blippyblop/GEM-Link'
     name: bench golden gates
     runs-on: ubuntu-latest
     steps:
@@ -51,6 +57,7 @@ jobs:
           done
 
   windows-gpu-tier:
+    if: github.repository == 'blippyblop/GEM-Link'
     name: windows GPU tier (nvenc delivery gates)
     runs-on: [self-hosted, gpu]
     steps:
