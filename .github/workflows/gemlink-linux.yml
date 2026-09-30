@@ -79,6 +79,16 @@ jobs:
           set CARGO_HOME=C:\Gemlink\tools\cargo
           set PATH=C:\Gemlink\tools\cargo\bin;%PATH%
           cargo test -p x-protocol -p x-bench -p x-crypto
+      - name: SteamVR driver build (server_openvr, ADR-0005)
+        shell: cmd
+        run: |
+          set RUSTUP_HOME=C:\Gemlink\tools\rustup
+          set CARGO_HOME=C:\Gemlink\tools\cargo
+          set PATH=C:\Gemlink\tools\cargo\bin;%PATH%
+          set LIBCLANG_PATH=C:\Gemlink\tools\llvm\bin
+          if not exist deps\windows\libvpl\alvr_build xcopy /E /I /Y C:\Gemlink\deps-cache\windows deps\windows\ >nul
+          cargo build --release -p alvr_server_openvr
+          dir target\release\alvr_server_openvr.dll
       - name: NVENC delivery gates (8-bit)
         shell: cmd
         run: |
