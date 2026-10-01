@@ -325,16 +325,27 @@ pub fn run_loopback(scenario: &Scenario, seed: u64, iterations: u32) -> Result<R
     // Windows loopback quirk: a fresh bind/listen on 9943 can collide with
     // TIME_WAIT remnants of the previous run (children share the local port;
     // Windows holds them ~4min) and surface as an immediate RST (10054 /
-    // 10057) instead of a bind failure — even with SO_REUSEADDR. Same seed
-    // reproduces identical metrics, so ONE retry keeps gates deterministic.
-    match run_loopback_inner(scenario, seed, iterations) {
-        Ok(m) => Ok(m),
-        Err(e) if e.contains("10054") || e.contains("10057") => {
-            run_loopback_inner(scenario, seed, iterations)
-                .map_err(|retry| format!("{e} | retry: {retry}"))
+    // 10057) instead of a bind failure — even with SO_REUSEADDR. The hostile
+    // window can outlive an instant retry, so back off before each retry.
+    // Same seed reproduces identical metrics; retries keep gates honest.
+    let mut attempt_err = String::new();
+    for cooldown_ms in [0u64, 100, 500] {
+        if cooldown_ms > 0 {
+            std::thread::sleep(Duration::from_millis(cooldown_ms));
         }
-        Err(e) => Err(e),
+        match run_loopback_inner(scenario, seed, iterations) {
+            Ok(m) => return Ok(m),
+            Err(e) if e.contains("10054") || e.contains("10057") => {
+                attempt_err = if attempt_err.is_empty() {
+                    e
+                } else {
+                    format!("{attempt_err} | retry(+{cooldown_ms}ms): {e}")
+                };
+            }
+            Err(e) => return Err(e),
+        }
     }
+    Err(attempt_err)
 }
 
 fn run_loopback_inner(
@@ -983,6 +994,235 @@ pub fn run_gaze_foveation() -> Result<GazeRunMetrics, String> {
         update_cost_us_mean,
         update_cost_us_max,
         samples: centers_x.len() as u32,
+    })
+}
+
+/// Wire-level gaze hop: the LAST untested link of the flagship path. The
+/// fake headset encodes REAL `TrackingData` packets (combined_eye_gaze
+/// quat, poll_timestamp) and fires them over a REAL UDP stream socket
+/// (`alvr_sockets::StreamSocket`, stream id TRACKING). The receiver side
+/// decodes, feeds the REAL `EyeTrackedFoveation`, and measures
+/// send→centers latency. Everything on this path is the product wire.
+/// (TCP stream variant: UDP's symmetric-port design — both ends bind the
+/// same port number on their own machines — is untestable on one host.)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GazeWireMetrics {
+    pub sent: u32,
+    pub received: u32,
+    pub delivered_pct: f64,
+    pub wire_latency_ms_mean: f64,
+    pub wire_latency_ms_p95: f64,
+    pub wire_latency_ms_max: f64,
+}
+
+const GAZE_WIRE_HEADSET_PORT: u16 = 19443;
+const GAZE_WIRE_PC_PORT: u16 = 19444;
+
+pub fn run_gaze_wire(samples: u32) -> Result<GazeWireMetrics, String> {
+    use alvr_common::{
+        AlvrFoveatedEncodingParams, Fov, Pose, ViewParams,
+        glam::{Quat, UVec2, Vec3},
+    };
+    use alvr_packets::{TRACKING, TrackingData};
+    use alvr_session::{SocketBufferConfig, SocketProtocol};
+    use alvr_sockets::StreamSocketBuilder;
+    use std::collections::VecDeque;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use x_foveation::EyeTrackedFoveation;
+
+    const POLL_HZ: f32 = 90.0;
+    const HOLD_N: u32 = 27;
+    const SWEEP_N: u32 = 45;
+    const SWEEP_DEG: f32 = 30.0;
+    const MAX_PACKET: usize = 1472;
+
+    assert!(
+        samples <= HOLD_N + SWEEP_N,
+        "cap samples at the scripted sweep"
+    );
+
+    let headset_port = GAZE_WIRE_HEADSET_PORT;
+    let pc_port = GAZE_WIRE_PC_PORT;
+    let poll_s = 1.0 / POLL_HZ;
+    let sweep_rate = SWEEP_DEG / ((SWEEP_N as f32) * poll_s); // deg/s
+
+    let t_sent: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+    // Fake headset: real stream socket listener, REAL TrackingData packets
+    // with a deterministic gaze sweep at 90 Hz.
+    let listener = StreamSocketBuilder::listen_for_server(
+        Duration::from_secs(5),
+        headset_port,
+        SocketProtocol::Tcp,
+        None,
+        SocketBufferConfig::default(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // PC side: real stream socket, subscribe TRACKING, decode, feed the real
+    // foveation, record send→centers latency.
+    let t_sent_pc = Arc::clone(&t_sent);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let pc_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let pc_errors_pc = Arc::clone(&pc_errors);
+    let pc = std::thread::spawn(move || -> Result<(u32, Vec<f64>), String> {
+        let log_err = |what: &str, e: String| {
+            pc_errors_pc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("{what}: {e}"));
+        };
+        let mut socket = StreamSocketBuilder::connect_to_client(
+            Duration::from_secs(5),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            headset_port,
+            SocketProtocol::Tcp,
+            None,
+            SocketBufferConfig::default(),
+            MAX_PACKET,
+        )
+        .map_err(|e| format!("pc connect: {e}"))?;
+        let mut receiver = socket.subscribe_to_stream::<TrackingData>(TRACKING, 32);
+        let _ = ready_tx.send(());
+
+        let view_params = [ViewParams {
+            pose: Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::ZERO,
+            },
+            fov: Fov {
+                left: -55.0_f32.to_radians(),
+                right: 55.0_f32.to_radians(),
+                up: 45.0_f32.to_radians(),
+                down: -45.0_f32.to_radians(),
+            },
+        }; 2];
+        let params = AlvrFoveatedEncodingParams {
+            encoded_view_resolution: [2048, 2048],
+            view_ratio: [1.0, 1.0],
+            center_size: [0.4, 0.4],
+            center_shifts: [[0.0, 0.0]; 2],
+            edge_ratio: [4.0, 4.0],
+        };
+        let mut foveation = EyeTrackedFoveation::new(params, UVec2::new(2048, 2048));
+        foveation.view_params = Some(view_params);
+
+        let mut latencies = Vec::new();
+        let mut received = 0u32;
+        while received < samples {
+            match socket.recv() {
+                Ok(()) => {}
+                Err(e) if format!("{e}").contains("Try again") => continue,
+                Err(e) => {
+                    log_err("stream recv pump", format!("{e}"));
+                    return Err(format!("stream recv pump: {e}"));
+                }
+            }
+            loop {
+                match receiver.recv(Duration::ZERO) {
+                    Ok(data) => {
+                        let (tracking, _) = data.get().map_err(|e| e.to_string())?;
+                        let sent_at = t_sent_pc
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .pop_front()
+                            .ok_or("received more packets than sent")?;
+                        if let Some(gaze) = tracking.face.eyes_combined {
+                            let now = Instant::now();
+                            foveation.update(tracking.poll_timestamp, Some(gaze), now);
+                            if foveation.centers(tracking.poll_timestamp).is_some() {
+                                latencies.push(now.duration_since(sent_at).as_secs_f64() * 1000.0);
+                            }
+                        }
+                        received += 1;
+                    }
+                    // Empty-queue timeouts (incl. recv(ZERO) racing the pump
+                    // dispatch) mean "no packet yet" — repump, not fatal.
+                    Err(e)
+                        if format!("{e}").contains("timed out")
+                            || format!("{e}").contains("Try again") =>
+                    {
+                        break;
+                    }
+                    Err(e) => {
+                        log_err("tracking recv", format!("{e}"));
+                        return Err(format!("tracking recv: {e}"));
+                    }
+                }
+            }
+        }
+        Ok((received, latencies))
+    });
+
+    if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        let pc_err = pc
+            .join()
+            .map(|r| format!("{r:?}"))
+            .unwrap_or_else(|_| "panicked".to_string());
+        return Err(format!("PC side never became ready: {pc_err}"));
+    }
+    let headset_sock = listener
+        .accept_from_server(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            pc_port,
+            MAX_PACKET,
+            Duration::from_secs(5),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut sender = headset_sock.request_stream::<TrackingData>(TRACKING);
+
+    let mut sent = 0u32;
+    for i in 0..samples {
+        let t = i as f32 * poll_s;
+        // Hold center, then a constant-velocity ramp (driver sign convention).
+        let az = if i < HOLD_N {
+            0.0
+        } else {
+            -((i - HOLD_N) as f32) * poll_s * sweep_rate
+        };
+        let packet = TrackingData {
+            poll_timestamp: Duration::from_secs_f32(t),
+            device_motions: vec![],
+            hand_skeletons: [None, None],
+            face: alvr_packets::FaceData {
+                eyes_combined: Some(Quat::from_rotation_y(az.to_radians())),
+                eyes_social: [None, None],
+                face_expressions: None,
+            },
+            body: None,
+        };
+        t_sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(Instant::now());
+        if let Err(e) = sender.send_header(&packet) {
+            let errs = pc_errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .join(" | ");
+            return Err(format!("headset send #{sent}: {e} || pc errors: [{errs}]"));
+        }
+        sent += 1;
+        std::thread::sleep(Duration::from_secs_f32(poll_s));
+    }
+
+    let (received, latencies) = pc.join().map_err(|_| "PC thread panicked".to_string())??;
+    let _ = headset_sock;
+
+    let ls = latency_stats(latencies.clone());
+    Ok(GazeWireMetrics {
+        sent,
+        received,
+        delivered_pct: if sent > 0 {
+            received as f64 / sent as f64 * 100.0
+        } else {
+            0.0
+        },
+        wire_latency_ms_mean: ls.mean_ms,
+        wire_latency_ms_p95: ls.p95_ms,
+        wire_latency_ms_max: ls.max_ms,
     })
 }
 

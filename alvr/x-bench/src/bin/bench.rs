@@ -10,8 +10,8 @@
 
 use std::process::ExitCode;
 use x_bench::{
-    RunMetrics, compare, gate, parse_gate, run_gaze_foveation, run_loopback, run_secure_control,
-    run_secure_loopback, scenario, scenarios, write_run,
+    RunMetrics, compare, gate, parse_gate, run_gaze_foveation, run_gaze_wire, run_loopback,
+    run_secure_control, run_secure_loopback, scenario, scenarios, write_run,
 };
 
 fn chrono_like_timestamp() -> String {
@@ -311,6 +311,47 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 return Err("gaze gate failed".into());
             }
             println!("GATE: settle ≤120ms and update ≤100µs — PASS");
+            Ok(())
+        }
+        "gaze_wire" => {
+            // Wire-level gaze: REAL TrackingData over REAL UDP stream socket.
+            // Gate: 100% delivery on loopback, p95 wire latency < 5ms.
+            let mut samples = 60u32;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--samples" => {
+                        samples = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(60);
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown flag {other:?}")),
+                }
+            }
+            let m = run_gaze_wire(samples)?;
+            println!(
+                "gaze wire: TrackingData(combined_eye_gaze) over TCP stream socket, real decode + foveation"
+            );
+            println!(
+                "sent={} received={} delivered={:.1}%",
+                m.sent, m.received, m.delivered_pct
+            );
+            println!(
+                "wire_latency_ms mean={:.3} p95={:.3} max={:.3}",
+                m.wire_latency_ms_mean, m.wire_latency_ms_p95, m.wire_latency_ms_max
+            );
+            let mut failed = false;
+            if m.delivered_pct < 100.0 {
+                println!("GATE FAIL: delivered {}% < 100%", m.delivered_pct);
+                failed = true;
+            }
+            if m.wire_latency_ms_p95 > 5.0 {
+                println!("GATE FAIL: p95 {}ms > 5ms", m.wire_latency_ms_p95);
+                failed = true;
+            }
+            if failed {
+                return Err("gaze_wire gate failed".into());
+            }
+            println!("GATE: 100% delivery and p95 <5ms — PASS");
             Ok(())
         }
         "nvenc" => {
