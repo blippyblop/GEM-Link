@@ -20,3 +20,10 @@ Report via **GitHub private vulnerability reporting** (no project domain yet; em
 ## Transport security posture (ADR-0006)
 
 Noise-XX transport encryption is unconditional in release builds. A plaintext transport exists **only** under the compile-time feature `insecure-debug-transport` (default OFF), for wire debugging — it cannot be enabled at runtime and does not exist in release binaries.
+
+**Implementation status (2026-10-01, honest).** The primitives are built, benched and
+CI-gated (`x-crypto`, `bench secure` — ADR-0006), but they are **not yet wired
+end-to-end**: the control plane still runs the plaintext socket and the media plane has
+no crypto. Until that lands (tracked as an **M1 gate** in [ROADMAP.md](ROADMAP.md)), the
+statement above is the project's **requirement, not a description of current binaries**.
+Nothing in this project ships as release until it is true.

@@ -1,9 +1,9 @@
 # CHARTER
 
 ## Mission
-**GemLink** is a forever-free, open-source, non-commercial PC-VR streaming stack: game *and* desktop streaming from Windows, virtual displays, strong defaults, and an open per-device policy engine — without requiring SteamVR.
+**GemLink** is a forever-free, open-source, non-commercial PC-VR streaming stack for Windows: **SteamVR is the primary VR path** (ADR-0005, ADR-0009), with desktop streaming, virtual displays, and an open per-device policy engine as the modular second source that works **without SteamVR installed**.
 
-**First-class device: the Steam Frame** — streamed at 90–120 Hz inside a **300 Mbps + foveated-encoding** envelope, tuned for **minimum glass-to-glass latency**. Gaze-driven foveation is the flagship feature; motion synthesis happens exactly once, at the client.
+**First-class device: the Steam Frame** — streamed at 90–120 Hz inside a **300 Mbps + gaze-driven foveated-encoding** envelope, tuned for **minimum measured latency**. Gaze-driven foveation is the flagship feature; motion synthesis happens exactly once, at the client. The score is the frame-delivery **tail** — you will not find a target, a gate or a number restated here; they live in [ROADMAP.md](ROADMAP.md) (single source of truth), what we are measured against in [docs/BAR.md](docs/BAR.md), and how we measure in [docs/BENCH.md](docs/BENCH.md).
 
 Built on [ALVR](https://github.com/alvr-org/ALVR) by zarik5 & the alvr-org community; licensed **MIT** — do what you want, attribution included (see NOTICE).
 
@@ -18,6 +18,7 @@ Built on [ALVR](https://github.com/alvr-org/ALVR) by zarik5 & the alvr-org commu
 - Paid features, commercial licensing, marketplace distribution deals.
 - Supporting closed platforms that forbid interoperability research.
 - Reproducing proprietary products' anti-user choices (obfuscation, lock-in).
+- Chasing breadth over depth: other devices ride along at lower priority; the competitive bar and the scope we decline are stated in [docs/BAR.md](docs/BAR.md).
 - Being everything: Linux-first users are better served by WiVRn; we are Windows-first, openly.
 
 ## Funding policy

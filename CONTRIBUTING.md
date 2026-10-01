@@ -8,7 +8,7 @@ Thanks for helping build a free, open VR streaming stack.
 - Don't paste code from proprietary VR software; *parameters and behavior* are fine — see `docs/PRESETS.md` provenance note. Also: GPL/NC-licensed third-party code can't be merged (MIT stays pure) — ideas and APIs fine, code no.
 
 ## Engineering rules
-1. Every feature ships with a bench scenario (`bench/`) and a gate (latency/SSIM/stability) — no measurements, no merge.
+1. Every feature ships with a bench scenario (`bench/`) and a gate — no measurements, no merge. The score is the frame-delivery **tail** (0 % over the 90 Hz budget), defined in `ROADMAP.md` and detailed in `docs/BENCH.md`.
 2. `cargo fmt` + `cargo clippy -D warnings` clean.
 3. Roadmap work goes in the `x-*` crates; changes to shared upstream crates must be recorded in `PATCHES.md` (one line each — this is our rebase budget).
 4. Encryption, network, and driver code requires a second reviewer once the team has 2+ maintainers.
@@ -20,7 +20,7 @@ Thanks for helping build a free, open VR streaming stack.
 3. One maintainer review (two for security/driver code).
 
 ## Where to start
-See `ROADMAP.md` milestone marked `help-wanted`, and `docs/BENCH.md` for the testing setup.
+`ROADMAP.md` states the goals, the score and which gates are open — the **M3 client** is the long pole. `docs/BENCH.md` is the testing setup; `docs/BAR.md` is what we are measured against.
 
 ---
 # Code style & AI policy (inherited from upstream ALVR)

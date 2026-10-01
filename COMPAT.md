@@ -1,6 +1,8 @@
 # COMPAT — Device compatibility matrix
 
-Generated from bench + field reports. ✅ verified · 🟨 works w/ caveats · ⬜ untested · ❌ known-broken.
+Generated from bench + field reports. ✅ verified · 🟨 works w/ caveats · 🚧 partial · ⬜ untested · ❌ known-broken.
+
+Targets and gates are defined once in [ROADMAP.md](ROADMAP.md); how the numbers are produced is in [docs/BENCH.md](docs/BENCH.md). An untested cell is `⬜`, not a claim.
 
 | Device | Client build | Res ladder | Refresh | Codecs | Foveation | Tracking | Notes |
 |---|---|---|---|---|---|---|---|
@@ -9,7 +11,7 @@ Generated from bench + field reports. ✅ verified · 🟨 works w/ caveats · �
 | Quest Pro | ⬜ | ✅ presets | 90 | HEVC10 | ✅ eye | ⬜ | eye-tracked foveation |
 | Pico 4 / Ultra | ⬜ | ✅ presets | 72/90 | HEVC10/AV1(U) | ✅ | ⬜ |  |
 | Vive Focus 3 / XR Elite | ⬜ | ✅ presets | 90 | HEVC10 | ✅ | ⬜ | upstream notes "laggy" |
-| Steam Frame | ⬜ | ✅ presets | 90 | AV1 | ⬜ | ⬜ | new — needs farm time |
+| Steam Frame | ⬜ | ✅ presets | 90–120 | HEVC/H264 | 🚧 eye | ⬜ | **first-class device**; no AV1/10-bit (ADR-0008); client unbuilt (M3) |
 | Galaxy XR | ⬜ | ✅ presets | ⬜ | ⬜ | ⬜ | ⬜ |  |
 | Desktop (virtual display) | ⬜ | M2 gate | any | all | n/a | n/a |  |
 

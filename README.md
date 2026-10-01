@@ -1,15 +1,17 @@
 # GemLink
 
-*A free, open, non-commercial PC-VR streaming stack, rebuilt ground-up with the **Steam Frame** as its first-class device — game **and** desktop streaming from Windows, virtual displays, gaze-driven foveated encoding, and a single-minded obsession with glass-to-glass latency. Built on [ALVR](https://github.com/alvr-org/ALVR), licensed [MIT](LICENSE) — do what you want, attribution included.*
+*A free, open, non-commercial PC-VR streaming stack, rebuilt ground-up with the **Steam Frame** as its first-class device — game **and** desktop streaming from Windows, virtual displays, gaze-driven foveated encoding, and a single-minded obsession with the latency **tail**. Built on [ALVR](https://github.com/alvr-org/ALVR), licensed [MIT](LICENSE) — do what you want, attribution included.*
 
 No ads. No tiers. No telemetry. Encryption always on.
 
 ## Target
 
-**Device:** Steam Frame (Qualcomm SM8650 / Adreno 750, 2160×2160 LCD per eye, 72–144 Hz, eye-tracking cameras).
+**Device:** Steam Frame (Qualcomm SM8650 / Adreno 750, 2160×2160 LCD per eye, panel 72–144 Hz; the gating envelope is 90–120 Hz; eye-tracking cameras). Render resolution is the **client's** call.
 **Links:** Wi-Fi 7 on 6 GHz (the Frame's own SoftAP + dongle, or LAN) · USB-C NCM wired.
-**Envelope:** 300 Mbps **with foveated encoding** — gaze-driven foveation is the flagship feature, fixed foveation the fallback.
-**North-star metric:** measured glass-to-glass latency. Motion synthesis happens exactly once, at the client — never baked into the PC's encoded frame.
+**Envelope:** 300 Mbps **with gaze-driven foveated encoding** — the flagship feature; fixed foveation the fallback. Decode is **HEVC/H.264** (the Frame kernel decodes neither AV1 nor 10-bit today).
+**North-star metric:** the **tail**, not the mean — **0 % of frames over the 90 Hz budget (1000/90 ms)**, the 120 Hz budget (1000/120 ms) as the published target, absolute latency minimized after that. Motion synthesis happens exactly once, at the client — never baked into the PC's encoded frame.
+
+Single source of truth for targets and gates: [ROADMAP.md](ROADMAP.md). What we are measured against: [docs/BAR.md](docs/BAR.md). How we measure: [docs/BENCH.md](docs/BENCH.md).
 
 ## Why this fork exists
 
@@ -17,11 +19,11 @@ Upstream ALVR is a SteamVR driver maintained at a declining cadence (754→49 co
 
 ## Status
 
-🚧 Pre-release, Phase 0 (foundations: protocol crate, capability negotiation, bench). See [ROADMAP.md](ROADMAP.md). Honest, bench-generated compatibility data: [COMPAT.md](COMPAT.md).
+🚧 Pre-release. The **server half of the first shippable target works** — a real SteamVR game streams end-to-end through GemLink's `server_openvr` driver (2026-10-01); the Steam Frame client is the long pole and is next. See [ROADMAP.md](ROADMAP.md) and [docs/BAR.md](docs/BAR.md). Honest, bench-generated compatibility data: [COMPAT.md](COMPAT.md).
 
 ## Bench & development
 
-Every feature lands with a measured scenario (`docs/BENCH.md`): latency p50/p95/p99, SSIM at equal bitrate, missed-deadline %. PRs require a scenario. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Every feature lands with a measured scenario ([docs/BENCH.md](docs/BENCH.md)): frame-delivery tail (missed-deadline %), latency p50/p95/p99, SSIM at equal bitrate. PRs require a scenario. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Provenance & attribution
 
