@@ -29,6 +29,21 @@ alvr_session = { path = "alvr/session" }
 alvr_sockets = { path = "alvr/sockets" }
 alvr_system_info = { path = "alvr/system_info" }
 
+# Release-speed build with the dbg_* tracing compiled in.
+#
+# Every dbg_* macro in alvr_common::logging is gated on cfg(debug_assertions),
+# and the C++ side reaches them through alvr_dbg_server_impl, so a plain release
+# build silently drops all of it: the connection/frame/encoder tracing simply
+# does not exist in the artifact. That makes "the stream never starts" very hard
+# to diagnose from the release binary.
+#
+# This profile keeps release codegen and the release CRT (so the driver still
+# loads the same way) while enabling the tracing:
+#     cargo build -p alvr_server_openvr --profile traced
+[profile.traced]
+inherits = "release"
+debug-assertions = true
+
 [profile.release]
 debug = "limited"
 strip = false
