@@ -270,6 +270,7 @@ fn main() {
         };
 
     let t0 = Instant::now();
+    let mut base = t0;
     let mut total_bytes: u64 = 0;
     let mut max_frame = 0usize;
     let mut send_late_ms: Vec<f64> = Vec::new();
@@ -325,9 +326,21 @@ fn main() {
         // adds the encode time to the frame period (we measured 11.1 + 3.1 =
         // 14.6 ms -> 68 fps instead of 90). A deadline schedule hides the work
         // inside the budget, which is what the real server does.
-        let deadline = t0 + Duration::from_micros((i as u64 + 1) * FRAME_INTERVAL_US);
+        //
+        // Re-anchor when we fall more than a frame behind. Without this the
+        // shortfall accumulates without bound (we measured p50 2385 ms of
+        // "lateness" over 900 frames simply because we were ~2.6 ms/frame
+        // short), which measures the backlog since frame 0 rather than the
+        // current shortfall. A real streamer drops frames to catch up; this is
+        // the harness equivalent, so the lateness number stays meaningful.
+        let mut deadline = base + Duration::from_micros((i as u64 + 1) * FRAME_INTERVAL_US);
         if let Some(rest) = deadline.checked_duration_since(Instant::now()) {
             thread::sleep(rest);
+        } else if Instant::now().saturating_duration_since(deadline)
+            > Duration::from_micros(FRAME_INTERVAL_US)
+        {
+            base = Instant::now() - Duration::from_micros(i as u64 * FRAME_INTERVAL_US);
+            deadline = base + Duration::from_micros((i as u64 + 1) * FRAME_INTERVAL_US);
         }
         send_late_ms.push(Instant::now().saturating_duration_since(deadline).as_secs_f64() * 1e3);
     }

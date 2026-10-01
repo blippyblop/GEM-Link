@@ -280,8 +280,18 @@ impl DdaFeeder {
     pub fn encode_next(&mut self) -> Result<Vec<u8>, String> {
         let slot = self.idx % self.pool.len();
 
-        // 20 ms wait-bounded poll.
-        let frame = match unsafe { self.dup.acquire(20) } {
+        // Short wait-bounded poll, NOT VD's 20 ms.
+        //
+        // VD polls at 20 ms because the desktop's own composition is its clock:
+        // it only encodes when LastPresentTime changes, and the frame rate
+        // follows the desktop. Our harness is the opposite -- we pace at a
+        // fixed 90 Hz and the desktop is just a content source. A 20 ms block
+        // therefore exceeds the 11.1 ms frame interval, so on a mostly-static
+        // desktop (where the poll times out) every frame takes >= 20 ms, the
+        // cadence collapses, and the client dies with "Connection error: Try
+        // again" (a receive timeout). Keep the poll well inside the budget and
+        // re-encode the previous texture when there is nothing new.
+        let frame = match unsafe { self.dup.acquire(1) } {
             Ok(Some(f)) => Some(f),
             Ok(None) => {
                 self.empty_polls += 1;
