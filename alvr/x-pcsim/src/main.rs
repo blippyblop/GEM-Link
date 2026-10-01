@@ -37,6 +37,8 @@ use std::{
 mod nvenc;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-frame trace path, for joining against the client's CSV.
+const PCSIM_CSV: &str = "pcsim_frames.csv";
 /// 90 Hz.
 const FRAME_INTERVAL: Duration = Duration::from_micros(11_111);
 const FRAME_INTERVAL_US: u64 = 11_111;
@@ -60,11 +62,15 @@ impl Source {
         None
     }
 
-    fn next_frame(&mut self) -> Result<Vec<u8>, String> {
+    /// Returns (bitstream, encode_ms). Synthetic has no encode step.
+    fn next_frame(&mut self) -> Result<(Vec<u8>, f64), String> {
         match self {
-            Source::Synthetic(p) => Ok(p.clone()),
+            Source::Synthetic(p) => Ok((p.clone(), 0.0)),
             #[cfg(windows)]
-            Source::Nvenc(f) => f.encode_next(),
+            Source::Nvenc(f) => {
+                let b = f.encode_next()?;
+                Ok((b, f.last_encode_ms()))
+            }
         }
     }
 }
@@ -225,6 +231,8 @@ fn main() {
     let mut total_bytes: u64 = 0;
     let mut max_frame = 0usize;
     let mut send_late_ms: Vec<f64> = Vec::new();
+    // Per-frame trace, joinable with the client's on the header timestamp.
+    let mut trace: Vec<(u64, usize, f64, f64)> = Vec::new();
     let _ = FRAME_INTERVAL;
     println!("[pcsim] streaming {frames} frames over VIDEO (target {} fps)", 1_000_000 / FRAME_INTERVAL_US);
 
@@ -247,7 +255,7 @@ fn main() {
             is_idr: i == 0 || i % 120 == 0,
         };
 
-        let payload = match source.next_frame() {
+        let (payload, encode_ms) = match source.next_frame() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[pcsim] frame {i} encode failed: {e}");
@@ -264,6 +272,12 @@ fn main() {
             eprintln!("[pcsim] video send failed at frame {i}: {e}");
             exit(1);
         }
+        trace.push((
+            header.timestamp.as_micros() as u64,
+            payload.len(),
+            encode_ms,
+            send_late_ms.last().copied().unwrap_or(0.0),
+        ));
 
         // Pace against absolute deadlines. Sleeping the interval AFTER encoding
         // adds the encode time to the frame period (we measured 11.1 + 3.1 =
@@ -300,6 +314,30 @@ fn main() {
             send_late_ms[m - 1]
         );
         println!("[pcsim]   over 90Hz budget: {over90}/{m} | over 120Hz budget: {over120}/{m}");
+    }
+    if !trace.is_empty() {
+        let mut enc: Vec<f64> = trace.iter().map(|r| r.2).collect();
+        enc.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let m = enc.len();
+        println!(
+            "[pcsim]   worst encode: max {:.2} ms at frame {}",
+            enc[m - 1],
+            trace.iter().position(|r| r.2 == enc[m - 1]).unwrap_or(0)
+        );
+        let mut by_size: Vec<&(u64, usize, f64, f64)> = trace.iter().collect();
+        by_size.sort_by_key(|r| std::cmp::Reverse(r.1));
+        println!("[pcsim]   biggest frames (idx by size): {:?}", by_size.iter().take(5).map(|r| (r.1, r.2 as u64)).collect::<Vec<_>>());
+        match std::fs::File::create(PCSIM_CSV) {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                let _ = writeln!(f, "header_ts_us,size_bytes,encode_ms,send_late_ms");
+                for r in &trace {
+                    let _ = writeln!(f, "{},{},{:.3},{:.3}", r.0, r.1, r.2, r.3);
+                }
+                println!("[pcsim] per-frame CSV written to {PCSIM_CSV}");
+            }
+            Err(e) => eprintln!("[pcsim] could not write CSV: {e}"),
+        }
     }
     if let Some((n, p50, p99, mean)) = source.encode_stats() {
         println!(

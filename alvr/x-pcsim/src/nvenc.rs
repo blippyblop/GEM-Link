@@ -89,6 +89,14 @@ impl Feeder {
         Ok(out)
     }
 
+    /// Encode time of the most recent frame, in ms.
+    pub fn last_encode_ms(&self) -> f64 {
+        self.encode_times
+            .last()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .unwrap_or(0.0)
+    }
+
     /// (count, p50_ms, p99_ms, mean_ms) over the encode calls so far.
     pub fn encode_stats(&self) -> (usize, f64, f64, f64) {
         let mut ms: Vec<f64> = self.encode_times.iter().map(|d| d.as_secs_f64() * 1e3).collect();

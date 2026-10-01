@@ -2,19 +2,28 @@
 //!
 //! Drives the **real** `client_core` connection pipeline with no VR runtime and
 //! no display, so the Frame client stack can be exercised against a real
-//! streamer while running under qemu on a sim host (pavserv). It is
-//! `alvr_client_mock`'s `client_thread` with the eframe GUI removed.
+//! streamer while running under qemu on a sim host (pavserv).
 //!
 //! The client *listens* on the well-known control port; the streamer dials it.
-//! Exits 0 as soon as the session is negotiated (that is the M1 gate), non-zero
-//! on timeout, so a rig can assert on it.
 //!
-//! Set `FRAMESIM_FRAMES=N` to instead require N decoded-input frames before
-//! exiting 0 — that is the video-path gate.
+//! Gates (env `FRAMESIM_FRAMES=N`):
+//!   exits 0 once N frames have arrived inside every frame budget,
+//!   exits 3 if any frame missed a budget, 2 on timeout.
+//!
+//! The goal is NOT a frame rate. One frame arriving 100 ms late and the rest
+//! arriving in 1 ms still averages 90 fps and looks awful. What matters is the
+//! tail: every frame inside the budget.
+//!
+//! Diagnostics (env `FRAMESIM_CSV=path`): writes one row per frame —
+//! `idx,header_ts_us,size_bytes,dev_ms,gap_ms` — so a run can be joined against
+//! the streamer's own per-frame trace on `header_ts_us`. Without that join, a
+//! budget miss is just a number with no cause.
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::glam::UVec2;
 use std::{
+    fs::File,
+    io::Write,
     process::exit,
     sync::{
         Arc, Mutex,
@@ -24,7 +33,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long to wait for the streamer to turn up and negotiate.
+/// The streamer's cadence, used to compute expected arrival times.
+const FRAME_INTERVAL_US: u64 = 11_111;
+
+/// Frame-budget gates, in ms, with the label to print.
+///
+/// We assert "zero frames over budget" rather than "99.99% within budget",
+/// because substantiating 99.99% needs >= 10_000 samples; asserting it from a
+/// few hundred frames would be a dishonest number. The sample count is printed
+/// either way.
+const DEADLINES_MS: [(f64, &str); 2] = [
+    (1000.0 / 90.0, "primary  (90 Hz budget, 11.111 ms)"),
+    (1000.0 / 120.0, "ideal    (120 Hz budget,  8.333 ms)"),
+];
+
+/// One received frame: arrival instant, bitstream size, sender's timestamp.
+#[derive(Clone, Copy)]
+struct Sample {
+    at: Instant,
+    size: usize,
+    header_ts: Duration,
+}
+
 fn timeout() -> Duration {
     std::env::var("FRAMESIM_TIMEOUT_SECS")
         .ok()
@@ -33,29 +63,18 @@ fn timeout() -> Duration {
         .unwrap_or(Duration::from_secs(90))
 }
 
-/// Frame-budget gates, in ms, with the label to print.
-///
-/// The goal is NOT a frame rate: a mean of 90 fps is trivially hit by one frame
-/// arriving 100 ms late and the rest arriving in 1 ms, which looks awful. What
-/// matters is the tail — every frame inside the budget. Primary is the 90 Hz
-/// budget (1000/90 = 11.111 ms); ideal is the 120 Hz budget (8.333 ms).
-///
-/// We assert "zero frames over budget" rather than "99.99% within budget",
-/// because substantiating 99.99% needs >= 10_000 samples; asserting it from a
-/// few hundred frames would be a dishonest number. Run with a large
-/// FRAMESIM_FRAMES to make the claim, and the count is printed either way.
-const FRAME_INTERVAL_US: u64 = 11_111;
-const DEADLINES_MS: [(f64, &str); 2] = [
-    (1000.0 / 90.0, "primary  (90 Hz budget, 11.111 ms)"),
-    (1000.0 / 120.0, "ideal    (120 Hz budget,  8.333 ms)"),
-];
-
-/// If non-zero, require this many video frames before declaring success.
 fn frame_target() -> usize {
     std::env::var("FRAMESIM_FRAMES")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted[((sorted.len() as f64 - 1.0) * q) as usize]
 }
 
 fn main() {
@@ -90,42 +109,32 @@ fn main() {
 
     let ctx = ClientCoreContext::new(capabilities, vec![]);
 
-    // A null decoder: accept every frame and count it. Returning `false` is read
-    // as decoder saturation and makes the client spam RequestIdr, so always
+    // A null decoder: accept every frame and record it. Returning `false` is
+    // read as decoder saturation and makes the client spam RequestIdr, so always
     // accept. This is what lets the sim prove real video arrived with no
     // hardware decoder in the loop.
     let frames = Arc::new(AtomicUsize::new(0));
-    let frames_seen = Arc::clone(&frames);
-    let first = Arc::new(AtomicBool::new(true));
-    let first_frame = Arc::clone(&first);
     let bytes = Arc::new(AtomicUsize::new(0));
+    let samples: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
+    let first = Arc::new(AtomicBool::new(true));
+
+    let frames_seen = Arc::clone(&frames);
     let bytes_seen = Arc::clone(&bytes);
-    // Arrival instants. Raw inter-frame gap is the WRONG metric for a paced
-    // stream: gaps jitter symmetrically around the period, so ~half exceed it by
-    // construction and it looks like a failure when nothing is wrong. What
-    // matters is deviation from the expected cadence (a long gap followed by a
-    // short one is not a hitch).
-    let arrivals: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
-    let arrivals_seen = Arc::clone(&arrivals);
-    let mut last: Option<Instant> = None;
-    let first_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-    let first_at_seen = Arc::clone(&first_at);
-    ctx.set_decoder_input_callback(Box::new(move |timestamp, nal| {
+    let samples_seen = Arc::clone(&samples);
+    let first_frame = Arc::clone(&first);
+    ctx.set_decoder_input_callback(Box::new(move |header_ts, nal| {
         let n = frames_seen.fetch_add(1, Ordering::SeqCst) + 1;
         bytes_seen.fetch_add(nal.len(), Ordering::SeqCst);
-        let now = Instant::now();
-        if let Ok(mut f) = first_at_seen.lock() {
-            if f.is_none() {
-                *f = Some(now);
-            }
+        if let Ok(mut s) = samples_seen.lock() {
+            s.push(Sample {
+                at: Instant::now(),
+                size: nal.len(),
+                header_ts,
+            });
         }
-        if let Ok(mut a) = arrivals_seen.lock() {
-            a.push(now);
-        }
-        let _ = last;
         if first_frame.swap(false, Ordering::SeqCst) || n % 60 == 0 {
             println!(
-                "[framesim] video frame #{n} ts={timestamp:?} bytes={}",
+                "[framesim] video frame #{n} ts={header_ts:?} bytes={}",
                 nal.len()
             );
         }
@@ -180,69 +189,8 @@ fn main() {
         }
 
         if want_frames > 0 && frames.load(Ordering::SeqCst) >= want_frames {
-            let n = frames.load(Ordering::SeqCst);
-            // Measure over the frame span: `start` predates the handshake and
-            // qemu's startup, which made this read as a nonsense 5 fps.
-            let secs = first_at
-                .lock()
-                .ok()
-                .and_then(|f| *f)
-                .map(|f| f.elapsed().as_secs_f64())
-                .unwrap_or_else(|| start.elapsed().as_secs_f64())
-                .max(1e-6);
-            let total = bytes.load(Ordering::SeqCst);
-            println!("[framesim] VIDEO OK: received {n} video frames");
-            println!(
-                "[framesim]   {:.0} fps, {:.1} Mbps, {} bytes",
-                n as f64 / secs,
-                total as f64 * 8.0 / secs / 1e6,
-                total
-            );
-            let mut gate_ok = true;
-            if let Ok(a) = arrivals.lock() {
-                if a.len() > 2 {
-                    let interval = Duration::from_micros(FRAME_INTERVAL_US);
-                    let first = a[0];
-                    // Signed lateness of each frame against where it should have
-                    // landed if the stream were perfectly paced.
-                    let mut late: Vec<f64> = a
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| {
-                            let expected = first + interval * i as u32;
-                            (t.saturating_duration_since(expected).as_secs_f64()
-                                - expected.saturating_duration_since(*t).as_secs_f64())
-                                * 1e3
-                        })
-                        .collect();
-                    late.sort_by(|x, y| x.partial_cmp(y).unwrap());
-                    let m = late.len();
-                    // Centre on the median. The absolute offset is unknowable:
-                    // we cannot compare clocks, and the first frame sits queued
-                    // behind session setup, which shifts every later frame's
-                    // apparent lateness. Only the spread is real.
-                    let mid = late[m / 2];
-                    let dev: Vec<f64> = late.iter().map(|x| x - mid).collect();
-                    println!(
-                        "[framesim]   cadence deviation from median: min {:.2} ms, p99 {:.2} ms, max {:.2} ms",
-                        dev[0], dev[(m * 99 / 100).min(m - 1)], dev[m - 1]
-                    );
-                    println!("[framesim]   samples: {m} frames (99.99% needs >= 10000)");
-                    for (deadline, label) in DEADLINES_MS {
-                        let over = dev.iter().filter(|x| x.abs() > deadline).count();
-                        let ok = over == 0;
-                        if label.starts_with("primary") {
-                            gate_ok = ok;
-                        }
-                        println!(
-                            "[framesim]   {label}: {over}/{m} outside budget ({:.4}%) -> {}",
-                            over as f64 * 100.0 / m as f64,
-                            if ok { "PASS" } else { "FAIL" }
-                        );
-                    }
-                }
-            }
-            exit(if gate_ok { 0 } else { 3 });
+            let code = report(&samples, &bytes, start);
+            exit(code);
         }
 
         if start.elapsed() > limit {
@@ -256,4 +204,130 @@ fn main() {
 
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Statistics, gates, and — the point of this file — per-outlier context.
+fn report(samples: &Arc<Mutex<Vec<Sample>>>, bytes: &Arc<AtomicUsize>, start: Instant) -> i32 {
+    let s = match samples.lock() {
+        Ok(s) => s.clone(),
+        Err(_) => return 0,
+    };
+    let n = s.len();
+    if n < 3 {
+        println!("[framesim] only {n} frames; nothing to report");
+        return 0;
+    }
+
+    // Cadence deviation, centred on the median. The absolute offset is
+    // unknowable (no shared clock, and the first frame sits queued behind
+    // session setup); only the spread is real.
+    let interval = FRAME_INTERVAL_US as f64 / 1000.0;
+    let mut dev: Vec<f64> = Vec::with_capacity(n);
+    for (i, smp) in s.iter().enumerate() {
+        let rel = smp.at.duration_since(s[0].at).as_secs_f64() * 1e3;
+        dev.push(rel - i as f64 * interval);
+    }
+    let mut sorted = dev.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mid = percentile(&sorted, 0.5);
+    let centred: Vec<f64> = dev.iter().map(|d| d - mid).collect();
+
+    let span = s[n - 1].at.duration_since(s[0].at).as_secs_f64().max(1e-6);
+    let total = bytes.load(Ordering::SeqCst);
+    println!("[framesim] VIDEO OK: received {n} video frames");
+    println!(
+        "[framesim]   {:.1} fps, {:.1} Mbps, {} bytes",
+        (n - 1) as f64 / span,
+        total as f64 * 8.0 / span / 1e6,
+        total
+    );
+    let mut cs = centred.clone();
+    cs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "[framesim]   cadence deviation: min {:.2} ms, p50 {:.2} ms, p99 {:.2} ms, max {:.2} ms",
+        cs[0],
+        percentile(&cs, 0.5),
+        percentile(&cs, 0.99),
+        cs[n - 1]
+    );
+    println!("[framesim]   samples: {n} (99.99% needs >= 10000)");
+
+    let mut gate_ok = true;
+    for (deadline, label) in DEADLINES_MS {
+        let over = centred.iter().filter(|x| x.abs() > deadline).count();
+        let ok = over == 0;
+        if label.starts_with("primary") {
+            gate_ok = ok;
+        }
+        println!(
+            "[framesim]   {label}: {over}/{n} outside budget ({:.4}%) -> {}",
+            over as f64 * 100.0 / n as f64,
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+
+    // ---- per-outlier context: the whole reason this exists ----
+    let mut sizes: Vec<usize> = s.iter().map(|x| x.size).collect();
+    sizes.sort_unstable();
+    let median_size = sizes[sizes.len() / 2];
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| centred[b].abs().partial_cmp(&centred[a].abs()).unwrap());
+    println!("[framesim] worst offenders (join on header_ts_us with the streamer's CSV):");
+    println!("[framesim]   idx  dev_ms   gap_ms   size_B  idr?  header_ts_us");
+    for &i in idx.iter().take(10) {
+        let gap = if i == 0 {
+            0.0
+        } else {
+            s[i].at.duration_since(s[i - 1].at).as_secs_f64() * 1e3
+        };
+        println!(
+            "[framesim]   {:>4}  {:>7.2}  {:>7.2}  {:>7}  {:>4}  {}",
+            i,
+            centred[i],
+            gap,
+            s[i].size,
+            if s[i].size > median_size * 2 { "yes" } else { "" },
+            s[i].header_ts.as_micros()
+        );
+    }
+
+    // Is the tail explained by big frames (IDRs) rather than by the transport?
+    let outlier_idx: Vec<usize> = (0..n).filter(|&i| centred[i].abs() > DEADLINES_MS[0].0).collect();
+    let big = outlier_idx.iter().filter(|&&i| s[i].size > median_size * 2).count();
+    println!(
+        "[framesim] {}/{} outliers are >2x median size ({} B); median frame {} B",
+        big,
+        outlier_idx.len(),
+        median_size * 2,
+        median_size
+    );
+
+    if let Ok(path) = std::env::var("FRAMESIM_CSV") {
+        match File::create(&path) {
+            Ok(mut f) => {
+                let _ = writeln!(f, "idx,header_ts_us,size_bytes,dev_ms,gap_ms");
+                for i in 0..n {
+                    let gap = if i == 0 {
+                        0.0
+                    } else {
+                        s[i].at.duration_since(s[i - 1].at).as_secs_f64() * 1e3
+                    };
+                    let _ = writeln!(
+                        f,
+                        "{},{},{},{:.3},{:.3}",
+                        i,
+                        s[i].header_ts.as_micros(),
+                        s[i].size,
+                        centred[i],
+                        gap
+                    );
+                }
+                println!("[framesim] per-frame CSV written to {path}");
+            }
+            Err(e) => eprintln!("[framesim] could not write CSV {path}: {e}"),
+        }
+    }
+
+    let _ = start;
+    if gate_ok { 0 } else { 3 }
 }
