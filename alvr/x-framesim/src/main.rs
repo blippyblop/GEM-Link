@@ -20,7 +20,11 @@
 //! budget miss is just a number with no cause.
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
-use alvr_common::glam::UVec2;
+use alvr_common::{
+    DeviceMotion, HEAD_ID, Pose, ViewParams,
+    glam::{Quat, UVec2, Vec3},
+};
+use alvr_packets::{FaceData, TrackingData};
 use std::{
     fs::File,
     io::Write,
@@ -75,6 +79,63 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
         return 0.0;
     }
     sorted[((sorted.len() as f64 - 1.0) * q) as usize]
+}
+
+/// Feed the streamer head tracking.
+///
+/// This is not decoration. On the streamer side,
+/// `OvrDirectModeComponent::SubmitLayer` matches the HMD pose the compositor
+/// submitted against its history of *tracking* poses to work out which frame it
+/// is holding. With no tracking that history is empty, every `GetBestPoseMatch`
+/// fails, the frame index stays 0, and every frame is discarded as a duplicate —
+/// so nothing is ever encoded and no video arrives, even though the whole
+/// compositor -> Present path is running. A headless sim therefore has to send
+/// poses even though it has no head.
+///
+/// Rate matches the mock client's: a third of the frame rate.
+fn tracking_thread(ctx: Arc<ClientCoreContext>, streaming: Arc<AtomicBool>, origin: Instant) {
+    ctx.send_view_params([ViewParams::DUMMY; 2]);
+
+    // The pose must be *unique per sample*, not merely present. A constant pose
+    // makes every entry in the streamer's pose history an equally good match, so
+    // consecutive frames resolve to the same timestamp and get discarded as
+    // duplicates (measured: ~85% discarded with a static pose). A slow yaw sweep
+    // plus a small deterministic jitter keeps each sample distinguishable, and
+    // keeps the motion plausible.
+    let mut lcg: u32 = 0x1234_5678;
+
+    let mut deadline = Instant::now();
+    loop {
+        if streaming.load(Ordering::SeqCst) {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let jitter = ((lcg >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.002;
+
+            let t = origin.elapsed().as_secs_f32();
+            let orientation = Quat::from_rotation_y(t * 0.5) * Quat::from_rotation_z(jitter);
+
+            ctx.send_tracking(TrackingData {
+                poll_timestamp: origin.elapsed(),
+                device_motions: vec![(
+                    *HEAD_ID,
+                    DeviceMotion {
+                        pose: Pose {
+                            orientation,
+                            // Standing height, so the pose is plausible rather
+                            // than at the floor origin.
+                            position: Vec3::new(0.0, 1.6, 0.0),
+                        },
+                        linear_velocity: Vec3::ZERO,
+                        angular_velocity: Vec3::ZERO,
+                    },
+                )],
+                hand_skeletons: [None, None],
+                face: FaceData::default(),
+                body: None,
+            });
+        }
+        deadline += Duration::from_micros(FRAME_INTERVAL_US / 3);
+        thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    }
 }
 
 fn main() {
@@ -153,6 +214,17 @@ fn main() {
     }));
 
     let want_frames = frame_target();
+
+    // Tracking must start as soon as there is a connection: the streamer cannot
+    // identify a single frame without a pose history to match against.
+    let streaming = Arc::new(AtomicBool::new(false));
+    let tracking_origin = Instant::now();
+    {
+        let ctx_for_tracking = Arc::clone(&ctx);
+        let streaming_for_tracking = Arc::clone(&streaming);
+        thread::spawn(move || tracking_thread(ctx_for_tracking, streaming_for_tracking, tracking_origin));
+    }
+
     ctx.resume();
     println!(
         "[framesim] resume() called; announcing + listening for the streamer (frame target: {})",
@@ -166,6 +238,8 @@ fn main() {
     let start = Instant::now();
     let limit = timeout();
     let mut last_hud = String::new();
+    let realtime_seen = AtomicBool::new(false);
+    let haptics_seen = AtomicBool::new(false);
 
     loop {
         while let Some(event) = ctx.poll_event() {
@@ -175,6 +249,7 @@ fn main() {
                     last_hud = message;
                 }
                 ClientCoreEvent::StreamingStarted(config) => {
+                    streaming.store(true, Ordering::SeqCst);
                     let n = &config.negotiated_config;
                     println!(
                         "[framesim] NEGOTIATED view={}x{} refresh={}Hz",
@@ -193,9 +268,22 @@ fn main() {
                     );
                 }
                 ClientCoreEvent::StreamingStopped => {
+                    streaming.store(false, Ordering::SeqCst);
                     println!("[framesim] stream stopped");
                 }
-                _ => println!("[framesim] event (unhandled variant)"),
+                ClientCoreEvent::RealTimeConfig(config) => {
+                    // Arrives repeatedly, not per frame; report once so it does
+                    // not drown the log.
+                    if !realtime_seen.swap(true, Ordering::SeqCst) {
+                        println!("[framesim] realtime config: ext={:?}", config.ext_str);
+                    }
+                }
+                ClientCoreEvent::Haptics { device_id, .. } => {
+                    // No actuator on a headless sim; note it once.
+                    if !haptics_seen.swap(true, Ordering::SeqCst) {
+                        println!("[framesim] haptics events arriving (device {device_id})");
+                    }
+                }
             }
         }
 

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 alvr_client_core.workspace = true
 alvr_common.workspace = true
+alvr_packets.workspace = true
 alvr_session.workspace = true
 alvr_system_info.workspace = true
 env_logger = "0.11"
