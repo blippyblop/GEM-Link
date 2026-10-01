@@ -8423,6 +8423,8 @@ dependencies = [
  "alvr_session",
  "alvr_sockets",
  "env_logger",
+ "windows 0.58.0",
+ "x-nvenc",
 ]
 
 [[package]]
