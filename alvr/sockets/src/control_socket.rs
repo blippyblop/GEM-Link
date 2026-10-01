@@ -31,6 +31,17 @@ pub fn bind(
     // SO_REUSEADDR (Linux scopes TIME_WAIT to the connection 4-tuple, so
     // the gap never showed there). Rebind-on-reconnect is a core flow.
     socket.set_reuse_address(true)?;
+    // GemLink (Windows): even with reuseaddr, fresh binds can race the
+    // ~4min TIME_WAIT of prior children and connections get RST'd
+    // mid-handshake. Windows accepted sockets INHERIT listener options
+    // (documented accept() behavior), so abortive close (SO_LINGER 0)
+    // here removes the TIME_WAIT source entirely: closes RST instead of
+    // FIN. RST teardown is acceptable for control sessions — dead peers
+    // are detected by keepalive timeout anyway.
+    #[cfg(windows)]
+    socket
+        .set_linger(Some(std::time::Duration::ZERO))
+        .map_err(|e| alvr_common::anyhow::anyhow!("set_linger: {e}"))?;
     socket.bind(&SocketAddr::new(LOCAL_IP, port).into())?;
     socket.listen(1024)?;
 
