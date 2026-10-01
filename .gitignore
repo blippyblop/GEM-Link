@@ -80,3 +80,5 @@ CLAUDE.md
 
 # local secrets never enter the repo
 .windowscreds
+.token
+.ssh/
