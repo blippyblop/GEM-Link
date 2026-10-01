@@ -10,8 +10,8 @@
 
 use std::process::ExitCode;
 use x_bench::{
-    RunMetrics, compare, gate, parse_gate, run_loopback, run_secure_loopback, scenario, scenarios,
-    write_run,
+    RunMetrics, compare, gate, parse_gate, run_loopback, run_secure_control, run_secure_loopback,
+    scenario, scenarios, write_run,
 };
 
 fn chrono_like_timestamp() -> String {
@@ -255,6 +255,33 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 ));
             }
             println!("GATE: 0% missed mandatory — PASS");
+
+            // Phase 2: the product wire — typed packets over
+            // alvr_sockets::SecureControlSocket (real crate, real handshake).
+            let c = run_secure_control(iterations)?;
+            println!(
+                "secure control plane: alvr_sockets::SecureControlSocket, real bincode packets"
+            );
+            println!(
+                "handshake_ms={:.3} rtt_ms mean={:.3} p50={:.3} p95={:.3} p99={:.3} max={:.3}",
+                c.handshake_ms,
+                c.mean_rtt_ms,
+                c.p50_rtt_ms,
+                c.p95_rtt_ms,
+                c.p99_rtt_ms,
+                c.max_rtt_ms
+            );
+            println!(
+                "delivery: missed_mandatory={:.2}% within_optimal={:.1}% (90Hz gate / 120Hz target)",
+                c.missed_mandatory_pct, c.within_optimal_pct
+            );
+            if c.missed_mandatory_pct > 0.0 {
+                return Err(format!(
+                    "GATE FAIL (control plane): missed mandatory deadline {:.2}% (must be 0.00%)",
+                    c.missed_mandatory_pct
+                ));
+            }
+            println!("GATE: control plane 0% missed mandatory — PASS");
             Ok(())
         }
         "nvenc" => {

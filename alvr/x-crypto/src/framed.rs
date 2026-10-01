@@ -95,6 +95,11 @@ impl NoiseSocket {
     /// `framed_recv`; partial reads accumulate, so a frame interrupted by
     /// a timeout continues on the next call.
     pub fn recv_frame(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {
+        // Transport reads must cycle quickly or the deadline check below is
+        // starved by the blocking socket timeout (handshake sets 10s).
+        self.stream
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .map_err(|e| format!("recv_frame: set_read_timeout: {e}"))?;
         let deadline = Instant::now() + timeout;
         loop {
             if self.header_have < HEADER_LEN {

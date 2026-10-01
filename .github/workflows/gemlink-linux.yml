@@ -55,6 +55,8 @@ jobs:
             echo "=== gating $f ==="
             cargo run -q -p x-bench --bin bench -- gate --run "$f" --goldens bench/goldens
           done
+      - name: Secure tier (Noise-XX gate, ADR-0006)
+        run: cargo run -q -p x-bench --bin bench -- secure --iterations 200
 
   windows-gpu-tier:
     if: github.repository == 'blippyblop/GEM-Link'

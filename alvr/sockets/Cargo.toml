@@ -13,6 +13,7 @@ trace-performance = ["profiling/profile-with-tracy"]
 alvr_common.workspace = true
 alvr_packets.workspace = true
 alvr_session.workspace = true
+x-crypto = { path = "../x-crypto" }
 
 bincode = { version = "2", features = ["serde"] }
 profiling = { version = "1", optional = true }

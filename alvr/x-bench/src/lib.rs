@@ -732,6 +732,80 @@ pub fn run_secure_loopback(
     })
 }
 
+/// Secure control-plane measurement: typed packets over
+/// `alvr_sockets::SecureControlSocket` (real Noise-XX handshake + real
+/// bincode control packets). This is the wire the product will speak.
+pub fn run_secure_control(iterations: u32) -> Result<SecureRunMetrics, String> {
+    use alvr_session::SocketBufferConfig;
+    use alvr_sockets::SecureControlSocket;
+    use std::net::TcpListener;
+    use x_crypto::Identity;
+
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+
+    let server_id = Identity::generate().map_err(|e| e.to_string())?;
+    let server_handle = std::thread::spawn(move || -> Result<(), String> {
+        let (server, _remote) = SecureControlSocket::accept_from_client(
+            &listener,
+            None,
+            Duration::from_secs(5),
+            &server_id,
+        )
+        .map_err(|e| e.to_string())?;
+        for _ in 0..iterations {
+            let _req: ClientControlPacket = server
+                .recv(Duration::from_secs(2))
+                .map_err(|e| e.to_string())?;
+            server
+                .send(&ServerControlPacket::KeepAlive)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    });
+
+    let client_id = Identity::generate().map_err(|e| e.to_string())?;
+    let hs_start = Instant::now();
+    let (client, _remote) = SecureControlSocket::connect_to_server(
+        Duration::from_secs(5),
+        &[addr.ip()],
+        addr.port(),
+        SocketBufferConfig::default(),
+        &client_id,
+    )
+    .map_err(|e| e.to_string())?;
+    let handshake_ms = hs_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut rtts = Vec::new();
+    for _ in 0..iterations {
+        let t0 = Instant::now();
+        client
+            .send(&ClientControlPacket::KeepAlive)
+            .map_err(|e| e.to_string())?;
+        let _ack: ServerControlPacket = client
+            .recv(Duration::from_secs(2))
+            .map_err(|e| e.to_string())?;
+        rtts.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    server_handle
+        .join()
+        .map_err(|_| "server thread panicked".to_string())??;
+
+    let ls = latency_stats(rtts.clone());
+    let ds = delivery_stats(&rtts, MANDATORY_DEADLINE_MS, OPTIMAL_DEADLINE_MS);
+    Ok(SecureRunMetrics {
+        handshake_ms,
+        mean_rtt_ms: ls.mean_ms,
+        p50_rtt_ms: ls.p50_ms,
+        p95_rtt_ms: ls.p95_ms,
+        p99_rtt_ms: ls.p99_ms,
+        max_rtt_ms: ls.max_ms,
+        missed_mandatory_pct: ds.missed_mandatory_pct,
+        within_optimal_pct: ds.within_optimal_pct,
+        frames: iterations,
+    })
+}
+
 fn secure_client_side(
     stream: TcpStream,
     rng: &mut Lcg,

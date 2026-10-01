@@ -1,4 +1,5 @@
 mod control_socket;
+mod secure_control_socket;
 mod stream_socket;
 
 use alvr_common::{AnyhowToCon, ConResult, ToCon, anyhow::Result, con_bail, info};
@@ -13,6 +14,7 @@ use std::{
 };
 
 pub use control_socket::*;
+pub use secure_control_socket::*;
 pub use stream_socket::*;
 
 pub const LOCAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
