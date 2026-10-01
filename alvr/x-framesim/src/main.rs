@@ -107,7 +107,7 @@ fn main() {
         capabilities.encoder_10_bits,
     );
 
-    let ctx = ClientCoreContext::new(capabilities, vec![]);
+    let ctx = Arc::new(ClientCoreContext::new(capabilities, vec![]));
 
     // A null decoder: accept every frame and record it. Returning `false` is
     // read as decoder saturation and makes the client spam RequestIdr, so always
@@ -117,6 +117,11 @@ fn main() {
     let bytes = Arc::new(AtomicUsize::new(0));
     let samples: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
     let first = Arc::new(AtomicBool::new(true));
+    // Foveation centres the streamer sent with each frame, via the real metadata
+    // API the compositor uses (report_compositor_start).
+    let fov: Arc<Mutex<Vec<[[f32; 2]; 2]>>> = Arc::new(Mutex::new(Vec::new()));
+    let fov_seen = Arc::clone(&fov);
+    let ctx_for_cb = Arc::clone(&ctx);
 
     let frames_seen = Arc::clone(&frames);
     let bytes_seen = Arc::clone(&bytes);
@@ -125,6 +130,12 @@ fn main() {
     ctx.set_decoder_input_callback(Box::new(move |header_ts, nal| {
         let n = frames_seen.fetch_add(1, Ordering::SeqCst) + 1;
         bytes_seen.fetch_add(nal.len(), Ordering::SeqCst);
+        if let Some(meta) = ctx_for_cb.report_compositor_start(header_ts)
+            && let Some(shifts) = meta.foveation_center_shifts
+            && let Ok(mut v) = fov_seen.lock()
+        {
+            v.push(shifts);
+        }
         if let Ok(mut s) = samples_seen.lock() {
             s.push(Sample {
                 at: Instant::now(),
@@ -189,7 +200,7 @@ fn main() {
         }
 
         if want_frames > 0 && frames.load(Ordering::SeqCst) >= want_frames {
-            let code = report(&samples, &bytes, start);
+            let code = report(&samples, &bytes, &fov, start);
             exit(code);
         }
 
@@ -207,7 +218,12 @@ fn main() {
 }
 
 /// Statistics, gates, and — the point of this file — per-outlier context.
-fn report(samples: &Arc<Mutex<Vec<Sample>>>, bytes: &Arc<AtomicUsize>, start: Instant) -> i32 {
+fn report(
+    samples: &Arc<Mutex<Vec<Sample>>>,
+    bytes: &Arc<AtomicUsize>,
+    fov: &Arc<Mutex<Vec<[[f32; 2]; 2]>>>,
+    start: Instant,
+) -> i32 {
     let s = match samples.lock() {
         Ok(s) => s.clone(),
         Err(_) => return 0,
@@ -251,6 +267,24 @@ fn report(samples: &Arc<Mutex<Vec<Sample>>>, bytes: &Arc<AtomicUsize>, start: In
         cs[n - 1]
     );
     println!("[framesim]   samples: {n} (99.99% needs >= 10000)");
+
+    // Foveation on the wire: did the streamer actually send centres, and did
+    // they move? (A constant centre would mean the gaze path is dead.)
+    if let Ok(v) = fov.lock() {
+        if v.is_empty() {
+            println!("[framesim] foveation: NO centres received (foveation not in the stream)");
+        } else {
+            let n = v.len();
+            let first = v[0];
+            let moved = v.iter().any(|c| {
+                (c[0][0] - first[0][0]).abs() > 1e-4 || (c[1][0] - first[1][0]).abs() > 1e-4
+            });
+            println!(
+                "[framesim] foveation: {n}/{n} frames carried centres; moved={moved}; first L({:.4},{:.4}) R({:.4},{:.4})",
+                first[0][0], first[0][1], first[1][0], first[1][1]
+            );
+        }
+    }
 
     let mut gate_ok = true;
     for (deadline, label) in DEADLINES_MS {

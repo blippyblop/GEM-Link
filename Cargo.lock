@@ -8425,6 +8425,7 @@ dependencies = [
  "env_logger",
  "windows 0.58.0",
  "x-dda",
+ "x-foveation",
  "x-nvenc",
 ]
 
