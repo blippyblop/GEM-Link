@@ -23,13 +23,16 @@
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_MAP_WRITE, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_RESOURCE_MISC_GENERATE_MIPS, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::core::Interface;
+use crate::foveation::Foveator;
 use x_dda::Duplicator;
 use x_nvenc::NvEncoder;
 
@@ -39,13 +42,23 @@ const PATTERNS: usize = 8;
 /// Side of the moving block drawn into each pattern, in pixels.
 const BLOCK: u32 = 256;
 
+/// PCSIM_FOV=0 disables the foveation pass, giving a clean A/B baseline. The
+/// point of the toggle is to measure what foveation actually buys.
+fn foveation_enabled() -> bool {
+    std::env::var("PCSIM_FOV").map(|v| v != "0").unwrap_or(true)
+}
+
 pub struct Feeder {
     /// Kept alive: the encoder holds a reference to this device.
     _device: ID3D11Device,
+    ctx: ID3D11DeviceContext,
     pool: Vec<ID3D11Texture2D>,
+    pool_srv: Vec<ID3D11ShaderResourceView>,
+    fove: Foveator,
     encoder: NvEncoder,
     pitch: u32,
     idx: usize,
+    foveation: bool,
     encode_times: Vec<Duration>,
 }
 
@@ -57,34 +70,53 @@ impl Feeder {
         // firmware suggests it can, but it does not appear to display it), so
         // stay 8-bit until everything else is done.
         let mut pool = Vec::with_capacity(PATTERNS);
+        let mut pool_srv = Vec::with_capacity(PATTERNS);
         let staging = create_texture(&device, width, height, D3D11_USAGE_STAGING)?;
         for i in 0..PATTERNS {
-            let tex = create_texture(&device, width, height, D3D11_USAGE_DEFAULT)?;
+            let tex = create_pool_texture(&device, width, height)?;
             fill_pattern(&context, &staging, &tex, width, height, i)?;
+            let srv = make_srv(&device, &tex)?;
+            // Content is static here, so the chain is built once.
+            unsafe { context.GenerateMips(&srv) };
             pool.push(tex);
+            pool_srv.push(srv);
         }
 
         let encoder = NvEncoder::new(device.as_raw(), width, height, fps)
             .map_err(|e| format!("nvenc session: {e}"))?;
 
+        let fove = Foveator::new(&device, &context, width, height)?;
+
         Ok(Self {
             _device: device,
+            ctx: context,
             pool,
+            pool_srv,
+            fove,
             encoder,
             pitch: width * 4,
             idx: 0,
+            foveation: foveation_enabled(),
             encode_times: Vec::new(),
         })
     }
 
     /// Encode one frame and return its bitstream.
-    pub fn encode_next(&mut self) -> Result<Vec<u8>, String> {
-        let texture = &self.pool[self.idx % self.pool.len()];
+    pub fn encode_next(&mut self, center: [f32; 2], center_size: f32) -> Result<Vec<u8>, String> {
+        let slot = self.idx % self.pool.len();
         self.idx += 1;
+        // Degrade the periphery BEFORE the encoder sees it -- this is where the
+        // bitrate saving comes from; the centres alone save nothing.
+        let src = if self.foveation {
+            self.fove.apply(&self.pool_srv[slot], center, center_size)?;
+            self.fove.out.as_raw()
+        } else {
+            self.pool[slot].as_raw()
+        };
         let t = Instant::now();
         let out = self
             .encoder
-            .encode(texture.as_raw(), self.pitch)
+            .encode(src, self.pitch)
             .map_err(|e| format!("nvenc encode: {e}"))?;
         self.encode_times.push(t.elapsed());
         Ok(out)
@@ -129,6 +161,40 @@ fn standalone_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
         .map_err(|e| format!("D3D11CreateDevice failed: {e}"))?;
         Ok((device.ok_or("no device")?, context.ok_or("no context")?))
     }
+}
+
+/// Pool texture: mips (for real peripheral downsampling) plus an SRV so the
+/// foveation pass can read it.
+fn create_pool_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Texture2D, String> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 0, // full chain, for mip-based peripheral downsampling
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+    };
+    let mut tex: Option<ID3D11Texture2D> = None;
+    unsafe {
+        device
+            .CreateTexture2D(&desc, None, Some(&mut tex))
+            .map_err(|e| format!("CreateTexture2D(pool) failed: {e}"))?;
+    }
+    tex.ok_or_else(|| "CreateTexture2D(pool) returned no texture".to_string())
+}
+
+fn make_srv(device: &ID3D11Device, t: &ID3D11Texture2D) -> Result<ID3D11ShaderResourceView, String> {
+    let mut srv: Option<ID3D11ShaderResourceView> = None;
+    unsafe {
+        device
+            .CreateShaderResourceView(t, None, Some(&mut srv))
+            .map_err(|e| format!("CreateShaderResourceView: {e}"))?;
+    }
+    srv.ok_or_else(|| "no srv".to_string())
 }
 
 fn create_texture(
@@ -211,7 +277,13 @@ fn fill_pattern(
         }
 
         context.Unmap(staging, 0);
-        context.CopyResource(target, staging);
+        // CopySubresourceRegion, NOT CopyResource: CopyResource requires source
+        // and destination to agree on mip count, and the pool now carries a full
+        // mip chain while the staging texture has one. The silent failure left
+        // every texture empty and the encoder producing 385-byte frames.
+        // windows-rs unpacks the destination coordinates (dstx/dsty/dstz) rather
+        // than taking a D3D11_BOX; passing a box here does not compile.
+        context.CopySubresourceRegion(target, 0, 0, 0, 0, staging, 0, None);
     }
     Ok(())
 }
@@ -235,10 +307,14 @@ fn fill_pattern(
 /// Phase 2 `x-idd`), not a scale step here.
 pub struct DdaFeeder {
     dup: Duplicator,
+    ctx: ID3D11DeviceContext,
     pool: Vec<ID3D11Texture2D>,
+    pool_srv: Vec<ID3D11ShaderResourceView>,
+    fove: Foveator,
     encoder: NvEncoder,
     pitch: u32,
     idx: usize,
+    foveation: bool,
     encode_times: Vec<Duration>,
     empty_polls: u64,
     frames: u64,
@@ -253,21 +329,31 @@ impl DdaFeeder {
         let (w, h) = (desktop.width, desktop.height);
 
         // Two slots, same as the pattern feeder: NVENC reads one while the next
-        // desktop frame is copied into the other.
-        let pool = vec![
-            create_texture(dup.device(), w, h, D3D11_USAGE_DEFAULT)?,
-            create_texture(dup.device(), w, h, D3D11_USAGE_DEFAULT)?,
-        ];
+        // desktop frame is copied into the other. Mips so the foveation pass can
+        // genuinely downsample the periphery.
+        let mut pool = Vec::new();
+        let mut pool_srv = Vec::new();
+        for _ in 0..2 {
+            let t = create_pool_texture(dup.device(), w, h)?;
+            pool_srv.push(make_srv(dup.device(), &t)?);
+            pool.push(t);
+        }
+        let ctx = dup.context().ok_or("duplicator has no device context")?.clone();
+        let fove = Foveator::new(dup.device(), &ctx, w, h)?;
         let encoder = NvEncoder::new(dup.device_ptr(), w, h, fps)
             .map_err(|e| format!("nvenc session: {e}"))?;
 
         Ok((
             Self {
                 dup,
+                ctx,
                 pool,
+                pool_srv,
+                fove,
                 encoder,
                 pitch: w * 4,
                 idx: 0,
+                foveation: foveation_enabled(),
                 encode_times: Vec::new(),
                 empty_polls: 0,
                 frames: 0,
@@ -277,7 +363,7 @@ impl DdaFeeder {
         ))
     }
 
-    pub fn encode_next(&mut self) -> Result<Vec<u8>, String> {
+    pub fn encode_next(&mut self, center: [f32; 2], center_size: f32) -> Result<Vec<u8>, String> {
         let slot = self.idx % self.pool.len();
 
         // Short wait-bounded poll, NOT VD's 20 ms.
@@ -308,10 +394,17 @@ impl DdaFeeder {
             self.dup.release();
         }
 
+        let src = if self.foveation {
+            self.fove.apply(&self.pool_srv[slot], center, center_size)?;
+            self.fove.out.as_raw()
+        } else {
+            self.pool[slot].as_raw()
+        };
+
         let t = Instant::now();
         let out = self
             .encoder
-            .encode(self.pool[slot].as_raw(), self.pitch)
+            .encode(src, self.pitch)
             .map_err(|e| format!("nvenc encode: {e}"))?;
         self.encode_times.push(t.elapsed());
         self.idx += 1;

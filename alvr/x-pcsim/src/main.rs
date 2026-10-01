@@ -16,7 +16,7 @@
 //!   PCSIM_PAYLOAD=N   bytes per frame payload (default 20000)
 //! Exits 0 on success.
 
-use alvr_common::{ViewParams, glam::UVec2};
+use alvr_common::{AlvrFoveatedEncodingParams, ViewParams, glam::{Quat, UVec2}};
 use alvr_packets::{
     ClientConnectionResult, ClientNegotiatedStreamingConfig, NegotiatedStreamingConfigExt,
     ServerControlPacket, StreamConfigPacket, VIDEO, VideoPacketHeader,
@@ -27,6 +27,7 @@ use alvr_sockets::{
 };
 use std::{
     env,
+    time::Instant as StdInstant,
     net::IpAddr,
     process::exit,
     thread,
@@ -34,9 +35,26 @@ use std::{
 };
 
 #[cfg(windows)]
+mod foveation;
+#[cfg(windows)]
 mod nvenc;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Foveation: fraction of each axis in the sharp centre region.
+const PCSIM_FOV_CENTER: f32 = 0.35;
+/// Foveation: periphery degradation ratio.
+const PCSIM_FOV_EDGE_RATIO: f32 = 2.0;
+/// Synthetic gaze amplitude, radians. PCSIM_GAZE=0 holds the centre still,
+/// which is the honest way to measure what foveation buys in compression: with a
+/// moving centre the blurred region moves too, and on a low-motion source that
+/// motion dominates the frame difference and swamps the effect.
+fn gaze_rad() -> f32 {
+    std::env::var("PCSIM_GAZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.25)
+}
+
 /// Per-frame trace path, for joining against the client's CSV.
 const PCSIM_CSV: &str = "pcsim_frames.csv";
 /// 90 Hz.
@@ -77,17 +95,18 @@ impl Source {
     }
 
     /// Returns (bitstream, encode_ms). Synthetic has no encode step.
-    fn next_frame(&mut self) -> Result<(Vec<u8>, f64), String> {
+    /// `center`/`center_size` are the foveation region applied before encoding.
+    fn next_frame(&mut self, center: [f32; 2], center_size: f32) -> Result<(Vec<u8>, f64), String> {
         match self {
             Source::Synthetic(p) => Ok((p.clone(), 0.0)),
             #[cfg(windows)]
             Source::Nvenc(f) => {
-                let b = f.encode_next()?;
+                let b = f.encode_next(center, center_size)?;
                 Ok((b, f.last_encode_ms()))
             }
             #[cfg(windows)]
             Source::Dda(f) => {
-                let b = f.encode_next()?;
+                let b = f.encode_next(center, center_size)?;
                 Ok((b, f.last_encode_ms()))
             }
         }
@@ -205,6 +224,34 @@ fn main() {
     // handshake still reported success.
     let (mut source, view_w, view_h) = make_source(view_w, view_h, payload_len);
 
+    // Foveation: the 300 Mbps target is WITH foveation -- the periphery is what
+    // we spend the savings on. Negotiate the params and drive the per-frame
+    // centres from the REAL x-foveation code path (not a hard-coded value), so
+    // this exercises the same math the product uses.
+    let foveation_params = AlvrFoveatedEncodingParams {
+        encoded_view_resolution: [view_w, view_h],
+        view_ratio: [1.0, 1.0],
+        // Fraction of each axis in the sharp centre region (ALVR's centre_size).
+        center_size: [PCSIM_FOV_CENTER, PCSIM_FOV_CENTER],
+        center_shifts: [[0.0, 0.0]; 2],
+        edge_ratio: [PCSIM_FOV_EDGE_RATIO, PCSIM_FOV_EDGE_RATIO],
+    };
+    println!(
+        "[pcsim] foveation: centre {:.0}% of axis, edge_ratio {:.1}, encoded {}x{}",
+        foveation_params.center_size[0] * 100.0,
+        foveation_params.edge_ratio[0],
+        view_w,
+        view_h
+    );
+    // x-foveation drives the per-frame centres; see the params above.
+    let mut foveation =
+        x_foveation::EyeTrackedFoveation::new(foveation_params.clone(), UVec2::new(view_w, view_h));
+    // The streamer needs the client's eye poses/FOV before it will compute any
+    // centres -- update() no-ops until view_params is populated ("wait for this
+    // client's real eye poses and FOV, including after a reconnect"). In the
+    // product that arrives from the headset; here we supply it directly.
+    // ViewParams::DUMMY carries a well-formed FOV (-1..1 on both axes).
+    foveation.view_params = Some([ViewParams::DUMMY; 2]);
     let session_config = SessionConfig::default();
     let session_settings = session_config.to_settings();
     let stream_port: u16 = session_settings.connection.stream_port;
@@ -217,7 +264,7 @@ fn main() {
             view_resolution: UVec2::new(view_w, view_h),
             refresh_rate_hint: 90.0,
             game_audio_sample_rate: 48000,
-            foveated_encoding: None,
+            foveated_encoding: Some(foveation_params.clone()),
             encoding_gamma: 1.0,
             enable_hdr: false,
             wired: false,
@@ -289,16 +336,31 @@ fn main() {
             exit(1);
         }
 
+        // Synthetic moving gaze until real eye tracking is wired in. Oscillates
+        // a few degrees so the centres actually move and the client sees them
+        // change frame to frame.
+        let ts = t0.elapsed();
+        let secs = ts.as_secs_f64();
+        let amp = gaze_rad();
+        let gaze = Quat::from_rotation_y((secs * 0.8).sin() as f32 * amp)
+            * Quat::from_rotation_x((secs * 0.5).cos() as f32 * amp);
+        foveation.update(ts, Some(gaze), StdInstant::now());
+        let shifts = foveation.centers(ts);
+        if i == 0 || i % 90 == 0 {
+            println!("[pcsim] foveation centres: {shifts:?}");
+        }
+
         let header = VideoPacketHeader {
-            timestamp: t0.elapsed(),
+            timestamp: ts,
             global_view_params: [ViewParams::DUMMY; 2],
-            foveation_center_shifts: None,
+            foveation_center_shifts: shifts,
             // The client starts every session stream_corrupted; without a first
             // IDR it would drop frames until one arrives.
             is_idr: i == 0 || i % 120 == 0,
         };
 
-        let (payload, encode_ms) = match source.next_frame() {
+        let fov_center = shifts.map(|s| s[0]).unwrap_or([0.0, 0.0]);
+        let (payload, encode_ms) = match source.next_frame(fov_center, PCSIM_FOV_CENTER) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[pcsim] frame {i} encode failed: {e}");
