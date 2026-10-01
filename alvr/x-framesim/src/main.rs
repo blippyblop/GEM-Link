@@ -8,11 +8,18 @@
 //! The client *listens* on the well-known control port; the streamer dials it.
 //! Exits 0 as soon as the session is negotiated (that is the M1 gate), non-zero
 //! on timeout, so a rig can assert on it.
+//!
+//! Set `FRAMESIM_FRAMES=N` to instead require N decoded-input frames before
+//! exiting 0 — that is the video-path gate.
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::glam::UVec2;
 use std::{
     process::exit,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -24,6 +31,14 @@ fn timeout() -> Duration {
         .and_then(|s| s.parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(90))
+}
+
+/// If non-zero, require this many video frames before declaring success.
+fn frame_target() -> usize {
+    std::env::var("FRAMESIM_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 fn main() {
@@ -57,8 +72,36 @@ fn main() {
     );
 
     let ctx = ClientCoreContext::new(capabilities, vec![]);
+
+    // A null decoder: accept every frame and count it. Returning `false` is read
+    // as decoder saturation and makes the client spam RequestIdr, so always
+    // accept. This is what lets the sim prove real video arrived with no
+    // hardware decoder in the loop.
+    let frames = Arc::new(AtomicUsize::new(0));
+    let frames_seen = Arc::clone(&frames);
+    let first = Arc::new(AtomicBool::new(true));
+    let first_frame = Arc::clone(&first);
+    ctx.set_decoder_input_callback(Box::new(move |timestamp, nal| {
+        let n = frames_seen.fetch_add(1, Ordering::SeqCst) + 1;
+        if first_frame.swap(false, Ordering::SeqCst) || n % 60 == 0 {
+            println!(
+                "[framesim] video frame #{n} ts={timestamp:?} bytes={}",
+                nal.len()
+            );
+        }
+        true
+    }));
+
+    let want_frames = frame_target();
     ctx.resume();
-    println!("[framesim] resume() called; announcing + listening for the streamer");
+    println!(
+        "[framesim] resume() called; announcing + listening for the streamer (frame target: {})",
+        if want_frames == 0 {
+            "negotiation only".to_string()
+        } else {
+            format!("{want_frames} frames")
+        }
+    );
 
     let start = Instant::now();
     let limit = timeout();
@@ -77,8 +120,17 @@ fn main() {
                         "[framesim] NEGOTIATED view={}x{} refresh={}Hz",
                         n.view_resolution.x, n.view_resolution.y, n.refresh_rate_hint,
                     );
-                    println!("[framesim] M1 OK: negotiation completed");
-                    exit(0);
+                    if want_frames == 0 {
+                        println!("[framesim] M1 OK: negotiation completed");
+                        exit(0);
+                    }
+                    println!("[framesim] waiting for {want_frames} video frames...");
+                }
+                ClientCoreEvent::DecoderConfig { codec, config_nal } => {
+                    println!(
+                        "[framesim] decoder config: codec={codec:?} config_nal={} bytes",
+                        config_nal.len()
+                    );
                 }
                 ClientCoreEvent::StreamingStopped => {
                     println!("[framesim] stream stopped");
@@ -87,10 +139,19 @@ fn main() {
             }
         }
 
+        if want_frames > 0 && frames.load(Ordering::SeqCst) >= want_frames {
+            println!(
+                "[framesim] VIDEO OK: received {} video frames",
+                frames.load(Ordering::SeqCst)
+            );
+            exit(0);
+        }
+
         if start.elapsed() > limit {
             eprintln!(
-                "[framesim] TIMEOUT after {:?}; last hud: {last_hud}",
-                start.elapsed()
+                "[framesim] TIMEOUT after {:?} (frames={}); last hud: {last_hud}",
+                start.elapsed(),
+                frames.load(Ordering::SeqCst)
             );
             exit(2);
         }
