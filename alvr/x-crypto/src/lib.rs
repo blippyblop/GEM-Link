@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 /// The single supported Noise pattern: XX over 25519, ChaCha20-Poly1305,
 /// SHA256. One pattern, reviewed once, no negotiation surface.
+pub mod framed;
+
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 
 /// Length of the fingerprint shown to users during pairing.

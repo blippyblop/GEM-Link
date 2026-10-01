@@ -10,7 +10,8 @@
 
 use std::process::ExitCode;
 use x_bench::{
-    RunMetrics, compare, gate, parse_gate, run_loopback, scenario, scenarios, write_run,
+    RunMetrics, compare, gate, parse_gate, run_loopback, run_secure_loopback, scenario, scenarios,
+    write_run,
 };
 
 fn chrono_like_timestamp() -> String {
@@ -193,6 +194,68 @@ fn real_main(args: &[String]) -> Result<(), String> {
             let golden_path = goldens.join(format!("{}-golden.json", run.scenario));
             let golden = load(&golden_path)?;
             gate(&run, &golden)
+        }
+        "secure" => {
+            // Noise-XX over real TCP (x-crypto framed wire), loopback.
+            // Crypto-tier measurement — NOT the wire-faithful port-9943
+            // scenarios. Gate: 0% missed mandatory; everything else is raw
+            // numbers for trend monitoring.
+            let mut iterations = 200u32;
+            let mut seed = 42u64;
+            let mut one_way = 0.1f64;
+            let mut jitter = 0.0f64;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--iterations" => {
+                        iterations = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(200);
+                        i += 2;
+                    }
+                    "--seed" => {
+                        seed = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(42);
+                        i += 2;
+                    }
+                    "--latency" => {
+                        one_way = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.1);
+                        i += 2;
+                    }
+                    "--jitter" => {
+                        jitter = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown flag {other:?}")),
+                }
+            }
+            let m = run_secure_loopback(iterations, one_way, jitter, seed)?;
+            println!(
+                "secure link: Noise_XX_25519_ChaChaPoly_SHA256 over TCP loopback \
+                 (framed, AEAD-sealed)"
+            );
+            println!(
+                "iterations={} seed={} one_way={one_way}ms jitter={jitter}ms",
+                m.frames, seed
+            );
+            println!(
+                "handshake_ms={:.3} rtt_ms mean={:.3} p50={:.3} p95={:.3} p99={:.3} max={:.3}",
+                m.handshake_ms,
+                m.mean_rtt_ms,
+                m.p50_rtt_ms,
+                m.p95_rtt_ms,
+                m.p99_rtt_ms,
+                m.max_rtt_ms
+            );
+            println!(
+                "delivery: missed_mandatory={:.2}% within_optimal={:.1}% (90Hz gate / 120Hz target)",
+                m.missed_mandatory_pct, m.within_optimal_pct
+            );
+            if m.missed_mandatory_pct > 0.0 {
+                return Err(format!(
+                    "GATE FAIL: missed mandatory deadline {:.2}% (must be 0.00%)",
+                    m.missed_mandatory_pct
+                ));
+            }
+            println!("GATE: 0% missed mandatory — PASS");
+            Ok(())
         }
         "nvenc" => {
             // Windows GPU tier, device-neutral scenarios (server capability).

@@ -628,7 +628,7 @@ pub fn gate(run: &RunMetrics, golden: &RunMetrics) -> Result<(), String> {
 }
 
 use std::net::{TcpListener, TcpStream};
-use x_crypto::{Handshake, HandshakeRole, Identity};
+use x_crypto::{HandshakeRole, Identity};
 
 // ---------------------------------------------------------------------------
 // Secure loopback — Noise-XX over a real TCP pair, then AEAD-sealed
@@ -642,7 +642,9 @@ use x_crypto::{Handshake, HandshakeRole, Identity};
 pub struct SecureRunMetrics {
     pub handshake_ms: f64,
     pub mean_rtt_ms: f64,
+    pub p50_rtt_ms: f64,
     pub p95_rtt_ms: f64,
+    pub p99_rtt_ms: f64,
     pub max_rtt_ms: f64,
     pub missed_mandatory_pct: f64,
     pub within_optimal_pct: f64,
@@ -720,7 +722,9 @@ pub fn run_secure_loopback(
     Ok(SecureRunMetrics {
         handshake_ms,
         mean_rtt_ms: ls.mean_ms,
+        p50_rtt_ms: ls.p50_ms,
         p95_rtt_ms: ls.p95_ms,
+        p99_rtt_ms: ls.p99_ms,
         max_rtt_ms: ls.max_ms,
         missed_mandatory_pct: ds.missed_mandatory_pct,
         within_optimal_pct: ds.within_optimal_pct,
@@ -729,7 +733,7 @@ pub fn run_secure_loopback(
 }
 
 fn secure_client_side(
-    mut stream: TcpStream,
+    stream: TcpStream,
     rng: &mut Lcg,
     one_way_latency_ms: f64,
     jitter_ms: f64,
@@ -737,46 +741,21 @@ fn secure_client_side(
     handshake_ms_out: &mut f64,
     rtts_out: &mut Vec<f64>,
 ) -> Result<(), String> {
-    use std::io::{Read, Write};
     use std::time::{Duration, Instant};
+    use x_crypto::framed::NoiseSocket;
 
     let local = Identity::generate().map_err(|e| e.to_string())?;
-    let mut hs = Handshake::new(
-        HandshakeRole::Initiator,
-        &local,
-        &[], // peer pin exchanged via pairing store; empty in bench
-    )
-    .map_err(|e| e.to_string())?;
-
     let hs_start = Instant::now();
-    let _ = hs_start;
-    // msg1
-    let mut buf = [0u8; 512];
-    let n = hs.write(&mut buf).map_err(|e| e.to_string())?;
-    stream
-        .write_all(&(n as u32).to_le_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-    // msg2
-    let mut lenb = [0u8; 4];
-    stream.read_exact(&mut lenb).map_err(|e| e.to_string())?;
-    let n = u32::from_le_bytes(lenb) as usize;
-    stream
-        .read_exact(&mut buf[..n])
-        .map_err(|e| e.to_string())?;
-    hs.read(&buf[..n]).map_err(|e| e.to_string())?;
-    // msg3
-    let n = hs.write(&mut buf).map_err(|e| e.to_string())?;
-    stream
-        .write_all(&(n as u32).to_le_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    let (mut sock, _remote_static) =
+        NoiseSocket::handshake(stream, HandshakeRole::Initiator, &local)
+            .map_err(|e| format!("client handshake: {e}"))?;
     *handshake_ms_out = hs_start.elapsed().as_secs_f64() * 1000.0;
+    // Real clients compare `_remote_static`'s fingerprint against the
+    // pairing store here; the bench uses fresh ephemeral identities.
 
-    let mut transport = hs.into_transport().map_err(|e| e.to_string())?;
-    let mut sealed = [0u8; 128];
-    let mut wire = [0u8; 128];
-    let mut opened = [0u8; 128];
+    let recv_timeout = Duration::from_secs_f64(
+        ((2.0 * (one_way_latency_ms + jitter_ms)) + 250.0).max(300.0) / 1000.0,
+    );
     for i in 0..iterations {
         let jitter = if jitter_ms > 0.0 {
             (rng.next_f64() * 2.0 - 1.0) * jitter_ms
@@ -788,67 +767,33 @@ fn secure_client_side(
         ));
         let t0 = Instant::now();
         let payload = format!("secure frame {i}");
-        let n = transport
-            .seal(payload.as_bytes(), &mut sealed)
+        sock.send_frame(payload.as_bytes())
             .map_err(|e| e.to_string())?;
-        stream
-            .write_all(&(n as u32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        stream.write_all(&sealed[..n]).map_err(|e| e.to_string())?;
-        stream.read_exact(&mut lenb).map_err(|e| e.to_string())?;
-        let n = u32::from_le_bytes(lenb) as usize;
-        stream
-            .read_exact(&mut wire[..n])
-            .map_err(|e| e.to_string())?;
-        let m = transport
-            .open(&wire[..n], &mut opened)
-            .map_err(|e| e.to_string())?;
-        let _ = m;
+        let ack = sock.recv_frame(recv_timeout).map_err(|e| e.to_string())?;
+        let _ = String::from_utf8_lossy(&ack);
         rtts_out.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     Ok(())
 }
 
 fn secure_server_side(
-    mut stream: TcpStream,
+    stream: TcpStream,
     rng: &mut Lcg,
     one_way_latency_ms: f64,
     jitter_ms: f64,
     iterations: u32,
 ) -> Result<(), String> {
-    use std::io::{Read, Write};
     use std::time::{Duration, Instant};
+    use x_crypto::framed::NoiseSocket;
 
     let local = Identity::generate().map_err(|e| e.to_string())?;
-    let mut hs =
-        Handshake::new(HandshakeRole::Responder, &local, &[]).map_err(|e| e.to_string())?;
+    let (mut sock, _remote_static) =
+        NoiseSocket::handshake(stream, HandshakeRole::Responder, &local)
+            .map_err(|e| format!("server handshake: {e}"))?;
 
-    let mut buf = [0u8; 512];
-    let mut lenb = [0u8; 4];
-    // msg1
-    stream.read_exact(&mut lenb).map_err(|e| e.to_string())?;
-    let n = u32::from_le_bytes(lenb) as usize;
-    stream
-        .read_exact(&mut buf[..n])
-        .map_err(|e| e.to_string())?;
-    hs.read(&buf[..n]).map_err(|e| e.to_string())?;
-    // msg2
-    let n = hs.write(&mut buf).map_err(|e| e.to_string())?;
-    stream
-        .write_all(&(n as u32).to_le_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-    // msg3
-    stream.read_exact(&mut lenb).map_err(|e| e.to_string())?;
-    let n = u32::from_le_bytes(lenb) as usize;
-    stream
-        .read_exact(&mut buf[..n])
-        .map_err(|e| e.to_string())?;
-    hs.read(&buf[..n]).map_err(|e| e.to_string())?;
-
-    let mut transport = hs.into_transport().map_err(|e| e.to_string())?;
-    let mut sealed = [0u8; 128];
-    let mut opened = [0u8; 128];
+    let recv_timeout = Duration::from_secs_f64(
+        ((2.0 * (one_way_latency_ms + jitter_ms)) + 250.0).max(300.0) / 1000.0,
+    );
     for _ in 0..iterations {
         let jitter = if jitter_ms > 0.0 {
             (rng.next_f64() * 2.0 - 1.0) * jitter_ms
@@ -858,22 +803,11 @@ fn secure_server_side(
         std::thread::sleep(Duration::from_secs_f64(
             (one_way_latency_ms + jitter).max(0.0) / 1000.0,
         ));
-        stream.read_exact(&mut lenb).map_err(|e| e.to_string())?;
-        let n = u32::from_le_bytes(lenb) as usize;
-        stream
-            .read_exact(&mut opened[..n])
+        let req = sock.recv_frame(recv_timeout).map_err(|e| e.to_string())?;
+        let m = req.len();
+        let reply = format!("ack-{m}");
+        sock.send_frame(reply.as_bytes())
             .map_err(|e| e.to_string())?;
-        let m = transport
-            .open(&opened[..n], &mut sealed)
-            .map_err(|e| e.to_string())?;
-        let reply = format!("ack-{}", m);
-        let n = transport
-            .seal(reply.as_bytes(), &mut opened)
-            .map_err(|e| e.to_string())?;
-        stream
-            .write_all(&(n as u32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        stream.write_all(&opened[..n]).map_err(|e| e.to_string())?;
         let _ = Instant::now();
     }
     Ok(())
