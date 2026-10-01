@@ -16,3 +16,16 @@ alvr_packets.workspace = true
 alvr_session.workspace = true
 alvr_sockets.workspace = true
 env_logger = "0.11"
+
+# Real NVENC source for the video path. Windows-only: it needs a D3D11 device
+# and the driver NVENC runtime. Builds without it everywhere else, falling back
+# to the synthetic payload.
+[target.'cfg(windows)'.dependencies]
+x-nvenc = { path = "../x-nvenc" }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }

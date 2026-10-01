@@ -33,9 +33,54 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+mod nvenc;
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// 90 Hz.
 const FRAME_INTERVAL: Duration = Duration::from_micros(11_111);
+
+/// Where video frames come from.
+enum Source {
+    /// Padding bytes: exercises the transport and framing only.
+    Synthetic(Vec<u8>),
+    /// Real NVENC bitstream (Windows).
+    #[cfg(windows)]
+    Nvenc(nvenc::Feeder),
+}
+
+impl Source {
+    fn next_frame(&mut self) -> Result<Vec<u8>, String> {
+        match self {
+            Source::Synthetic(p) => Ok(p.clone()),
+            #[cfg(windows)]
+            Source::Nvenc(f) => f.encode_next(),
+        }
+    }
+}
+
+/// Real NVENC when it is available and asked for, else a synthetic payload.
+/// The encoder is fed VR-resolution frames (never the desktop's), because that
+/// is what the headset consumes and the resolution must stay negotiable.
+fn make_source(view_w: u32, view_h: u32, payload_len: usize) -> Source {
+    #[cfg(windows)]
+    {
+        let want = env::var("PCSIM_NVENC").map(|v| v != "0").unwrap_or(true);
+        if want {
+            match nvenc::Feeder::new(view_w, view_h, 90) {
+                Ok(f) => {
+                    println!("[pcsim] video source: NVENC {view_w}x{view_h} (8-bit)");
+                    return Source::Nvenc(f);
+                }
+                Err(e) => eprintln!("[pcsim] NVENC unavailable ({e}); using synthetic payload"),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (view_w, view_h);
+    println!("[pcsim] video source: synthetic {payload_len}B payload");
+    Source::Synthetic(vec![0u8; payload_len])
+}
 
 fn main() {
     env_logger::init();
@@ -54,6 +99,10 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20_000);
+    // Negotiable: render resolution may change, so it is a parameter, not a
+    // constant. Defaults to the Frame's per-eye resolution.
+    let view_w: u32 = env::var("PCSIM_VIEW_W").ok().and_then(|s| s.parse().ok()).unwrap_or(2160);
+    let view_h: u32 = env::var("PCSIM_VIEW_H").ok().and_then(|s| s.parse().ok()).unwrap_or(2160);
 
     println!("[pcsim] dialling headset sim at {ip} (control port 9943)");
 
@@ -106,7 +155,7 @@ fn main() {
     let stream_config_packet = match StreamConfigPacket::new(
         &session_config,
         ClientNegotiatedStreamingConfig {
-            view_resolution: UVec2::new(2160, 2160),
+            view_resolution: UVec2::new(view_w, view_h),
             refresh_rate_hint: 90.0,
             game_audio_sample_rate: 48000,
             foveated_encoding: None,
@@ -161,9 +210,7 @@ fn main() {
             }
         };
 
-    // A synthetic payload: we are exercising the transport/framing/client video
-    // loop here, not the encoder. NVENC is measured separately by `bench nvenc`.
-    let payload = vec![0u8; payload_len];
+    let mut source = make_source(view_w, view_h, payload_len);
     let t0 = Instant::now();
     println!(
         "[pcsim] streaming {frames} frames of {payload_len}B over VIDEO ({:?}/frame)",
@@ -188,6 +235,17 @@ fn main() {
             // IDR it would drop frames until one arrives.
             is_idr: i == 0 || i % 120 == 0,
         };
+
+        let payload = match source.next_frame() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[pcsim] frame {i} encode failed: {e}");
+                exit(1);
+            }
+        };
+        if i == 0 || i % 90 == 0 {
+            println!("[pcsim] frame {i}: {} bytes", payload.len());
+        }
 
         if let Err(e) = video_sender.send_header_with_payload(&header, &payload) {
             eprintln!("[pcsim] video send failed at frame {i}: {e}");
