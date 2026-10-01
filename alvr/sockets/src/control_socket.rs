@@ -1,4 +1,5 @@
 use crate::{CONTROL_PORT, LOCAL_IP};
+use socket2::Socket;
 use alvr_common::{ConResult, HandleTryAgain, ToCon, anyhow::Result, con_bail};
 use alvr_session::{DscpTos, SocketBufferConfig};
 use bincode::config;
@@ -20,7 +21,18 @@ pub fn bind(
     dscp: Option<DscpTos>,
     buffer_config: SocketBufferConfig,
 ) -> Result<TcpListener> {
-    let socket = TcpListener::bind((LOCAL_IP, port))?.into();
+    let socket = Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    // GemLink: on Windows, accepted children of a previous listener linger
+    // in TIME_WAIT on the same local port and block a re-bind without
+    // SO_REUSEADDR (Linux scopes TIME_WAIT to the connection 4-tuple, so
+    // the gap never showed there). Rebind-on-reconnect is a core flow.
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::new(LOCAL_IP, port).into())?;
+    socket.listen(1024)?;
 
     crate::set_socket_buffers(&socket, buffer_config).ok();
 
