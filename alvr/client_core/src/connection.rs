@@ -25,6 +25,7 @@ use alvr_sockets::{
 };
 use std::{
     collections::VecDeque,
+    net::TcpListener,
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -96,19 +97,45 @@ pub fn connection_lifecycle_loop(
 
     set_hud_message(&event_queue, INITIAL_MESSAGE);
 
+    // Hold the well-known control port for as long as the user wants to stream,
+    // instead of re-binding it on every retry. The control connection is TCP, so
+    // the socket a dropped session leaves behind sits in TIME_WAIT *on that
+    // port*; re-binding into it makes the next reconnect start with an RST
+    // (10054/10057) even with SO_REUSEADDR, which turns a fast reconnect into a
+    // stumble. Keeping one listener makes a reconnect just another accept().
+    // Released again when streaming stops, so we do not squat on the port idle.
+    let mut listener = None;
+
     while *lifecycle_state.read() != LifecycleState::ShuttingDown {
         if *lifecycle_state.read() == LifecycleState::Resumed {
-            if let Err(e) = connection_pipeline(
-                capabilities.clone(),
-                Arc::clone(&ctx),
-                Arc::clone(&lifecycle_state),
-                Arc::clone(&event_queue),
-            ) {
+            if listener.is_none() {
+                match alvr_sockets::get_server_listener(HANDSHAKE_ACTION_TIMEOUT) {
+                    Ok(socket) => listener = Some(socket),
+                    Err(e) => {
+                        let message =
+                            format!("Connection error:\n{e}\nCheck the PC for more details");
+                        set_hud_message(&event_queue, &message);
+                        error!("Failed to bind the control port: {e}");
+                    }
+                }
+            }
+
+            if let Some(listener_socket) = listener.as_ref()
+                && let Err(e) = connection_pipeline(
+                    capabilities.clone(),
+                    Arc::clone(&ctx),
+                    Arc::clone(&lifecycle_state),
+                    Arc::clone(&event_queue),
+                    listener_socket,
+                )
+            {
                 let message = format!("Connection error:\n{e}\nCheck the PC for more details");
                 set_hud_message(&event_queue, &message);
                 error!("Connection error: {e}");
             }
         } else {
+            // Not streaming: give the port back.
+            listener = None;
             debug!("Skip try connection because the device is sleeping");
         }
 
@@ -126,14 +153,15 @@ fn connection_pipeline(
     ctx: Arc<ConnectionContext>,
     lifecycle_state: Arc<RwLock<LifecycleState>>,
     event_queue: Arc<Mutex<VecDeque<ClientCoreEvent>>>,
+    // Bound once by the caller and held across retries — see the TIME_WAIT note
+    // in connection_lifecycle_loop.
+    listener_socket: &TcpListener,
 ) -> ConResult {
     dbg_connection!("connection_pipeline: Begin");
 
     let (mut proto_control_socket, server_ip) = {
         let config = Config::load();
         let announcer_socket = AnnouncerSocket::new(&config.hostname).to_con()?;
-        let listener_socket =
-            alvr_sockets::get_server_listener(HANDSHAKE_ACTION_TIMEOUT).to_con()?;
 
         loop {
             if *lifecycle_state.write() != LifecycleState::Resumed {
@@ -144,7 +172,7 @@ fn connection_pipeline(
 
             if let Ok(pair) = ProtoControlSocket::connect_to(
                 SOCKET_INIT_RETRY_INTERVAL,
-                PeerType::Server(&listener_socket),
+                PeerType::Server(listener_socket),
             ) {
                 set_hud_message(&event_queue, SUCCESS_CONNECT_MESSAGE);
                 break pair;
