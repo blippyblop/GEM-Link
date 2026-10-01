@@ -39,7 +39,11 @@ AddReg = MyDevice_HardwareDeviceSettings
 
 [MyDevice_HardwareDeviceSettings]
 HKR,, "UpperFilters",  %REG_MULTI_SZ%, "IndirectKmd"
-HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "XIddDriverGroup" ; TODO: edit driver group name, see README.md for more info
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "XIddDriverGroup"
+; Allow generic-all access to Built-in administrators and Local system.
+; Taken from VD's proven vdvmd.inf: without it CreateFile() on the device
+; returns ACCESS_DENIED, so no companion app (or harness) can open it.
+HKR,, "Security",, "D:P(A;;GA;;;BA)(A;;GA;;;SY)"
 
 [MyDevice_Install.NT.Services]
 Include=WUDFRD.inf
