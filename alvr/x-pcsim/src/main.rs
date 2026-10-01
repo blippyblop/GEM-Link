@@ -39,6 +39,7 @@ mod nvenc;
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// 90 Hz.
 const FRAME_INTERVAL: Duration = Duration::from_micros(11_111);
+const FRAME_INTERVAL_US: u64 = 11_111;
 
 /// Where video frames come from.
 enum Source {
@@ -50,6 +51,15 @@ enum Source {
 }
 
 impl Source {
+    /// (count, p50_ms, p99_ms, mean_ms) when the source is NVENC.
+    fn encode_stats(&self) -> Option<(usize, f64, f64, f64)> {
+        #[cfg(windows)]
+        if let Source::Nvenc(f) = self {
+            return Some(f.encode_stats());
+        }
+        None
+    }
+
     fn next_frame(&mut self) -> Result<Vec<u8>, String> {
         match self {
             Source::Synthetic(p) => Ok(p.clone()),
@@ -212,10 +222,10 @@ fn main() {
 
     let mut source = make_source(view_w, view_h, payload_len);
     let t0 = Instant::now();
-    println!(
-        "[pcsim] streaming {frames} frames of {payload_len}B over VIDEO ({:?}/frame)",
-        FRAME_INTERVAL
-    );
+    let mut total_bytes: u64 = 0;
+    let mut max_frame = 0usize;
+    let _ = FRAME_INTERVAL;
+    println!("[pcsim] streaming {frames} frames over VIDEO (target {} fps)", 1_000_000 / FRAME_INTERVAL_US);
 
     for i in 0..frames {
         // The client drops the session if the control stream goes quiet
@@ -243,6 +253,8 @@ fn main() {
                 exit(1);
             }
         };
+        total_bytes += payload.len() as u64;
+        max_frame = max_frame.max(payload.len());
         if i == 0 || i % 90 == 0 {
             println!("[pcsim] frame {i}: {} bytes", payload.len());
         }
@@ -252,13 +264,31 @@ fn main() {
             exit(1);
         }
 
-        thread::sleep(FRAME_INTERVAL);
+        // Pace against absolute deadlines. Sleeping the interval AFTER encoding
+        // adds the encode time to the frame period (we measured 11.1 + 3.1 =
+        // 14.6 ms -> 68 fps instead of 90). A deadline schedule hides the work
+        // inside the budget, which is what the real server does.
+        let deadline = t0 + Duration::from_micros((i as u64 + 1) * FRAME_INTERVAL_US);
+        if let Some(rest) = deadline.checked_duration_since(Instant::now()) {
+            thread::sleep(rest);
+        }
     }
 
     let elapsed = t0.elapsed();
+    let secs = elapsed.as_secs_f64();
+    println!("[pcsim] VIDEO OK: sent {frames} frames in {elapsed:?} ({:.1} fps)", frames as f64 / secs);
     println!(
-        "[pcsim] VIDEO OK: sent {frames} frames in {elapsed:?} ({:.1} fps)",
-        frames as f64 / elapsed.as_secs_f64()
+        "[pcsim]   bitrate {:.1} Mbps, {} bytes total, max frame {} B, mean {:.0} B",
+        total_bytes as f64 * 8.0 / secs / 1e6,
+        total_bytes,
+        max_frame,
+        total_bytes as f64 / frames as f64
     );
+    if let Some((n, p50, p99, mean)) = source.encode_stats() {
+        println!(
+            "[pcsim]   nvenc encode over {n} frames: p50 {p50:.2} ms, p99 {p99:.2} ms, mean {mean:.2} ms ({:.0} fps encodable)",
+            1000.0 / mean
+        );
+    }
     exit(0);
 }

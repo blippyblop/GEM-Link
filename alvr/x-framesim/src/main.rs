@@ -17,7 +17,7 @@ use alvr_common::glam::UVec2;
 use std::{
     process::exit,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -81,8 +81,30 @@ fn main() {
     let frames_seen = Arc::clone(&frames);
     let first = Arc::new(AtomicBool::new(true));
     let first_frame = Arc::clone(&first);
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let bytes_seen = Arc::clone(&bytes);
+    // Inter-arrival gaps: the receive-side cadence, independent of what the
+    // streamer thinks it sent.
+    let gaps: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+    let gaps_seen = Arc::clone(&gaps);
+    let mut last: Option<Instant> = None;
+    let first_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let first_at_seen = Arc::clone(&first_at);
     ctx.set_decoder_input_callback(Box::new(move |timestamp, nal| {
         let n = frames_seen.fetch_add(1, Ordering::SeqCst) + 1;
+        bytes_seen.fetch_add(nal.len(), Ordering::SeqCst);
+        let now = Instant::now();
+        if let Ok(mut f) = first_at_seen.lock() {
+            if f.is_none() {
+                *f = Some(now);
+            }
+        }
+        if let Some(prev) = last {
+            if let Ok(mut g) = gaps_seen.lock() {
+                g.push((now - prev).as_secs_f64() * 1e3);
+            }
+        }
+        last = Some(now);
         if first_frame.swap(false, Ordering::SeqCst) || n % 60 == 0 {
             println!(
                 "[framesim] video frame #{n} ts={timestamp:?} bytes={}",
@@ -140,10 +162,37 @@ fn main() {
         }
 
         if want_frames > 0 && frames.load(Ordering::SeqCst) >= want_frames {
+            let n = frames.load(Ordering::SeqCst);
+            // Measure over the frame span: `start` predates the handshake and
+            // qemu's startup, which made this read as a nonsense 5 fps.
+            let secs = first_at
+                .lock()
+                .ok()
+                .and_then(|f| *f)
+                .map(|f| f.elapsed().as_secs_f64())
+                .unwrap_or_else(|| start.elapsed().as_secs_f64())
+                .max(1e-6);
+            let total = bytes.load(Ordering::SeqCst);
+            println!("[framesim] VIDEO OK: received {n} video frames");
             println!(
-                "[framesim] VIDEO OK: received {} video frames",
-                frames.load(Ordering::SeqCst)
+                "[framesim]   {:.0} fps, {:.1} Mbps, {} bytes",
+                n as f64 / secs,
+                total as f64 * 8.0 / secs / 1e6,
+                total
             );
+            if let Ok(mut g) = gaps.lock() {
+                if !g.is_empty() {
+                    g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let m = g.len();
+                    let mean = g.iter().sum::<f64>() / m as f64;
+                    println!(
+                        "[framesim]   frame gap: mean {mean:.2} ms, p50 {:.2} ms, p99 {:.2} ms, max {:.2} ms",
+                        g[m / 2],
+                        g[(m * 99 / 100).min(m - 1)],
+                        g[m - 1]
+                    );
+                }
+            }
             exit(0);
         }
 
