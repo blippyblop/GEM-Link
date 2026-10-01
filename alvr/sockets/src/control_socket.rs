@@ -200,9 +200,14 @@ impl<R: DeserializeOwned> ControlSocketReceiver<R> {
 }
 
 pub fn get_server_listener(timeout: Duration) -> Result<TcpListener> {
-    let listener = bind(timeout, CONTROL_PORT, None, SocketBufferConfig::default())?;
+    get_server_listener_on(timeout, CONTROL_PORT)
+}
 
-    Ok(listener)
+/// [`get_server_listener`] on an explicit port. The bench harness uses this to
+/// keep independent loopbacks off the well-known control port, so an OS-level
+/// TIME_WAIT on one cannot bleed into the next (see `bind()`).
+pub fn get_server_listener_on(timeout: Duration, port: u16) -> Result<TcpListener> {
+    bind(timeout, port, None, SocketBufferConfig::default())
 }
 
 // Proto-control-socket that can send and receive any packet. After the split, only the packets of
@@ -218,9 +223,20 @@ pub enum PeerType<'a> {
 
 impl ProtoControlSocket {
     pub fn connect_to(timeout: Duration, peer: PeerType<'_>) -> ConResult<(Self, IpAddr)> {
+        Self::connect_to_port(timeout, peer, CONTROL_PORT)
+    }
+
+    /// [`connect_to`] dialing an explicit port for the `AnyClient` variant (the
+    /// `Server` variant uses the listener it is handed, so `port` is ignored
+    /// there). Same rationale as [`get_server_listener_on`].
+    pub fn connect_to_port(
+        timeout: Duration,
+        peer: PeerType<'_>,
+        port: u16,
+    ) -> ConResult<(Self, IpAddr)> {
         let socket = match peer {
             PeerType::AnyClient(ips) => {
-                connect_to_client(timeout, &ips, CONTROL_PORT, SocketBufferConfig::default())?.0
+                connect_to_client(timeout, &ips, port, SocketBufferConfig::default())?.0
             }
             PeerType::Server(listener) => accept_from_server(listener, None, timeout)?.0,
         };

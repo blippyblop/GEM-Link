@@ -322,18 +322,29 @@ fn es<E: std::fmt::Display>(e: E) -> String {
 /// well-known port (9943 — clients always listen there, servers always connect
 /// out to it), so concurrent loopbacks on one machine would collide.
 pub fn run_loopback(scenario: &Scenario, seed: u64, iterations: u32) -> Result<RunMetrics, String> {
-    // Windows loopback quirk: a fresh bind/listen on 9943 can collide with
-    // TIME_WAIT remnants of the previous run (children share the local port;
-    // Windows holds them ~4min) and surface as an immediate RST (10054 /
-    // 10057) instead of a bind failure — even with SO_REUSEADDR. The hostile
-    // window can outlive an instant retry, so back off before each retry.
-    // Same seed reproduces identical metrics; retries keep gates honest.
+    run_loopback_at(alvr_sockets::CONTROL_PORT, scenario, seed, iterations)
+}
+
+/// [`run_loopback`] on an explicit port, or `0` to let the OS pick a free one.
+/// Callers that do not need the well-known control port should pass `0`: on
+/// Windows, reusing a port within a process leaves the previous session in
+/// TIME_WAIT and the next one starts with an immediate RST (10054/10057), even
+/// with SO_REUSEADDR. The well-known-port conformance case is covered once, in
+/// the `metrics_roundtrip_through_json` test and by the `bench` binary itself.
+pub fn run_loopback_at(
+    port: u16,
+    scenario: &Scenario,
+    seed: u64,
+    iterations: u32,
+) -> Result<RunMetrics, String> {
+    // The hostile window can outlive an instant retry, so back off before each
+    // retry. Same seed reproduces identical metrics; retries keep gates honest.
     let mut attempt_err = String::new();
     for cooldown_ms in [0u64, 100, 500] {
         if cooldown_ms > 0 {
             std::thread::sleep(Duration::from_millis(cooldown_ms));
         }
-        match run_loopback_inner(scenario, seed, iterations) {
+        match run_loopback_inner(port, scenario, seed, iterations) {
             Ok(m) => return Ok(m),
             Err(e) if e.contains("10054") || e.contains("10057") => {
                 attempt_err = if attempt_err.is_empty() {
@@ -349,6 +360,7 @@ pub fn run_loopback(scenario: &Scenario, seed: u64, iterations: u32) -> Result<R
 }
 
 fn run_loopback_inner(
+    port: u16,
     scenario: &Scenario,
     seed: u64,
     iterations: u32,
@@ -358,7 +370,12 @@ fn run_loopback_inner(
     let negotiation = negotiate(&scenario.client, &scenario.server)
         .map_err(|e| format!("negotiation failed for {}: {e}", scenario.name))?;
 
-    let listener = alvr_sockets::get_server_listener(IO_TIMEOUT).map_err(es)?;
+    let listener = alvr_sockets::get_server_listener_on(IO_TIMEOUT, port).map_err(es)?;
+    // Resolve the real port: a request of 0 asks the OS for a free one. Giving
+    // each loopback its own port is what keeps Windows TIME_WAIT from a previous
+    // session (which the retry window above cannot outlive — it is ~4 min) from
+    // aborting this one. Only the conformance case pins the well-known port.
+    let port = listener.local_addr().map_err(es)?.port();
 
     let profile = scenario.profile.clone();
     let headset = std::thread::spawn(move || -> Result<u32, String> {
@@ -381,9 +398,10 @@ fn run_loopback_inner(
 
     // Bench server: connect out to the headset, then ping-pong keepalives.
     let t_connect = Instant::now();
-    let (mut server, _) = ProtoControlSocket::connect_to(
+    let (mut server, _) = ProtoControlSocket::connect_to_port(
         IO_TIMEOUT,
         PeerType::AnyClient(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+        port,
     )
     .map_err(es)?;
     let connect_ms = t_connect.elapsed().as_secs_f64() * 1000.0;
@@ -1322,7 +1340,9 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use x_protocol::VideoCodec;
 
-    /// Loopbacks bind the real well-known port — serialize them.
+    /// Loopbacks use real sockets on localhost — serialize them so they do not
+    /// contend, and so the single well-known-port case is never concurrent
+    /// with another bind.
     fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
         SERIAL
@@ -1330,6 +1350,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Ask the OS for a fresh local port for this loopback. Reusing a port
+    /// within one process is what breaks on Windows: the previous session is
+    /// still in TIME_WAIT and the next bind/connect starts with 10054/10057.
+    /// `0` means "pick a free port" (resolved by run_loopback_inner).
+    const FRESH_PORT: u16 = 0;
 
     #[test]
     fn profiles_and_scenarios_are_consistent() {
@@ -1390,23 +1416,20 @@ mod tests {
         assert!(compare(&g, &bad, &gates).is_err());
     }
 
-    // NOTE (Windows): the four loopback tests below drive the REAL control
-    // plane on the protocol well-known port (9943, clients always listen
-    // there). They pass on Linux and on Windows *in isolation*, but on
-    // Windows successive loopbacks accumulate TIME_WAIT on 9943 and the next
-    // session intermittently starts with 10054/10057 mid-handshake:
-    // SO_REUSEADDR lets the re-bind succeed but the stack still routes the
-    // new SYN into the dying 4-tuple. The only Windows-safe teardown
-    // (SO_LINGER(0)) is inherited by accepted sockets and aborts the *live*
-    // session (verified on the GPU box — see the note in alvr/sockets
-    // bind()), so it is not available here. These tests are therefore
-    // Linux-only; the identical code path runs on the Linux tier plus the
-    // golden-gate/secure/gaze jobs, while the Windows tier exists for the
-    // box-specific NVENC + SteamVR driver steps. See VD_RE/20 §5.
-    #[cfg_attr(
-        windows,
-        ignore = "fixed-port loopback is unstable on Windows; covered by the Linux tier"
-    )]
+    // Loopback tests — these run on every platform (no ignores). There is
+    // deliberately exactly ONE well-known-port (9943) case:
+    // metrics_roundtrip_through_json, which is the conformance test that the
+    // real control port works end to end. Every other loopback test passes
+    // FRESH_PORT, so the OS hands out a new port per loopback.
+    //
+    // Why: on Windows, reusing a port within one process leaves the previous
+    // session in TIME_WAIT and the next one can start with an immediate RST
+    // (10054/10057) even with SO_REUSEADDR. The obvious fix — SO_LINGER(0) to
+    // make closes abortive — cannot be used, because accepted sockets inherit
+    // listener options and it aborts the *live* session (see alvr/sockets
+    // bind()). Fresh ports sidestep the problem entirely rather than hiding it.
+    // The harness logic under test (JSON round-trip, stall events, gate
+    // determinism, gate drift) is port-independent.
     #[test]
     fn metrics_roundtrip_through_json() {
         let _guard = serial_lock();
@@ -1420,15 +1443,11 @@ mod tests {
         assert_eq!(back.negotiation.bitrate_mbps, 300);
     }
 
-    #[cfg_attr(
-        windows,
-        ignore = "fixed-port loopback is unstable on Windows; covered by the Linux tier"
-    )]
     #[test]
     fn full_loopback_run_with_stalls_and_events() {
         let _guard = serial_lock();
         let s = scenario("frame_cqm_churn").unwrap();
-        let m = run_loopback(&s, 1234, 30).expect("loopback run");
+        let m = run_loopback_at(FRESH_PORT, &s, 1234, 30).expect("loopback run");
         assert_eq!(m.iterations, 30);
         assert!(
             !m.events.is_empty(),
@@ -1437,28 +1456,20 @@ mod tests {
         assert!(m.latency.p99_ms >= m.latency.p50_ms);
     }
 
-    #[cfg_attr(
-        windows,
-        ignore = "fixed-port loopback is unstable on Windows; covered by the Linux tier"
-    )]
     #[test]
     fn gate_passes_for_deterministic_reruns() {
         let _guard = serial_lock();
         let s = scenario("frame_ncm").unwrap();
-        let golden = run_loopback(&s, 7, 8).expect("golden");
-        let rerun = run_loopback(&s, 7, 8).expect("rerun");
+        let golden = run_loopback_at(FRESH_PORT, &s, 7, 8).expect("golden");
+        let rerun = run_loopback_at(FRESH_PORT, &s, 7, 8).expect("rerun");
         gate(&rerun, &golden).expect("same-seed rerun must gate clean");
     }
 
-    #[cfg_attr(
-        windows,
-        ignore = "fixed-port loopback is unstable on Windows; covered by the Linux tier"
-    )]
     #[test]
     fn gate_catches_negotiation_drift() {
         let _guard = serial_lock();
         let s = scenario("frame_ncm").unwrap();
-        let golden = run_loopback(&s, 7, 8).expect("golden");
+        let golden = run_loopback_at(FRESH_PORT, &s, 7, 8).expect("golden");
         let mut run = golden.clone();
         run.negotiation.codec = VideoCodec::H264;
         assert!(gate(&run, &golden).is_err());
