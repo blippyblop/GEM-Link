@@ -1,8 +1,12 @@
+//! x-foveation — GemLink's home for the foveation math that turns eye gaze
+//! into encoder center shifts. Extracted verbatim from the driver crate so
+//! the bench can drive the REAL pipeline (conformance by construction)
+//! without linking any C++.
+
 use alvr_common::{
     AlvrFoveatedEncodingParams, ViewParams,
     glam::{Quat, UVec2, Vec2, Vec3},
 };
-use alvr_server_core::align_foveation_center_shift;
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -240,4 +244,28 @@ fn project_gaze(direction: Vec3, view: ViewParams, center_size: Vec2) -> Option<
     );
 
     center_shift.is_finite().then_some(center_shift)
+}
+
+/// Align one center coordinate using the same rule for static and gaze-driven foveation.
+pub fn align_foveation_center_shift(center_shift: f32, edge_size: f32, edge_ratio: f32) -> f32 {
+    if !center_shift.is_finite()
+        || !edge_size.is_finite()
+        || !edge_ratio.is_finite()
+        || edge_size <= 0.0
+        || edge_ratio <= 0.0
+    {
+        return 0.0;
+    }
+
+    let step = edge_ratio * 2.0 / edge_size;
+    if !step.is_finite() || step >= 1.0 {
+        return 0.0;
+    }
+
+    // Reserve one alignment step on each edge to avoid singular inverse coefficients.
+    // Do not replace this with division by `step`: f32 rounding can change the ceiling.
+    let aligned =
+        (center_shift * edge_size / (edge_ratio * 2.0)).ceil() * (edge_ratio * 2.0) / edge_size;
+
+    aligned.clamp(-1.0 + step, 1.0 - step)
 }

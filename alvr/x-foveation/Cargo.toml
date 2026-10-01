@@ -1,0 +1,13 @@
+[package]
+name = "x-foveation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors = ["alvr-org", "Valve Corporation"]
+license = "MIT"
+
+[dependencies]
+alvr_common.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

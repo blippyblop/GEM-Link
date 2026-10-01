@@ -440,6 +440,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tower-http",
+ "x-foveation",
 ]
 
 [[package]]
@@ -8316,12 +8317,14 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "x-bench"
 version = "21.0.0-dev14"
 dependencies = [
+ "alvr_common",
  "alvr_packets",
  "alvr_session",
  "alvr_sockets",
  "serde",
  "serde_json",
  "x-crypto",
+ "x-foveation",
  "x-protocol",
 ]
 
@@ -8342,6 +8345,13 @@ dependencies = [
  "serde_json",
  "windows 0.58.0",
  "x-nvenc",
+]
+
+[[package]]
+name = "x-foveation"
+version = "21.0.0-dev14"
+dependencies = [
+ "alvr_common",
 ]
 
 [[package]]

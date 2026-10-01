@@ -67,29 +67,7 @@ fn is_streaming(client_hostname: &str) -> bool {
         .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
 }
 
-/// Align one center coordinate using the same rule for static and gaze-driven foveation.
-pub fn align_foveation_center_shift(center_shift: f32, edge_size: f32, edge_ratio: f32) -> f32 {
-    if !center_shift.is_finite()
-        || !edge_size.is_finite()
-        || !edge_ratio.is_finite()
-        || edge_size <= 0.0
-        || edge_ratio <= 0.0
-    {
-        return 0.0;
-    }
-
-    let step = edge_ratio * 2.0 / edge_size;
-    if !step.is_finite() || step >= 1.0 {
-        return 0.0;
-    }
-
-    // Reserve one alignment step on each edge to avoid singular inverse coefficients.
-    // Do not replace this with division by `step`: f32 rounding can change the ceiling.
-    let aligned =
-        (center_shift * edge_size / (edge_ratio * 2.0)).ceil() * (edge_ratio * 2.0) / edge_size;
-
-    aligned.clamp(-1.0 + step, 1.0 - step)
-}
+use crate::align_foveation_center_shift;
 
 // Compute a hash over all steamvr-restart settings and client-negotiated values.
 // The small SteamvrHmdInitConfig carries the negotiated resolution/fps; everything else comes from

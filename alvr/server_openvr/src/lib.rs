@@ -1,4 +1,3 @@
-mod foveated_encoding;
 mod graphics;
 mod props;
 mod tracking;
@@ -30,7 +29,7 @@ use alvr_server_core::{
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersConfig, ControllersEmulationMode,
 };
-use foveated_encoding::EyeTrackedFoveation;
+use alvr_server_core::EyeTrackedFoveation;
 use std::{
     collections::VecDeque,
     ffi::{CString, OsStr, c_char, c_void},

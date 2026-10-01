@@ -806,6 +806,175 @@ pub fn run_secure_control(iterations: u32) -> Result<SecureRunMetrics, String> {
     })
 }
 
+/// Gaze → foveation pipeline: deterministic sweep through the REAL
+/// `EyeTrackedFoveation` (extracted verbatim from the driver crate into
+/// x-foveation). Measures what the flagship feature actually costs:
+/// filter settling after a gaze step, steady-state lag during a sweep,
+/// and per-sample update cost. Deterministic — no RNG, no wall clock
+/// beyond measuring update cost.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GazeRunMetrics {
+    pub settle_ms_90pct: f64,
+    pub sweep_lag_ms: f64,
+    pub update_cost_us_mean: f64,
+    pub update_cost_us_max: f64,
+    pub samples: u32,
+}
+
+pub fn run_gaze_foveation() -> Result<GazeRunMetrics, String> {
+    use alvr_common::{
+        AlvrFoveatedEncodingParams, Fov, Pose, ViewParams,
+        glam::{Quat, UVec2, Vec3},
+    };
+    use std::time::Instant;
+    use x_foveation::EyeTrackedFoveation;
+
+    const POLL_HZ: f32 = 90.0;
+    const HOLD_S: f32 = 0.3; // settle window before the step
+    const SETTLE_WINDOW_S: f32 = 1.0;
+    const SWEEP_S: f32 = 0.5; // constant-velocity sweep after the step
+    const STEP_DEG: f32 = 15.0;
+    const SWEEP_DEG: f32 = 30.0;
+
+    // Frame-class FOV: ±55° horizontal, ±45° vertical.
+    let view_params = [ViewParams {
+        pose: Pose {
+            orientation: Quat::IDENTITY,
+            position: Vec3::ZERO,
+        },
+        fov: Fov {
+            left: -55.0_f32.to_radians(),
+            right: 55.0_f32.to_radians(),
+            up: 45.0_f32.to_radians(),
+            down: -45.0_f32.to_radians(),
+        },
+    }; 2];
+
+    let params = AlvrFoveatedEncodingParams {
+        encoded_view_resolution: [2048, 2048],
+        view_ratio: [1.0, 1.0],
+        center_size: [0.4, 0.4],
+        center_shifts: [[0.0, 0.0]; 2],
+        edge_ratio: [4.0, 4.0],
+    };
+    let mut foveation = EyeTrackedFoveation::new(params, UVec2::new(2048, 2048));
+    foveation.view_params = Some(view_params);
+
+    let poll_s = 1.0 / POLL_HZ;
+    let mut t = 0.0f32;
+    let mut centers_x: Vec<(f32, f32)> = Vec::new(); // (time_s, left center_shift_x)
+    let mut update_costs = Vec::new();
+
+    let step = |foveation: &mut EyeTrackedFoveation,
+                t: f32,
+                azimuth_deg: f32,
+                costs: &mut Vec<f64>,
+                out: &mut Vec<(f32, f32)>|
+     -> Result<(), String> {
+        let ts = Duration::from_secs_f32(t);
+        let orientation = Quat::from_rotation_y(azimuth_deg.to_radians());
+        let t0 = Instant::now();
+        foveation.update(ts, Some(orientation), Instant::now());
+        costs.push(t0.elapsed().as_secs_f64() * 1e6);
+        let centers = foveation
+            .centers(ts)
+            .ok_or_else(|| format!("no centers at t={t}"))?;
+        out.push((t, centers[0][0]));
+        Ok(())
+    };
+
+    // Phase 1: hold center — initialize the filter.
+    for i in 0..((HOLD_S / poll_s) as u32) {
+        t = i as f32 * poll_s;
+        step(&mut foveation, t, 0.0, &mut update_costs, &mut centers_x)?;
+    }
+
+    // Phase 2: STEP +15° — settling time to 90% of the total shift.
+    let baseline = centers_x.last().unwrap().1;
+    let mut settle_ms: Option<f64> = None;
+    for i in 1..=((SETTLE_WINDOW_S / poll_s) as u32) {
+        t = HOLD_S + i as f32 * poll_s;
+        step(
+            &mut foveation,
+            t,
+            STEP_DEG,
+            &mut update_costs,
+            &mut centers_x,
+        )?;
+        if settle_ms.is_none() {
+            let current = centers_x.last().unwrap().1;
+            let target = baseline + 0.9 * (current - baseline);
+            let _ = target; // 90% criterion below uses the final value
+        }
+    }
+    let settled = centers_x.last().unwrap().1;
+    let total_shift = settled - baseline;
+    for (sample_t, cx) in &centers_x {
+        if *sample_t > HOLD_S && settle_ms.is_none() {
+            // Magnitude criterion: works for either direction of the step.
+            if ((cx - baseline) / total_shift).abs() >= 0.9 {
+                settle_ms = Some(((sample_t - HOLD_S) * 1000.0) as f64);
+            }
+        }
+    }
+    let settle_ms_90pct = settle_ms.ok_or("gaze filter never settled within window")?;
+
+    // Phase 3: constant-velocity sweep back to 0° — steady-state lag.
+    // Invert the projection analytically: measured shift → input azimuth →
+    // the input time that produced it → lag. Averaged over the ramp tail.
+    let sweep_start = t;
+    let sweep_rate = SWEEP_DEG / SWEEP_S; // deg/s
+    let mut lags = Vec::new();
+    for i in 1..=((SWEEP_S / poll_s) as u32) {
+        t = sweep_start + i as f32 * poll_s;
+        let azimuth = STEP_DEG - sweep_rate * (t - sweep_start);
+        step(
+            &mut foveation,
+            t,
+            azimuth,
+            &mut update_costs,
+            &mut centers_x,
+        )?;
+        if i > 10 {
+            let measured = centers_x.last().unwrap().1;
+            let az_in = azimuth_for_shift_x(measured);
+            let input_t = sweep_start + (STEP_DEG - az_in) / sweep_rate;
+            lags.push(((t - input_t) * 1000.0) as f64);
+        }
+    }
+    let sweep_lag_ms = lags.iter().sum::<f64>() / lags.len().max(1) as f64;
+
+    // Sanity: centers finite and inside the aligned bounds.
+    for (_, cx) in &centers_x {
+        if !cx.is_finite() || cx.abs() > 1.5 {
+            return Err(format!("center shift out of bounds: {cx}"));
+        }
+    }
+
+    // Untimed-warmup lesson (NVENC): the first calls pay one-time allocator
+    // and page-fault costs — exclude them from the steady-state cost stats.
+    let warm = update_costs.len().min(5);
+    let steady = &update_costs[warm..];
+    let update_cost_us_mean = steady.iter().sum::<f64>() / steady.len() as f64;
+    let update_cost_us_max = steady.iter().cloned().fold(0.0, f64::max);
+    Ok(GazeRunMetrics {
+        settle_ms_90pct,
+        sweep_lag_ms,
+        update_cost_us_mean,
+        update_cost_us_max,
+        samples: centers_x.len() as u32,
+    })
+}
+
+fn azimuth_for_shift_x(shift: f32) -> f32 {
+    // Driver convention: yaw +az maps -Z toward -X, so tangent.x = -tan(az)
+    // and the shift sign flips relative to the naive mirror.
+    let lo = (-55.0_f32.to_radians()).tan();
+    let hi = 55.0_f32.to_radians().tan();
+    let uv = shift * 0.6 / 2.0 + 0.5;
+    -(uv * (hi - lo) + lo).atan().to_degrees()
+}
+
 fn secure_client_side(
     stream: TcpStream,
     rng: &mut Lcg,
@@ -1050,5 +1219,74 @@ mod tests {
         assert_eq!(m.frames, 10);
         assert_eq!(m.missed_mandatory_pct, 0.0);
         assert_eq!(m.within_optimal_pct, 100.0);
+    }
+}
+
+#[cfg(test)]
+mod gaze_tests {
+    use alvr_common::{
+        AlvrFoveatedEncodingParams, Fov, Pose, ViewParams,
+        glam::{Quat, UVec2, Vec3},
+    };
+    use std::time::{Duration, Instant};
+    use x_foveation::EyeTrackedFoveation;
+
+    /// The step response must be monotone and converge to the analytically
+    /// expected shift with the DRIVER's sign convention (yaw +15° → -0.313).
+    #[test]
+    fn gaze_step_response_is_monotone_and_converges() {
+        let view_params = [ViewParams {
+            pose: Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::ZERO,
+            },
+            fov: Fov {
+                left: -55.0_f32.to_radians(),
+                right: 55.0_f32.to_radians(),
+                up: 45.0_f32.to_radians(),
+                down: -45.0_f32.to_radians(),
+            },
+        }; 2];
+        let params = AlvrFoveatedEncodingParams {
+            encoded_view_resolution: [2048, 2048],
+            view_ratio: [1.0, 1.0],
+            center_size: [0.4, 0.4],
+            center_shifts: [[0.0, 0.0]; 2],
+            edge_ratio: [4.0, 4.0],
+        };
+        let mut f = EyeTrackedFoveation::new(params, UVec2::new(2048, 2048));
+        f.view_params = Some(view_params);
+        let poll = 1.0 / 90.0;
+        let mut t = 0.0f32;
+        for i in 0..27 {
+            t = i as f32 * poll;
+            f.update(
+                Duration::from_secs_f32(t),
+                Some(Quat::IDENTITY),
+                Instant::now(),
+            );
+        }
+        let mut prev = 0.0f32;
+        let mut last = 0.0f32;
+        for i in 1..=90 {
+            t = 0.3 + i as f32 * poll;
+            f.update(
+                Duration::from_secs_f32(t),
+                Some(Quat::from_rotation_y(15f32.to_radians())),
+                Instant::now(),
+            );
+            let cx = f.centers(Duration::from_secs_f32(t)).unwrap()[0][0];
+            assert!(
+                cx <= prev + 1e-4,
+                "step response must decrease monotonically (driver sign): {cx} after {prev}"
+            );
+            prev = cx;
+            last = cx;
+        }
+        let expected = -0.313_f32;
+        assert!(
+            (last - expected).abs() < 0.01,
+            "converged to {last}, expected {expected}"
+        );
     }
 }

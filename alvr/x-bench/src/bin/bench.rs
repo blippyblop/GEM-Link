@@ -10,8 +10,8 @@
 
 use std::process::ExitCode;
 use x_bench::{
-    RunMetrics, compare, gate, parse_gate, run_loopback, run_secure_control, run_secure_loopback,
-    scenario, scenarios, write_run,
+    RunMetrics, compare, gate, parse_gate, run_gaze_foveation, run_loopback, run_secure_control,
+    run_secure_loopback, scenario, scenarios, write_run,
 };
 
 fn chrono_like_timestamp() -> String {
@@ -282,6 +282,35 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 ));
             }
             println!("GATE: control plane 0% missed mandatory — PASS");
+            Ok(())
+        }
+        "gaze" => {
+            // Gaze → foveation pipeline through the real EyeTrackedFoveation
+            // math (x-foveation, verbatim from the driver). Gate: the 30ms
+            // time-constant filter must settle within 120ms at 90Hz polls.
+            let m = run_gaze_foveation()?;
+            println!("gaze pipeline: EyeTrackedFoveation (30ms filter, real driver math)");
+            println!(
+                "settle_ms_90pct={:.1} sweep_lag_ms={:.1} samples={}",
+                m.settle_ms_90pct, m.sweep_lag_ms, m.samples
+            );
+            println!(
+                "update_cost_us mean={:.2} max={:.2}",
+                m.update_cost_us_mean, m.update_cost_us_max
+            );
+            let mut failed = false;
+            if m.settle_ms_90pct > 120.0 {
+                println!("GATE FAIL: settle {}ms > 120ms", m.settle_ms_90pct);
+                failed = true;
+            }
+            if m.update_cost_us_max > 100.0 {
+                println!("GATE FAIL: update cost {}us > 100us", m.update_cost_us_max);
+                failed = true;
+            }
+            if failed {
+                return Err("gaze gate failed".into());
+            }
+            println!("GATE: settle ≤120ms and update ≤100µs — PASS");
             Ok(())
         }
         "nvenc" => {
