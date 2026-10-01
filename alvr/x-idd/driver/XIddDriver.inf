@@ -13,9 +13,9 @@ CatalogFile=XIddDriver.cat
 DriverVer= ; TODO: set DriverVer in stampinf property pages
 
 [Manufacturer]
-%ManufacturerName%=Standard,NT$ARCH$.10.0...22000
+%ManufacturerName%=Standard,NT$ARCH$.10.0...19041
 
-[Standard.NT$ARCH$.10.0...22000]
+[Standard.NT$ARCH$.10.0...19041]
 %DeviceName%=MyDevice_Install, Root\XIddDriver ; TODO: edit hw-id, this hardware id is used by Visual Studio remote debugging
 %DeviceName%=MyDevice_Install, XIddDriver      ; TODO: edit hw-id, this hardware if is used by the XIddApp.exe
 
@@ -27,14 +27,16 @@ XIddDriver.dll=1
 
 ; =================== UMDF Device ==================================
 
+; NOTE: the MS sample uses Include=WUDFRD.inf / Needs=WUDFRD.NT* here. That is
+; the Windows 11 shape: on Windows 10 19045 the .hw include fails outright and
+; the services section never sets SPSVCINST_ASSOCSERVICE, so install dies with
+; "No INF AddService directives contained the flag SPSVCINST_ASSOCSERVICE".
+; VD's shipped vdvmd.inf declares the reflector service EXPLICITLY instead, and
+; that is the configuration proven to work on this OS. Adopted.
 [MyDevice_Install.NT]
-Include=WUDFRD.inf
-Needs=WUDFRD.NT
 CopyFiles=UMDriverCopy
 
 [MyDevice_Install.NT.hw]
-Include=WUDFRD.inf
-Needs=WUDFRD.NT.HW
 AddReg = MyDevice_HardwareDeviceSettings
 
 [MyDevice_HardwareDeviceSettings]
@@ -46,8 +48,7 @@ HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "XIddDriverGroup"
 HKR,, "Security",, "D:P(A;;GA;;;BA)(A;;GA;;;SY)"
 
 [MyDevice_Install.NT.Services]
-Include=WUDFRD.inf
-Needs=WUDFRD.NT.Services
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
 
 [MyDevice_Install.NT.Wdf]
 UmdfService=XIddDriver,XIddDriver_Install
@@ -59,6 +60,13 @@ UmdfLibraryVersion=$UMDFVERSION$
 ServiceBinary=%12%\UMDF\XIddDriver.dll
 UmdfExtensions = IddCx0102
 
+[WUDFRD_ServiceInstall]
+DisplayName   = %WudfRdDisplayName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
 [DestinationDirs]
 UMDriverCopy=12,UMDF ; copy to drivers\umdf
 
@@ -69,6 +77,7 @@ XIddDriver.dll
 
 [Strings]
 ManufacturerName="<Your manufacturer name>" ; TODO: Replace with your manufacturer name
+WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"
 DiskName = "XIddDriver Installation Disk" ; TODO: Replace with driver disk name
 DeviceName="XIddDriver Device" ; TODO: Replace with correct device name
 

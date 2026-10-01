@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["alvr/*"]
+# x-idd is a Windows Indirect Display Driver (WDK/msbuild), NOT a Rust crate.
+# Without this exclusion the alvr/* glob picks it up and cargo fails to load the
+# workspace manifest for EVERY command in the repo (including CI).
+exclude = ["alvr/x-idd"]
 
 [workspace.package]
 version = "21.0.0-dev14"
