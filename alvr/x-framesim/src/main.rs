@@ -33,6 +33,23 @@ fn timeout() -> Duration {
         .unwrap_or(Duration::from_secs(90))
 }
 
+/// Frame-budget gates, in ms, with the label to print.
+///
+/// The goal is NOT a frame rate: a mean of 90 fps is trivially hit by one frame
+/// arriving 100 ms late and the rest arriving in 1 ms, which looks awful. What
+/// matters is the tail — every frame inside the budget. Primary is the 90 Hz
+/// budget (1000/90 = 11.111 ms); ideal is the 120 Hz budget (8.333 ms).
+///
+/// We assert "zero frames over budget" rather than "99.99% within budget",
+/// because substantiating 99.99% needs >= 10_000 samples; asserting it from a
+/// few hundred frames would be a dishonest number. Run with a large
+/// FRAMESIM_FRAMES to make the claim, and the count is printed either way.
+const FRAME_INTERVAL_US: u64 = 11_111;
+const DEADLINES_MS: [(f64, &str); 2] = [
+    (1000.0 / 90.0, "primary  (90 Hz budget, 11.111 ms)"),
+    (1000.0 / 120.0, "ideal    (120 Hz budget,  8.333 ms)"),
+];
+
 /// If non-zero, require this many video frames before declaring success.
 fn frame_target() -> usize {
     std::env::var("FRAMESIM_FRAMES")
@@ -83,10 +100,13 @@ fn main() {
     let first_frame = Arc::clone(&first);
     let bytes = Arc::new(AtomicUsize::new(0));
     let bytes_seen = Arc::clone(&bytes);
-    // Inter-arrival gaps: the receive-side cadence, independent of what the
-    // streamer thinks it sent.
-    let gaps: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
-    let gaps_seen = Arc::clone(&gaps);
+    // Arrival instants. Raw inter-frame gap is the WRONG metric for a paced
+    // stream: gaps jitter symmetrically around the period, so ~half exceed it by
+    // construction and it looks like a failure when nothing is wrong. What
+    // matters is deviation from the expected cadence (a long gap followed by a
+    // short one is not a hitch).
+    let arrivals: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let arrivals_seen = Arc::clone(&arrivals);
     let mut last: Option<Instant> = None;
     let first_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let first_at_seen = Arc::clone(&first_at);
@@ -99,12 +119,10 @@ fn main() {
                 *f = Some(now);
             }
         }
-        if let Some(prev) = last {
-            if let Ok(mut g) = gaps_seen.lock() {
-                g.push((now - prev).as_secs_f64() * 1e3);
-            }
+        if let Ok(mut a) = arrivals_seen.lock() {
+            a.push(now);
         }
-        last = Some(now);
+        let _ = last;
         if first_frame.swap(false, Ordering::SeqCst) || n % 60 == 0 {
             println!(
                 "[framesim] video frame #{n} ts={timestamp:?} bytes={}",
@@ -180,20 +198,51 @@ fn main() {
                 total as f64 * 8.0 / secs / 1e6,
                 total
             );
-            if let Ok(mut g) = gaps.lock() {
-                if !g.is_empty() {
-                    g.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let m = g.len();
-                    let mean = g.iter().sum::<f64>() / m as f64;
+            let mut gate_ok = true;
+            if let Ok(a) = arrivals.lock() {
+                if a.len() > 2 {
+                    let interval = Duration::from_micros(FRAME_INTERVAL_US);
+                    let first = a[0];
+                    // Signed lateness of each frame against where it should have
+                    // landed if the stream were perfectly paced.
+                    let mut late: Vec<f64> = a
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let expected = first + interval * i as u32;
+                            (t.saturating_duration_since(expected).as_secs_f64()
+                                - expected.saturating_duration_since(*t).as_secs_f64())
+                                * 1e3
+                        })
+                        .collect();
+                    late.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                    let m = late.len();
+                    // Centre on the median. The absolute offset is unknowable:
+                    // we cannot compare clocks, and the first frame sits queued
+                    // behind session setup, which shifts every later frame's
+                    // apparent lateness. Only the spread is real.
+                    let mid = late[m / 2];
+                    let dev: Vec<f64> = late.iter().map(|x| x - mid).collect();
                     println!(
-                        "[framesim]   frame gap: mean {mean:.2} ms, p50 {:.2} ms, p99 {:.2} ms, max {:.2} ms",
-                        g[m / 2],
-                        g[(m * 99 / 100).min(m - 1)],
-                        g[m - 1]
+                        "[framesim]   cadence deviation from median: min {:.2} ms, p99 {:.2} ms, max {:.2} ms",
+                        dev[0], dev[(m * 99 / 100).min(m - 1)], dev[m - 1]
                     );
+                    println!("[framesim]   samples: {m} frames (99.99% needs >= 10000)");
+                    for (deadline, label) in DEADLINES_MS {
+                        let over = dev.iter().filter(|x| x.abs() > deadline).count();
+                        let ok = over == 0;
+                        if label.starts_with("primary") {
+                            gate_ok = ok;
+                        }
+                        println!(
+                            "[framesim]   {label}: {over}/{m} outside budget ({:.4}%) -> {}",
+                            over as f64 * 100.0 / m as f64,
+                            if ok { "PASS" } else { "FAIL" }
+                        );
+                    }
                 }
             }
-            exit(0);
+            exit(if gate_ok { 0 } else { 3 });
         }
 
         if start.elapsed() > limit {

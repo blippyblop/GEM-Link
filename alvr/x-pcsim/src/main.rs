@@ -224,6 +224,7 @@ fn main() {
     let t0 = Instant::now();
     let mut total_bytes: u64 = 0;
     let mut max_frame = 0usize;
+    let mut send_late_ms: Vec<f64> = Vec::new();
     let _ = FRAME_INTERVAL;
     println!("[pcsim] streaming {frames} frames over VIDEO (target {} fps)", 1_000_000 / FRAME_INTERVAL_US);
 
@@ -272,6 +273,7 @@ fn main() {
         if let Some(rest) = deadline.checked_duration_since(Instant::now()) {
             thread::sleep(rest);
         }
+        send_late_ms.push(Instant::now().saturating_duration_since(deadline).as_secs_f64() * 1e3);
     }
 
     let elapsed = t0.elapsed();
@@ -284,6 +286,21 @@ fn main() {
         max_frame,
         total_bytes as f64 / frames as f64
     );
+    // Same tail convention as the client: how late did each frame leave,
+    // against the 90 Hz and 120 Hz frame budgets?
+    send_late_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let m = send_late_ms.len();
+    if m > 0 {
+        let over90 = send_late_ms.iter().filter(|x| **x > 1000.0 / 90.0).count();
+        let over120 = send_late_ms.iter().filter(|x| **x > 1000.0 / 120.0).count();
+        println!(
+            "[pcsim]   send lateness: p50 {:.3} ms, p99 {:.3} ms, max {:.3} ms",
+            send_late_ms[m / 2],
+            send_late_ms[(m * 99 / 100).min(m - 1)],
+            send_late_ms[m - 1]
+        );
+        println!("[pcsim]   over 90Hz budget: {over90}/{m} | over 120Hz budget: {over120}/{m}");
+    }
     if let Some((n, p50, p99, mean)) = source.encode_stats() {
         println!(
             "[pcsim]   nvenc encode over {n} frames: p50 {p50:.2} ms, p99 {p99:.2} ms, mean {mean:.2} ms ({:.0} fps encodable)",
