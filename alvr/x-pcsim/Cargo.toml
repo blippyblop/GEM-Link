@@ -1,0 +1,18 @@
+[package]
+name = "x_pcsim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pcsim"
+path = "src/main.rs"
+
+[dependencies]
+alvr_common.workspace = true
+alvr_packets.workspace = true
+alvr_session.workspace = true
+alvr_sockets.workspace = true
+env_logger = "0.11"
