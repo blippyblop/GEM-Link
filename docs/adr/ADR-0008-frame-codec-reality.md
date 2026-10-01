@@ -10,6 +10,21 @@ Frame's current kernel does not expose AV1 or 10-bit decode (iris V4L2 path).
 These become **nice-to-haves** gated on future firmware/kernel updates, not
 requirements.
 
+## Platform note (explicit, 2026-10-01)
+
+The Frame is **aarch64 Linux** — not Android. Evidence: iris V4L2 decode path
+(V4L2 is the Linux kernel decode API; Android headsets expose MediaCodec),
+vrcompositor strings in the firmware (Valve-family compositor), and the user's
+firmware dump. Client-side consequences:
+
+- Client stack targets `aarch64-unknown-linux-*` — upstream `client_core` is
+  already Rust-portable; no APK/JNI/NDK layer, native ELF.
+- Hardware decode integrates via **V4L2/VA-API (iris)**, not MediaCodec.
+- Compositor submission path is expected to be the Frame's native/Valve-family
+  compositor, not a generic Android surface.
+- The wire protocol, ports, negotiation, and encryption layers are
+  OS-independent and unaffected — the bench tiers validate them as-is.
+
 ## Decision
 
 1. Frame capability samples advertise **HEVC 8-bit and H.264 only** (HEVC
