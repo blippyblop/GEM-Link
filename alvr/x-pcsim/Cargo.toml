@@ -22,6 +22,7 @@ env_logger = "0.11"
 # to the synthetic payload.
 [target.'cfg(windows)'.dependencies]
 x-nvenc = { path = "../x-nvenc" }
+x-dda = { path = "../x-dda" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

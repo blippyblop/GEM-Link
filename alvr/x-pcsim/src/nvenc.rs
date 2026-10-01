@@ -30,6 +30,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::core::Interface;
+use x_dda::Duplicator;
 use x_nvenc::NvEncoder;
 
 /// How many distinct frames we cycle through. Enough that the encoder sees
@@ -63,7 +64,7 @@ impl Feeder {
             pool.push(tex);
         }
 
-        let encoder = NvEncoder::new(unsafe { device.as_raw() }, width, height, fps)
+        let encoder = NvEncoder::new(device.as_raw(), width, height, fps)
             .map_err(|e| format!("nvenc session: {e}"))?;
 
         Ok(Self {
@@ -213,4 +214,118 @@ fn fill_pattern(
         context.CopyResource(target, staging);
     }
     Ok(())
+}
+
+/// Desktop Duplication source — real screen content, zero CPU readback.
+///
+/// Follows the commercial streamer's capture discipline (`VD_RE/05` §2, mined
+/// from the RE), because naive DDA gets these wrong:
+///  - **20 ms wait-bounded poll** (`TryAcquireNextFrame`), not a spin.
+///  - **Release immediately after the GPU copy** — holding DDA ownership
+///    throttles the system compositor and is the #1 cause of "streaming makes my
+///    PC stutter".
+///  - `Ok(None)` means the desktop did not update within the poll; we re-encode
+///    the previous texture so the stream keeps its cadence. Note that a static
+///    desktop therefore produces near-empty P-frames: **an idle screen is not a
+///    valid bitrate sample** (`VD_RE/23` §8.1).
+///
+/// No scaling is done here: capture arrives at the desktop's resolution, so the
+/// negotiated resolution is taken FROM the desktop. The architecturally correct
+/// VR-resolution answer is a virtual display (VD's `IVirtualMonitor`, our
+/// Phase 2 `x-idd`), not a scale step here.
+pub struct DdaFeeder {
+    dup: Duplicator,
+    pool: Vec<ID3D11Texture2D>,
+    encoder: NvEncoder,
+    pitch: u32,
+    idx: usize,
+    encode_times: Vec<Duration>,
+    empty_polls: u64,
+    frames: u64,
+}
+
+impl DdaFeeder {
+    /// Returns the feeder and the desktop resolution it captures at.
+    pub fn new(adapter_idx: u32, output_idx: u32, fps: u32) -> Result<(Self, u32, u32), String> {
+        let dup = Duplicator::new(adapter_idx, output_idx, &[DXGI_FORMAT_B8G8R8A8_UNORM])
+            .map_err(|e| format!("duplicator: {e}"))?;
+        let desktop = dup.desktop_desc().map_err(|e| format!("desktop_desc: {e}"))?;
+        let (w, h) = (desktop.width, desktop.height);
+
+        // Two slots, same as the pattern feeder: NVENC reads one while the next
+        // desktop frame is copied into the other.
+        let pool = vec![
+            create_texture(dup.device(), w, h, D3D11_USAGE_DEFAULT)?,
+            create_texture(dup.device(), w, h, D3D11_USAGE_DEFAULT)?,
+        ];
+        let encoder = NvEncoder::new(dup.device_ptr(), w, h, fps)
+            .map_err(|e| format!("nvenc session: {e}"))?;
+
+        Ok((
+            Self {
+                dup,
+                pool,
+                encoder,
+                pitch: w * 4,
+                idx: 0,
+                encode_times: Vec::new(),
+                empty_polls: 0,
+                frames: 0,
+            },
+            w,
+            h,
+        ))
+    }
+
+    pub fn encode_next(&mut self) -> Result<Vec<u8>, String> {
+        let slot = self.idx % self.pool.len();
+
+        // 20 ms wait-bounded poll.
+        let frame = match unsafe { self.dup.acquire(20) } {
+            Ok(Some(f)) => Some(f),
+            Ok(None) => {
+                self.empty_polls += 1;
+                None
+            }
+            Err(e) => return Err(format!("acquire: {e}")),
+        };
+
+        if let Some(f) = frame.as_ref() {
+            // GPU-side copy, then release IMMEDIATELY (before encoding).
+            if let Some(ctx) = self.dup.context() {
+                unsafe { ctx.CopyResource(&self.pool[slot], &f.texture) };
+            }
+            self.dup.release();
+        }
+
+        let t = Instant::now();
+        let out = self
+            .encoder
+            .encode(self.pool[slot].as_raw(), self.pitch)
+            .map_err(|e| format!("nvenc encode: {e}"))?;
+        self.encode_times.push(t.elapsed());
+        self.idx += 1;
+        self.frames += 1;
+        Ok(out)
+    }
+
+    pub fn last_encode_ms(&self) -> f64 {
+        self.encode_times.last().map(|d| d.as_secs_f64() * 1e3).unwrap_or(0.0)
+    }
+
+    pub fn encode_stats(&self) -> (usize, f64, f64, f64) {
+        let mut ms: Vec<f64> = self.encode_times.iter().map(|d| d.as_secs_f64() * 1e3).collect();
+        if ms.is_empty() {
+            return (0, 0.0, 0.0, 0.0);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = ms.len();
+        let mean = ms.iter().sum::<f64>() / n as f64;
+        (n, ms[n / 2], ms[(n * 99 / 100).min(n - 1)], mean)
+    }
+
+    /// (desktop frames observed, empty polls) — a static desktop shows up here.
+    pub fn capture_stats(&self) -> (u64, u64) {
+        (self.frames, self.empty_polls)
+    }
 }

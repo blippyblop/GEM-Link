@@ -47,17 +47,31 @@ const FRAME_INTERVAL_US: u64 = 11_111;
 enum Source {
     /// Padding bytes: exercises the transport and framing only.
     Synthetic(Vec<u8>),
-    /// Real NVENC bitstream (Windows).
+    /// Real NVENC bitstream from synthetic patterned textures (Windows).
     #[cfg(windows)]
     Nvenc(nvenc::Feeder),
+    /// Real NVENC bitstream from Desktop Duplication (Windows).
+    #[cfg(windows)]
+    Dda(nvenc::DdaFeeder),
 }
 
 impl Source {
     /// (count, p50_ms, p99_ms, mean_ms) when the source is NVENC.
     fn encode_stats(&self) -> Option<(usize, f64, f64, f64)> {
         #[cfg(windows)]
-        if let Source::Nvenc(f) = self {
-            return Some(f.encode_stats());
+        match self {
+            Source::Nvenc(f) => return Some(f.encode_stats()),
+            Source::Dda(f) => return Some(f.encode_stats()),
+            _ => {}
+        }
+        None
+    }
+
+    /// Capture-side stats when the source has them: (desktop frames, empty polls).
+    fn capture_stats(&self) -> Option<(u64, u64)> {
+        #[cfg(windows)]
+        if let Source::Dda(f) = self {
+            return Some(f.capture_stats());
         }
         None
     }
@@ -71,6 +85,11 @@ impl Source {
                 let b = f.encode_next()?;
                 Ok((b, f.last_encode_ms()))
             }
+            #[cfg(windows)]
+            Source::Dda(f) => {
+                let b = f.encode_next()?;
+                Ok((b, f.last_encode_ms()))
+            }
         }
     }
 }
@@ -78,15 +97,33 @@ impl Source {
 /// Real NVENC when it is available and asked for, else a synthetic payload.
 /// The encoder is fed VR-resolution frames (never the desktop's), because that
 /// is what the headset consumes and the resolution must stay negotiable.
-fn make_source(view_w: u32, view_h: u32, payload_len: usize) -> Source {
+fn make_source(view_w: u32, view_h: u32, payload_len: usize) -> (Source, u32, u32) {
     #[cfg(windows)]
     {
-        let want = env::var("PCSIM_NVENC").map(|v| v != "0").unwrap_or(true);
+        let which = env::var("PCSIM_SOURCE").unwrap_or_else(|_| "pattern".to_string());
+        // Desktop Duplication: capture arrives at the DESKTOP's resolution and we
+        // negotiate exactly that (no scaling here; the correct VR-resolution
+        // answer is a virtual display, see VD_RE/23 section 8.2).
+        if which == "dda" {
+            let adapter: u32 = env::var("PCSIM_DDA_ADAPTER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let output: u32 = env::var("PCSIM_DDA_OUTPUT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            match nvenc::DdaFeeder::new(adapter, output, 90) {
+                Ok((f, w, h)) => {
+                    println!("[pcsim] video source: DDA {w}x{h} on adapter {adapter} output {output}");
+                    println!("[pcsim]   note: a static desktop yields near-empty P-frames -- not a valid bitrate sample");
+                    return (Source::Dda(f), w, h);
+                }
+                Err(e) => {
+                    eprintln!("[pcsim] DDA unavailable ({e}); falling back to the patterned NVENC source");
+                }
+            }
+        }
+        let want = which != "synthetic";
         if want {
             match nvenc::Feeder::new(view_w, view_h, 90) {
                 Ok(f) => {
                     println!("[pcsim] video source: NVENC {view_w}x{view_h} (8-bit)");
-                    return Source::Nvenc(f);
+                    return (Source::Nvenc(f), view_w, view_h);
                 }
                 Err(e) => eprintln!("[pcsim] NVENC unavailable ({e}); using synthetic payload"),
             }
@@ -95,7 +132,7 @@ fn make_source(view_w: u32, view_h: u32, payload_len: usize) -> Source {
     #[cfg(not(windows))]
     let _ = (view_w, view_h);
     println!("[pcsim] video source: synthetic {payload_len}B payload");
-    Source::Synthetic(vec![0u8; payload_len])
+    (Source::Synthetic(vec![0u8; payload_len]), view_w, view_h)
 }
 
 fn main() {
@@ -162,6 +199,12 @@ fn main() {
     //    a real server would use its negotiated session here.
     // Build the session once: the client will listen for the video socket on
     // THIS session's stream_port, so the server must dial the very same value.
+    // Pick the video source first, then negotiate ITS resolution. Taking the
+    // resolution from the source guarantees the two cannot drift -- hard-coded
+    // port/protocol is exactly what silently broke the stream earlier while the
+    // handshake still reported success.
+    let (mut source, view_w, view_h) = make_source(view_w, view_h, payload_len);
+
     let session_config = SessionConfig::default();
     let session_settings = session_config.to_settings();
     let stream_port: u16 = session_settings.connection.stream_port;
@@ -226,7 +269,6 @@ fn main() {
             }
         };
 
-    let mut source = make_source(view_w, view_h, payload_len);
     let t0 = Instant::now();
     let mut total_bytes: u64 = 0;
     let mut max_frame = 0usize;
@@ -338,6 +380,12 @@ fn main() {
             }
             Err(e) => eprintln!("[pcsim] could not write CSV: {e}"),
         }
+    }
+    if let Some((observed, empty)) = source.capture_stats() {
+        println!(
+            "[pcsim]   dda: {observed} desktop frames observed, {empty} empty polls ({:.1}% idle)",
+            empty as f64 * 100.0 / (observed + empty).max(1) as f64
+        );
     }
     if let Some((n, p50, p99, mean)) = source.encode_stats() {
         println!(
