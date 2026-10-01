@@ -322,6 +322,26 @@ fn es<E: std::fmt::Display>(e: E) -> String {
 /// well-known port (9943 — clients always listen there, servers always connect
 /// out to it), so concurrent loopbacks on one machine would collide.
 pub fn run_loopback(scenario: &Scenario, seed: u64, iterations: u32) -> Result<RunMetrics, String> {
+    // Windows loopback quirk: a fresh bind/listen on 9943 can collide with
+    // TIME_WAIT remnants of the previous run (children share the local port;
+    // Windows holds them ~4min) and surface as an immediate RST (10054 /
+    // 10057) instead of a bind failure — even with SO_REUSEADDR. Same seed
+    // reproduces identical metrics, so ONE retry keeps gates deterministic.
+    match run_loopback_inner(scenario, seed, iterations) {
+        Ok(m) => Ok(m),
+        Err(e) if e.contains("10054") || e.contains("10057") => {
+            run_loopback_inner(scenario, seed, iterations)
+                .map_err(|retry| format!("{e} | retry: {retry}"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_loopback_inner(
+    scenario: &Scenario,
+    seed: u64,
+    iterations: u32,
+) -> Result<RunMetrics, String> {
     assert!(iterations >= 1, "iterations must be >= 1");
 
     let negotiation = negotiate(&scenario.client, &scenario.server)

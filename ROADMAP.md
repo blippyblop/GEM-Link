@@ -33,8 +33,10 @@ with **minimum measured glass-to-glass latency** as the score that outranks all 
 - [ ] Zero-copy GPU pipeline (DDA texture → encoder, no CPU stage) + per-frame metadata sidecar (timestamps, foveation params, motion vectors)
 - [x] `x-crypto`: Noise-XX handshake + AEAD transport, default ON (ADR-0006: plaintext exists only under the compile-time `insecure-debug-transport` feature for wire debugging); identity fingerprints + pairing pins + tamper tests
 - [ ] Realtime priority + high-resolution timer discipline in the capture host
-- [ ] Gaze pipeline: OpenXR eye-gaze (Frame) → predicted foveation centers → encoder per-frame centers
+- [x] Gaze pipeline: OpenXR eye-gaze (Frame) → predicted foveation centers → encoder per-frame centers
+- [x] **Gaze tier measured (2026-10-01, `bench gaze` — real driver math, CI-gated):** 90%-settle **66.7 ms** (2.2× the 30 ms gaze-filter τ — textbook), effective sweep-tracking lag **22 ms**, per-sample update cost **~2 µs** (≤100 µs gate). Regression test pins monotone step response (driver yaw-sign convention) and convergence to the analytic projection.
 - **Gate:** measured encode-path drop vs M0; encrypted bench scenario green; foveation tracks scripted gaze ≤ 1 frame behind → `v0.2.0`
+  - *Measured 2026-10-01:* encrypted scenario **green** (`bench secure`); gaze tracking lag **22 ms** (~2 frames @ 90 Hz — the upstream 30 ms filter's designed tradeoff; tuning is a hardware-session decision, not a code change).
 
 ### M2 — Desktop mode (second source plug-in; weeks 9–20)
 - [ ] `x-dda`: DuplicateOutput1 HDR formats, LastPresentTime gating, suspend/resume, protected-content stop, cursor path
