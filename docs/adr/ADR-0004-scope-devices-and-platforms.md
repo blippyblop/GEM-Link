@@ -25,7 +25,7 @@ platform and ecosystem) is a *desired* goal but **not the focus**: the Linux str
    - Linux server: keep upstream's support working (do not break it; accept small fixes) —
      but no Linux-specific roadmap items and no Linux build gates.
    - Linux/Monado client (generic PC or Frame): not planned near-term; the Frame client runs
-     on the bundled SteamVR runtime (ADR-0003 §Decision 4). Revisit post-M3.
+     on the bundled SteamVR runtime (ADR-0003 §Decision 4, ADR-0009). Revisit post-M3.
 3. Capability types stay generic (`client_os`, `decoders`, …) so Tier-2/3 devices are
    first-class citizens of the protocol even while only Frame scenarios gate releases.
 

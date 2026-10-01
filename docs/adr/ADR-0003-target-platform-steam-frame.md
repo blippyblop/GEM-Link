@@ -33,7 +33,7 @@ reprojection failure mode (PC-side synthesis bakes stale poses → wobble).
 4. **Client strategy:** build the Frame client as an OpenXR application against the
    Frame's bundled SteamVR runtime (aarch64); port `client_core` (wgpu→turnip,
    MediaCodec→V4L2/iris decode). A Monado port stays the long-term escape hatch —
-   ideas/APIs yes, GPL code never merges (ADR-0001).
+   ideas/APIs yes, GPL code never merges (ADR-0001); consolidated by **ADR-0009**.
 5. **Name = GemLink, provisional.** Product identity (docs, README, charter) uses
    GemLink now; mechanical crate-prefix renames are deferred until the name is final
    (amendment to ADR-0002 below). The repo remote stays `GEM-Link`.

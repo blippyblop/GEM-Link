@@ -9,6 +9,11 @@ One device, tuned relentlessly: the **Steam Frame** —
 on Wi-Fi 7 6 GHz (Frame SoftAP + dongle, or LAN) or USB-C NCM wired,
 with **minimum measured glass-to-glass latency** as the score that outranks all others.
 
+**First shippable target:** **SteamVR compatibility** (ADR-0009) — a real
+SteamVR session on a Windows PC streams end-to-end through GemLink's driver,
+with the device side running on Valve's own SteamVR runtime. Desktop sources,
+extra devices and extra transports are additive and ship after it.
+
 ## Definition of done (project-level)
 
 1. **VR game streaming through SteamVR is the primary path** (upstream driver architecture, maintained — ADR-0005): a Steam Frame streams PC VR with GemLink as the streamer. Desktop streaming additionally works **without** SteamVR installed as the modular second source.
@@ -35,7 +40,7 @@ with **minimum measured glass-to-glass latency** as the score that outranks all 
 - [ ] Realtime priority + high-resolution timer discipline in the capture host
 - [x] Gaze pipeline: OpenXR eye-gaze (Frame) → predicted foveation centers → encoder per-frame centers
 - [x] **Gaze tier measured (2026-10-01, `bench gaze` — real driver math, CI-gated):** 90%-settle **66.7 ms** (2.2× the 30 ms gaze-filter τ — textbook), effective sweep-tracking lag **22 ms**, per-sample update cost **~2 µs** (≤100 µs gate). Regression test pins monotone step response (driver yaw-sign convention) and convergence to the analytic projection.
-- **Gate:** measured encode-path drop vs M0; encrypted bench scenario green; foveation tracks scripted gaze ≤ 1 frame behind → `v0.2.0`
+- **Gate:** measured encode-path drop vs M0; encrypted bench scenario green; foveation tracks scripted gaze ≤ 1 frame behind; **SteamVR path end-to-end (real session → driver → encoder → stream)** → `v0.2.0` = **first shippable target** (ADR-0009)
   - *Measured 2026-10-01:* encrypted scenario **green** (`bench secure`); gaze tracking lag **22 ms** (~2 frames @ 90 Hz — the upstream 30 ms filter's designed tradeoff; tuning is a hardware-session decision, not a code change).
 
 ### M2 — Desktop mode (second source plug-in; weeks 9–20)
@@ -45,8 +50,8 @@ with **minimum measured glass-to-glass latency** as the score that outranks all 
 - **Gate:** desktop session streamed **without SteamVR installed** (the modular second source; the SteamVR path remains primary) → `v0.3.0`
 
 ### M3 — Client & runtime (weeks 15–32) 🚧 long pole
-- [ ] Frame client: OpenXR app on the Frame's bundled SteamVR runtime (aarch64); `client_core` port (wgpu/turnip, V4L2-iris decode path)
-- [ ] ADR: Monado-adopt vs stay-on-Valve-runtime (OpenXR-CTS counter in CI either way); no GPL code merge
+- [ ] Frame client: OpenXR app on the bundled SteamVR runtime (aarch64); `client_core` port (wgpu/turnip, V4L2-iris decode path)
+- [x] **Runtime decided: stay on Valve's SteamVR runtime** (ADR-0009) — the client is an OpenXR application on the bundled runtime; adopting a second runtime is out of scope. No GPL code merge (charter rule).
 - [ ] Client-side extrapolation (synthesis-once rule): depth/motion-vector assisted, using Phase-1 sidecar
 - **Gate:** GemLink server → Frame client end-to-end (SteamVR driver as the PC source); CTS count published → `v0.4.0`
 

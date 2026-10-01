@@ -22,7 +22,9 @@ never compromises to the primary path.
    transform → codec → transport pipeline. They are additive, never a
    replacement for the SteamVR path.
 3. **"Own OpenXR runtime" ambitions are shelved.** Revisit only if SteamVR
-   concretely blocks a measured goal.
+   concretely blocks a measured goal. Extended by **ADR-0009** to the client
+   side: the device client is an OpenXR application on the bundled SteamVR
+   runtime, and SteamVR compatibility is the first shippable target.
 4. **The encoder seam serves all sources identically.** SteamVR textures go
    through the same zero-copy registration path (x-nvenc) and the same
    delivery gates as desktop frames.
