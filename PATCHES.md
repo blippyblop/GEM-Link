@@ -1,10 +1,17 @@
-# PATCHES — deviations in shared upstream crates
+# PATCHES — provenance record for shared crates
 
-One line per deviation to shared ALVR crates (`sockets`, `packets`, `session`,
-`graphics`, `server_core`, `client_*`, `dashboard`, `common`, `events`,
+One line per deviation to the inherited ALVR crates (`sockets`, `packets`,
+`session`, `graphics`, `server_core`, `client_*`, `dashboard`, `common`, `events`,
 `filesystem`, `server_io`, `system_info`, `adb`, `audio`, `launcher`,
-`vulkan_layer`, `vrcompositor_wrapper`, `xtask`). This file IS the rebase
-budget: keep it short. Roadmap work belongs in `x-*` crates, not here.
+`vulkan_layer`, `vrcompositor_wrapper`, `xtask`).
+
+**This is no longer a rebase budget.** Upstream is abandoned
+([ADR-0012](docs/adr/ADR-0012-upstream-alvr-is-abandoned.md)): there is nothing to
+rebase onto and no structural symmetry left to protect, so the file's job changed
+from "keep this small" to **"be able to tell our code from inherited code when
+debugging"**. Entries are recorded as they are found, not rationed. New work still
+belongs in an `x-*` crate, for the ordinary reason that a standalone crate is
+easier to reason about — not to protect a merge that is not coming.
 
 | # | Crate | Deviation | Reason | ADR/issue |
 |---|-------|-----------|--------|-----------|
@@ -13,9 +20,9 @@ budget: keep it short. Roadmap work belongs in `x-*` crates, not here.
 
 ## Known-unlisted deviations (audit needed)
 
-This table claimed "none yet" until 2026-10-02. That was wrong, and a rebase budget
-that under-reports is worse than no budget, so they are recorded here rather than
-silently omitted. Both predate this row:
+This table claimed "none yet" until 2026-10-02. That was wrong, and a record that
+under-reports is worse than no record, so they are noted here rather than silently
+omitted. Both predate the rows above:
 
 - **`packets`, `server_core`, `client_core`, `x-pcsim`, `x-framesim`** — the monotonic
   `frame_index` carried from `VideoPacketHeader` through `send_video_nal` and checked for
@@ -27,5 +34,9 @@ silently omitted. Both predate this row:
   and the restart-hash discriminator. The first-class device is the reason the fork exists
   ([ADR-0003](docs/adr/ADR-0003-target-platform-steam-frame.md)).
 
-Neither has been re-verified against upstream since it landed; the next rebase should turn
-these into numbered rows with their true surface area.
+Neither has been re-verified against upstream since it landed. With upstream
+abandoned ([ADR-0012](docs/adr/ADR-0012-upstream-alvr-is-abandoned.md)) there is no
+longer any value in *re-verifying* them — the value is in them being listed, so that
+when something in `packets`/`server_core`/`session` misbehaves we know whether we are
+reading inherited code or ours. The audit TODO is therefore about **completeness**,
+not about reducing surface.
