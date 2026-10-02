@@ -343,7 +343,8 @@ void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
                     pTexture[i][eye],
                     m_targetTimestampNs,
                     static_cast<int>(i),
-                    eye
+                    eye,
+                    "src"
                 );
             }
         }

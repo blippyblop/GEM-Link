@@ -42,6 +42,9 @@ inline int bytes_per_pixel(DXGI_FORMAT f) {
     case DXGI_FORMAT_R10G10B10A2_TYPELESS:
     case DXGI_FORMAT_R10G10B10A2_UNORM:
         return 4;
+    case DXGI_FORMAT_NV12:
+    case DXGI_FORMAT_NV11:
+        return 1; // luma plane only; the chroma plane is interleaved below it
     default:
         return 4; // 8-bit RGBA/BGRA family, which is what SteamVR apps use
     }
@@ -80,7 +83,8 @@ public:
         ID3D11Texture2D *texture,
         uint64_t frameIndex,
         int layer,
-        int eye
+        int eye,
+        const char *stage
     ) {
         if (!m_enabled || !texture || !device || !context)
             return;
@@ -116,7 +120,7 @@ public:
             m_format = format;
             std::fprintf(
                 m_file,
-                "frameIndex,layer,eye,w,h,srcW,srcH,format,bpp,mean,std,min,max\n"
+                "stage,frameIndex,layer,eye,w,h,texW,texH,format,bpp,mean,std,min,max\n"
             );
         }
 
@@ -141,9 +145,12 @@ public:
         uint64_t n = 0;
         uint8_t lo = 255;
         uint8_t hi = 0;
+        // Never read past the row pitch: NV12 and small textures have less than
+        // width*bpp of usable bytes per row.
+        const UINT rowBytes = std::min<UINT>(w * static_cast<UINT>(bpp), mapped.RowPitch);
         for (UINT y = 0; y < h; ++y) {
             const uint8_t *row = base + static_cast<size_t>(y) * mapped.RowPitch;
-            for (UINT x = 0; x < w * static_cast<UINT>(bpp); ++x) {
+            for (UINT x = 0; x < rowBytes; ++x) {
                 const uint8_t v = row[x];
                 sum += v;
                 sumSq += static_cast<uint64_t>(v) * v;
@@ -162,7 +169,8 @@ public:
 
         std::fprintf(
             m_file,
-            "%llu,%d,%d,%u,%u,%u,%u,%d,%d,%.3f,%.3f,%u,%u\n",
+            "%s,%llu,%d,%d,%u,%u,%u,%u,%d,%d,%.3f,%.3f,%u,%u\n",
+            stage,
             static_cast<unsigned long long>(frameIndex),
             layer,
             eye,

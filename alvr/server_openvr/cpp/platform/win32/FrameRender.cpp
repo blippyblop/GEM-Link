@@ -1,4 +1,6 @@
 #include "FrameRender.h"
+
+#include "GreyProbe.h"
 #include "alvr_server/Logger.h"
 #include "alvr_server/Utils.h"
 #include "alvr_server/bindings.h"
@@ -552,6 +554,24 @@ void FrameRender::SetViewParams(
     m_eyeToHead[1] = eyeToHeadRight;
 }
 
+
+// --- grey-frame bisection (measurement only, see VD_RE/50-grey-frame-experiments.md)
+//
+// The chain is: compositor's texture -> composition draw -> [colour correction]
+// -> FFR -> [YUV] -> m_pStagingTexture -> NVENC. Sampling each hand-off says
+// which pass turns a structured frame into a flat one. Gated on
+// GEMLINK_GREYPROBE; free when unset.
+static void GreyProbeStage(
+    std::shared_ptr<CD3DRender> &d3d,
+    ID3D11Texture2D *tex,
+    uint64_t frameIndex,
+    const char *stage
+) {
+    greyprobe::Probe::Instance().Sample(
+        d3d->GetDevice(), d3d->GetContext(), tex, frameIndex, 0, 0, stage
+    );
+}
+
 bool FrameRender::RenderFrame(
     ID3D11Texture2D* pTexture[][2],
     vr::VRTextureBounds_t bounds[][2],
@@ -865,6 +885,15 @@ bool FrameRender::RenderFrame(
     m_pD3DRender->GetContext()->RSSetViewports(1, &m_viewport);
     m_pD3DRender->GetContext()->RSSetScissorRects(1, &m_scissor);
 
+    if (greyprobe::Probe::Instance().Enabled()) {
+        ComPtr<ID3D11Resource> rtResource;
+        m_pRenderTargetView->GetResource(rtResource.GetAddressOf());
+        ComPtr<ID3D11Texture2D> rtTexture;
+        if (rtResource && SUCCEEDED(rtResource.As(&rtTexture))) {
+            GreyProbeStage(m_pD3DRender, rtTexture.Get(), targetTimestampNs, "comp");
+        }
+    }
+
     if (enableColorCorrection) {
         m_colorCorrectionPipeline->Render();
     }
@@ -875,6 +904,10 @@ bool FrameRender::RenderFrame(
 
     if (Settings_Instance()->m_enableHdr) {
         m_yuvPipeline->Render();
+    }
+
+    if (greyprobe::Probe::Instance().Enabled()) {
+        GreyProbeStage(m_pD3DRender, m_pStagingTexture.Get(), targetTimestampNs, "final");
     }
 
     m_pD3DRender->GetContext()->Flush();
