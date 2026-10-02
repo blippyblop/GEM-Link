@@ -11,9 +11,9 @@ mod tracking;
 mod web_server;
 
 pub use c_api::*;
-pub use x_foveation::{align_foveation_center_shift, EyeTrackedFoveation};
 pub use logging_backend::init_logging;
 pub use tracking::HandType;
+pub use x_foveation::{EyeTrackedFoveation, align_foveation_center_shift};
 
 use crate::connection::VideoPacket;
 use alvr_common::{

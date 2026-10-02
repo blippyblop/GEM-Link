@@ -90,6 +90,7 @@ pub fn compute_restart_settings_hash(
             ControllersEmulationMode::QuestPro => 4,
             ControllersEmulationMode::Pico4 => 10,
             ControllersEmulationMode::ValveIndex => 20,
+            ControllersEmulationMode::SteamFrame => 70,
             ControllersEmulationMode::ViveWand => 40,
             ControllersEmulationMode::ViveTracker => 41,
             ControllersEmulationMode::PSVR2Sense => 60,

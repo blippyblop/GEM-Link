@@ -18,6 +18,13 @@ macro_rules! interaction_profile {
 interaction_profile!(QUEST, "oculus/touch");
 interaction_profile!(VIVE, "htc/vive");
 interaction_profile!(INDEX, "valve/index");
+// The Steam Frame controller. Valve ships this profile (and its render models and
+// default per-game bindings) as the resource-only SteamVR driver
+// `frame_controller`, which is present on the PC as well as in the headset
+// firmware — verified byte-identical. So there is nothing proprietary to vendor:
+// we only have to declare ourselves as this controller type and point at the
+// driver's own profile.
+interaction_profile!(FRAME, "valve/frame_controller");
 interaction_profile!(PICO_NEO3, "bytedance/pico_neo3");
 interaction_profile!(PICO4, "bytedance/pico4");
 interaction_profile!(PICO4S, "bytedance/pico4s");
@@ -150,6 +157,22 @@ controller_inputs! {
     (TRACKPAD_FORCE, "trackpad/force", Scalar),
     (TRACKPAD_TOUCH, "trackpad/touch", Binary),
     (THUMBREST_TOUCH, "thumbrest/touch", Binary),
+    // Steam Frame controller additions. These four exist on no other consumer
+    // controller ALVR emulates, so they are additive; `grip` is deliberately
+    // absent because ALVR's existing `squeeze/*` already binds to SteamVR's
+    // `/input/grip/*` (see the C++ Paths table).
+    (VIEW_CLICK, "view/click", Binary),
+    (VIEW_TOUCH, "view/touch", Binary),
+    (BUMPER_CLICK, "bumper/click", Binary),
+    (BUMPER_TOUCH, "bumper/touch", Binary),
+    (DPAD_UP_CLICK, "dpad_up/click", Binary),
+    (DPAD_UP_TOUCH, "dpad_up/touch", Binary),
+    (DPAD_DOWN_CLICK, "dpad_down/click", Binary),
+    (DPAD_DOWN_TOUCH, "dpad_down/touch", Binary),
+    (DPAD_LEFT_CLICK, "dpad_left/click", Binary),
+    (DPAD_LEFT_TOUCH, "dpad_left/touch", Binary),
+    (DPAD_RIGHT_CLICK, "dpad_right/click", Binary),
+    (DPAD_RIGHT_TOUCH, "dpad_right/touch", Binary),
 }
 
 pub struct InteractionProfileInfo {
@@ -539,6 +562,81 @@ pub static CONTROLLER_PROFILE_INFO: LazyLock<HashMap<u64, InteractionProfileInfo
                         *RIGHT_THUMBSTICK_CLICK_ID,
                         *RIGHT_THUMBSTICK_TOUCH_ID,
                         *RIGHT_THUMBREST_TOUCH_ID, // might not actually be present?
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            ),
+            (
+                *FRAME_CONTROLLER_PROFILE_ID,
+                InteractionProfileInfo {
+                    path: FRAME_CONTROLLER_PROFILE_PATH,
+                    // Transcribed from Valve's own input profile for the Frame
+                    // controller (firmware:
+                    // /opt/steamvr/drivers/frame_controller/resources/input/
+                    // frame_controller_profile.json, byte-identical to the copy
+                    // desktop SteamVR ships). The one thing worth knowing: the
+                    // two hands are NOT symmetric. The right controller carries
+                    // A/B/X/Y and Menu; the left carries a four-way d-pad and
+                    // View. Valve describes them as mirrors of each other in the
+                    // profile's `mirror_mappings`, so a game binding to A/B/X/Y
+                    // is satisfied by the left d-pad — but the two devices must
+                    // be *registered* with different button sets, which ALVR's
+                    // ButtonInfo already expresses through its per-button
+                    // device_id.
+                    button_set: [
+                        // Left hand
+                        *LEFT_SYSTEM_CLICK_ID,
+                        *LEFT_SYSTEM_TOUCH_ID,
+                        *LEFT_VIEW_CLICK_ID,
+                        *LEFT_VIEW_TOUCH_ID,
+                        *LEFT_DPAD_UP_CLICK_ID,
+                        *LEFT_DPAD_UP_TOUCH_ID,
+                        *LEFT_DPAD_DOWN_CLICK_ID,
+                        *LEFT_DPAD_DOWN_TOUCH_ID,
+                        *LEFT_DPAD_LEFT_CLICK_ID,
+                        *LEFT_DPAD_LEFT_TOUCH_ID,
+                        *LEFT_DPAD_RIGHT_CLICK_ID,
+                        *LEFT_DPAD_RIGHT_TOUCH_ID,
+                        *LEFT_BUMPER_CLICK_ID,
+                        *LEFT_BUMPER_TOUCH_ID,
+                        *LEFT_TRIGGER_CLICK_ID,
+                        *LEFT_TRIGGER_TOUCH_ID,
+                        *LEFT_TRIGGER_VALUE_ID,
+                        *LEFT_SQUEEZE_CLICK_ID,
+                        *LEFT_SQUEEZE_TOUCH_ID,
+                        *LEFT_SQUEEZE_VALUE_ID,
+                        *LEFT_THUMBSTICK_X_ID,
+                        *LEFT_THUMBSTICK_Y_ID,
+                        *LEFT_THUMBSTICK_CLICK_ID,
+                        *LEFT_THUMBSTICK_TOUCH_ID,
+                        *LEFT_THUMBREST_TOUCH_ID,
+                        // Right hand
+                        *RIGHT_SYSTEM_CLICK_ID,
+                        *RIGHT_SYSTEM_TOUCH_ID,
+                        *RIGHT_MENU_CLICK_ID,
+                        *RIGHT_MENU_TOUCH_ID,
+                        *RIGHT_A_CLICK_ID,
+                        *RIGHT_A_TOUCH_ID,
+                        *RIGHT_B_CLICK_ID,
+                        *RIGHT_B_TOUCH_ID,
+                        *RIGHT_X_CLICK_ID,
+                        *RIGHT_X_TOUCH_ID,
+                        *RIGHT_Y_CLICK_ID,
+                        *RIGHT_Y_TOUCH_ID,
+                        *RIGHT_BUMPER_CLICK_ID,
+                        *RIGHT_BUMPER_TOUCH_ID,
+                        *RIGHT_TRIGGER_CLICK_ID,
+                        *RIGHT_TRIGGER_TOUCH_ID,
+                        *RIGHT_TRIGGER_VALUE_ID,
+                        *RIGHT_SQUEEZE_CLICK_ID,
+                        *RIGHT_SQUEEZE_TOUCH_ID,
+                        *RIGHT_SQUEEZE_VALUE_ID,
+                        *RIGHT_THUMBSTICK_X_ID,
+                        *RIGHT_THUMBSTICK_Y_ID,
+                        *RIGHT_THUMBSTICK_CLICK_ID,
+                        *RIGHT_THUMBSTICK_TOUCH_ID,
+                        *RIGHT_THUMBREST_TOUCH_ID,
                     ]
                     .into_iter()
                     .collect(),

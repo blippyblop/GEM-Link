@@ -34,6 +34,11 @@ pub fn registered_button_set(
             .unwrap()
             .button_set
             .clone(),
+        ControllersEmulationMode::SteamFrame => CONTROLLER_PROFILE_INFO
+            .get(&FRAME_CONTROLLER_PROFILE_ID)
+            .unwrap()
+            .button_set
+            .clone(),
         ControllersEmulationMode::ViveWand => CONTROLLER_PROFILE_INFO
             .get(&VIVE_CONTROLLER_PROFILE_ID)
             .unwrap()

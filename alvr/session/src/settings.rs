@@ -916,9 +916,7 @@ pub enum FaceTrackingSocialPresenceSinkConfig {
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct FaceTrackingSinkConfig {
-    #[schema(strings(
-        help = "Forward eye and face tracking to another application"
-    ))]
+    #[schema(strings(help = "Forward eye and face tracking to another application"))]
     pub social_presence: Switch<FaceTrackingSocialPresenceSinkConfig>,
     #[schema(strings(
         display_name = "Eye-tracked foveated encoding",
@@ -1025,6 +1023,8 @@ pub enum ControllersEmulationMode {
     PSVR2Sense,
     #[schema(strings(display_name = "Valve Index"))]
     ValveIndex,
+    #[schema(strings(display_name = "Steam Frame Controller"))]
+    SteamFrame,
     #[schema(strings(display_name = "Vive Wand"))]
     ViveWand,
     #[schema(strings(display_name = "Vive Tracker"))]

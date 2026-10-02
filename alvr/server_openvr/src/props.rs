@@ -514,6 +514,41 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                         "{indexcontroller}/input/index_controller_profile.json",
                     );
                 }
+                ControllersEmulationMode::SteamFrame => {
+                    // The Frame controller is a real SteamVR controller type, not
+                    // something we invented: Valve ships the resource-only driver
+                    // `frame_controller` (input profile, render models, icons, and
+                    // default per-game bindings for HL:A / Beat Saber / In Death /
+                    // Arizona Sunshine) inside desktop SteamVR as well as in the
+                    // headset firmware. Declaring the type and pointing at that
+                    // driver's own profile is therefore the whole emulation — we
+                    // vendor no Valve assets, and SteamVR resolves the render
+                    // model and default bindings itself.
+                    set_prop(TrackingSystemNameString, "frame_controller");
+                    set_prop(ManufacturerNameString, "Valve");
+                    if left_hand {
+                        set_prop(ModelNumberString, "Steam Frame Controller (Left)");
+                        set_prop(
+                            RenderModelNameString,
+                            "{frame_controller}rendermodels/frame_controller_left",
+                        );
+                        set_prop(RegisteredDeviceTypeString, "valve/frame_controller_Left");
+                        set_icons("{frame_controller}/icons/left_frame_controller");
+                    } else if right_hand {
+                        set_prop(ModelNumberString, "Steam Frame Controller (Right)");
+                        set_prop(
+                            RenderModelNameString,
+                            "{frame_controller}rendermodels/frame_controller_right",
+                        );
+                        set_prop(RegisteredDeviceTypeString, "valve/frame_controller_Right");
+                        set_icons("{frame_controller}/icons/right_frame_controller");
+                    }
+                    set_prop(ControllerTypeString, "frame_controller");
+                    set_prop(
+                        InputProfilePathString,
+                        "{frame_controller}/input/frame_controller_profile.json",
+                    );
+                }
                 ControllersEmulationMode::ViveWand => {
                     set_prop(TrackingSystemNameString, "htc");
                     set_prop(ManufacturerNameString, "HTC");

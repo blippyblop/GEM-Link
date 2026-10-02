@@ -23,13 +23,13 @@ use alvr_common::{
 };
 use alvr_filesystem as afs;
 use alvr_packets::{ButtonValue, Haptics};
+use alvr_server_core::EyeTrackedFoveation;
 use alvr_server_core::{
     HandType, ServerCoreContext, ServerCoreEvent, ServerNegotiatedStreamingConfig,
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersConfig, ControllersEmulationMode,
 };
-use alvr_server_core::EyeTrackedFoveation;
 use std::{
     collections::VecDeque,
     ffi::{CString, OsStr, c_char, c_void},

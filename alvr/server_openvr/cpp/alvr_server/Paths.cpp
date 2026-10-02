@@ -192,6 +192,51 @@ void init_paths() {
                                             ),
                                             { { "/input/thumbrest/touch" }, ButtonType::Binary } });
 
+    // Steam Frame controller, left hand: the left device has View and a four-way
+    // d-pad where the right has Menu and A/B/X/Y. Valve's own profile lists both
+    // sets on both hands' logical space (they are `mirror_mappings` of each
+    // other), so a game binding to A/B/X/Y is served by the left d-pad.
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert({ PathStringToHash("/user/hand/left/input/view/click"),
+                                            { { "/input/view/click" }, ButtonType::Binary } });
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert({ PathStringToHash("/user/hand/left/input/view/touch"),
+                                            { { "/input/view/touch" }, ButtonType::Binary } });
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert({ PathStringToHash("/user/hand/left/input/bumper/click"),
+                                            { { "/input/bumper/click" }, ButtonType::Binary } });
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert({ PathStringToHash("/user/hand/left/input/bumper/touch"),
+                                            { { "/input/bumper/touch" }, ButtonType::Binary } });
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert(
+        { PathStringToHash("/user/hand/left/input/dpad_up/click"),
+          { { "/input/dpad_up/click" }, ButtonType::Binary } }
+    );
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert(
+        { PathStringToHash("/user/hand/left/input/dpad_up/touch"),
+          { { "/input/dpad_up/touch" }, ButtonType::Binary } }
+    );
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert(
+        { PathStringToHash("/user/hand/left/input/dpad_down/click"),
+          { { "/input/dpad_down/click" }, ButtonType::Binary } }
+    );
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert(
+        { PathStringToHash("/user/hand/left/input/dpad_down/touch"),
+          { { "/input/dpad_down/touch" }, ButtonType::Binary } }
+    );
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert(
+        { PathStringToHash("/user/hand/left/input/dpad_left/click"),
+          { { "/input/dpad_left/click" }, ButtonType::Binary } }
+    );
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert(
+        { PathStringToHash("/user/hand/left/input/dpad_left/touch"),
+          { { "/input/dpad_left/touch" }, ButtonType::Binary } }
+    );
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert(
+        { PathStringToHash("/user/hand/left/input/dpad_right/click"),
+          { { "/input/dpad_right/click" }, ButtonType::Binary } }
+    );
+    LEFT_CONTROLLER_BUTTON_MAPPING.insert(
+        { PathStringToHash("/user/hand/left/input/dpad_right/touch"),
+          { { "/input/dpad_right/touch" }, ButtonType::Binary } }
+    );
+
     RIGHT_CONTROLLER_BUTTON_MAPPING.insert(
         { PathStringToHash("/user/hand/right/input/system/click"),
           { { "/input/system/click", "/input/right_ps/click" }, ButtonType::Binary } }
@@ -301,6 +346,13 @@ void init_paths() {
         { PathStringToHash("/user/hand/right/input/thumbrest/touch"),
           { { "/input/thumbrest/touch" }, ButtonType::Binary } }
     );
+
+    // Steam Frame controller, right hand: Bumper (the right device has no d-pad
+    // or View; its extra buttons are Menu and A/B/X/Y, which ALVR already maps).
+    RIGHT_CONTROLLER_BUTTON_MAPPING.insert({ PathStringToHash("/user/hand/right/input/bumper/click"),
+                                             { { "/input/bumper/click" }, ButtonType::Binary } });
+    RIGHT_CONTROLLER_BUTTON_MAPPING.insert({ PathStringToHash("/user/hand/right/input/bumper/touch"),
+                                             { { "/input/bumper/touch" }, ButtonType::Binary } });
 
     for (auto hand : { LEFT_CONTROLLER_BUTTON_MAPPING, RIGHT_CONTROLLER_BUTTON_MAPPING }) {
         for (auto info : hand) {

@@ -43,10 +43,13 @@ mod png;
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
-    CONTROLLER_PROFILE_INFO, DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID,
-    LEFT_THUMBSTICK_CLICK_ID, LEFT_THUMBSTICK_X_ID, LEFT_THUMBSTICK_Y_ID, LEFT_TRIGGER_VALUE_ID,
-    Pose, QUEST_CONTROLLER_PROFILE_ID, RIGHT_A_CLICK_ID, RIGHT_THUMBSTICK_X_ID,
-    RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID, ViewParams,
+    CONTROLLER_PROFILE_INFO, DeviceMotion, FRAME_CONTROLLER_PROFILE_ID, HAND_LEFT_ID,
+    HAND_RIGHT_ID, HEAD_ID, LEFT_BUMPER_CLICK_ID, LEFT_DPAD_DOWN_CLICK_ID, LEFT_DPAD_LEFT_CLICK_ID,
+    LEFT_DPAD_RIGHT_CLICK_ID, LEFT_DPAD_UP_CLICK_ID, LEFT_SQUEEZE_VALUE_ID, LEFT_THUMBSTICK_X_ID,
+    LEFT_THUMBSTICK_Y_ID, LEFT_TRIGGER_VALUE_ID, LEFT_VIEW_CLICK_ID, Pose, RIGHT_A_CLICK_ID,
+    RIGHT_B_CLICK_ID, RIGHT_BUMPER_CLICK_ID, RIGHT_MENU_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID,
+    RIGHT_THUMBSTICK_X_ID, RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID, RIGHT_X_CLICK_ID,
+    RIGHT_Y_CLICK_ID, ViewParams,
     glam::{Quat, UVec2, Vec3},
 };
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
@@ -482,9 +485,10 @@ fn controllers_enabled() -> bool {
 /// A deterministic, always-moving input pattern so the button path is exercised
 /// and is obviously the harness rather than a stuck controller.
 ///
-/// Both triggers sweep 0..1 on different periods, both thumbsticks describe a
-/// circle (so a game reading them sees smooth analog motion), and A / stick-click
-/// toggle as edges.
+/// Split by hand, because the Frame controller's two halves are not
+/// interchangeable: the left has a d-pad, View and Bumper, the right has
+/// A/B/X/Y, Menu and Bumper. Both triggers, both grips and both thumbsticks
+/// sweep on different periods; the buttons toggle as edges.
 fn controller_buttons(t: f32) -> Vec<ButtonEntry> {
     let scalar = |path_id: u64, value: f32| ButtonEntry {
         path_id,
@@ -494,26 +498,58 @@ fn controller_buttons(t: f32) -> Vec<ButtonEntry> {
         path_id,
         value: ButtonValue::Binary(value),
     };
+    // A rotating one-hot over the hand's four face/d-pad directions.
+    let rotate = |period: f32| ((t / period) as i32).rem_euclid(4);
 
-    vec![
+    let left_dpad = [
+        *LEFT_DPAD_UP_CLICK_ID,
+        *LEFT_DPAD_RIGHT_CLICK_ID,
+        *LEFT_DPAD_DOWN_CLICK_ID,
+        *LEFT_DPAD_LEFT_CLICK_ID,
+    ];
+    let right_face = [
+        *RIGHT_A_CLICK_ID,
+        *RIGHT_B_CLICK_ID,
+        *RIGHT_X_CLICK_ID,
+        *RIGHT_Y_CLICK_ID,
+    ];
+
+    let mut entries = vec![
+        // Both hands: trigger, grip and thumbstick, on distinct periods.
         scalar(*LEFT_TRIGGER_VALUE_ID, 0.5 + 0.5 * (t * 0.8).sin()),
         scalar(*RIGHT_TRIGGER_VALUE_ID, 0.5 + 0.5 * (t * 1.3).cos()),
+        scalar(*LEFT_SQUEEZE_VALUE_ID, 0.5 + 0.5 * (t * 0.6).cos()),
+        scalar(*RIGHT_SQUEEZE_VALUE_ID, 0.5 + 0.5 * (t * 1.1).sin()),
         scalar(*LEFT_THUMBSTICK_X_ID, (t * 0.5).sin()),
         scalar(*LEFT_THUMBSTICK_Y_ID, (t * 0.5).cos()),
         scalar(*RIGHT_THUMBSTICK_X_ID, (t * 0.4).cos()),
         scalar(*RIGHT_THUMBSTICK_Y_ID, (t * 0.4).sin()),
-        binary(*RIGHT_A_CLICK_ID, (t * 0.5).sin() > 0.0),
-        binary(*LEFT_THUMBSTICK_CLICK_ID, (t * 1.7).sin() > 0.0),
-    ]
+        // Bumper exists on both.
+        binary(*LEFT_BUMPER_CLICK_ID, (t * 1.9).sin() > 0.0),
+        binary(*RIGHT_BUMPER_CLICK_ID, (t * 2.3).sin() > 0.0),
+        // Left-only: View and the d-pad.
+        binary(*LEFT_VIEW_CLICK_ID, (t * 0.9).sin() > 0.7),
+    ];
+    for (i, id) in left_dpad.into_iter().enumerate() {
+        entries.push(binary(id, rotate(1.3) == i as i32));
+    }
+    // Right-only: Menu and A/B/X/Y.
+    entries.push(binary(*RIGHT_MENU_CLICK_ID, (t * 1.1).sin() > 0.7));
+    for (i, id) in right_face.into_iter().enumerate() {
+        entries.push(binary(id, rotate(0.9) == i as i32));
+    }
+
+    entries
 }
 
 /// The client's *active* input set, advertised so the streamer can build its
-/// button mapping table. The server's default emulation mode is Quest 2 Touch
-/// (`session.json`), so advertising the Quest profile makes the mapping a
-/// passthrough instead of a re-map. Returns `None` if the profile is unknown.
-fn quest_button_set() -> Option<HashSet<u64>> {
+/// button mapping table. For the Steam Frame this is the Frame controller's own
+/// profile, so a Frame-emulating server maps every input one-to-one instead of
+/// translating between two different controllers. Returns `None` if the profile
+/// is unknown.
+fn frame_button_set() -> Option<HashSet<u64>> {
     CONTROLLER_PROFILE_INFO
-        .get(&QUEST_CONTROLLER_PROFILE_ID)
+        .get(&FRAME_CONTROLLER_PROFILE_ID)
         .map(|info| info.button_set.clone())
 }
 
@@ -595,7 +631,7 @@ fn main() {
     println!(
         "[framesim] controllers: {}",
         if controllers_enabled() {
-            "on (Quest profile, synthetic hands + moving buttons)"
+            "on (Steam Frame profile, synthetic hands + moving buttons)"
         } else {
             "OFF (FRAMESIM_CONTROLLERS=0)"
         }
@@ -714,22 +750,22 @@ fn main() {
                     // there is a control socket to carry it, which is why it is
                     // sent here and not alongside the tracking thread's start.
                     if controllers_enabled() {
-                        match quest_button_set() {
+                        match frame_button_set() {
                             Some(input_ids) => {
                                 for device_id in [*HAND_LEFT_ID, *HAND_RIGHT_ID] {
                                     ctx.send_active_interaction_profile(
                                         device_id,
-                                        *QUEST_CONTROLLER_PROFILE_ID,
+                                        *FRAME_CONTROLLER_PROFILE_ID,
                                         input_ids.clone(),
                                     );
                                 }
                                 println!(
-                                    "[framesim] controllers: Quest profile advertised ({} inputs) for both hands",
+                                    "[framesim] controllers: Steam Frame profile advertised ({} inputs) for both hands",
                                     input_ids.len()
                                 );
                             }
                             None => eprintln!(
-                                "[framesim] controllers: Quest profile missing from CONTROLLER_PROFILE_INFO"
+                                "[framesim] controllers: Steam Frame profile missing from CONTROLLER_PROFILE_INFO"
                             ),
                         }
                     }
