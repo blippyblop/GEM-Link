@@ -438,10 +438,31 @@ fn main() {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![60.0, 72.0, 80.0, 90.0, 120.0]);
 
+    // The client owns its render resolution — that is the design (ADR per the
+    // north star: the device decides and the streamer obeys). So when the
+    // emulator needs a cheaper stream it advertises a smaller view rather than
+    // reaching over and editing the streamer's transcoding setting. The server
+    // clamps its own choice to this maximum, so this is the honest lever.
+    // "512" or "512x480"; default is the Steam Frame's panel.
+    let view_resolution = std::env::var("FRAMESIM_VIEW_RESOLUTION")
+        .ok()
+        .and_then(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            let (w, h) = match s.split_once('x') {
+                Some((w, h)) => (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?),
+                None => {
+                    let n = s.parse::<u32>().ok()?;
+                    (n, n)
+                }
+            };
+            Some(UVec2::new(w, h))
+        })
+        .unwrap_or_else(|| UVec2::new(2160, 2160));
+
     let capabilities = ClientCapabilities {
         platform: alvr_system_info::platform(None, None),
-        default_view_resolution: UVec2::new(2160, 2160),
-        max_view_resolution: UVec2::new(2160, 2160),
+        default_view_resolution: view_resolution,
+        max_view_resolution: view_resolution,
         refresh_rates: refresh_rates.clone(),
         foveated_encoding: true,
         encoder_high_profile: true,
@@ -461,7 +482,7 @@ fn main() {
         capabilities.encoder_av1,
         capabilities.encoder_10_bits,
     );
-    println!("[framesim] advertising refresh rates {refresh_rates:?}");
+    println!("[framesim] advertising refresh rates {refresh_rates:?} at view {view_resolution}");
 
     let ctx = Arc::new(ClientCoreContext::new(capabilities, vec![]));
 
