@@ -46,3 +46,7 @@ longer any value in *re-verifying* them — the value is in them being listed, s
 when something in `packets`/`server_core`/`session` misbehaves we know whether we are
 reading inherited code or ours. The audit TODO is therefore about **completeness**,
 not about reducing surface.
+
+| 9 | `server_core` | `send_video_nal` replaces the `STREAM_CORRUPTED` static and the `avoid_video_glitching` bypass with `x_transport::SendGate`; the mirror and rolling-file recording stay inside the gate | ADR-0011's send half. The old code discarded a frame and kept transmitting the P-frames that followed, which cannot be reconstructed. | [ADR-0011](docs/adr/ADR-0011-never-show-an-untrusted-frame.md) |
+| 10 | `client_core` | the video receive loop replaces `stream_corrupted` + its own gap arithmetic with `x_transport::TrustGate`; the gap now arms the gate, an untrusted frame is never submitted, and a keyframe is requested once per recovery instead of per frame | The display half. The gate was armed on datagram loss only, which a server-side discard does not produce — so 41 % of displayed frames could be undecodable while every counter read zero. | as above |
+| 11 | `session` | `connection.avoid_video_glitching` default `false` → `true`, and its help text rewritten | It no longer gates the invariant (it cannot), so the old text and default were actively misleading. It now controls whether the client spends a keyframe request to shorten a hold. | as above |

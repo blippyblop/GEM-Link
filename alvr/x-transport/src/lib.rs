@@ -50,6 +50,7 @@ pub mod fec;
 pub mod pacer;
 pub mod packetizer;
 pub mod receiver;
+pub mod trust;
 pub mod wire;
 
 pub use crypto::{KEY_LEN, MediaCipher};
@@ -57,6 +58,7 @@ pub use fec::{FecError, decode_striped as fec_decode_striped, encode as fec_enco
 pub use pacer::{Pacer, PacerConfig};
 pub use packetizer::{FrameMeta, Packetizer};
 pub use receiver::{DeliveredFrame, FrameOutcome, Receiver, ReceiverStats, ReleasePolicy};
+pub use trust::{FrameTrust, SendDecision, SendGate, SuppressReason, TrustGate, UntrustedReason};
 pub use wire::{Flags, FragmentHeader, HEADER_LEN};
 
 /// The largest payload a single datagram may carry, given an MTU.

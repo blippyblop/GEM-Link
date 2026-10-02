@@ -131,3 +131,49 @@ ROADMAP M4 (`v0.5.0`) already gates "**zero dropped frames on the impairment
 profiles**". That is a *transport* gate and it is necessary but not sufficient: it
 holds only while the link behaves. This ADR adds the **display** gate, earlier and
 independently: drops may happen; a bogus frame may never be shown.
+
+## Implementation status (2026-10-02)
+
+**In force on both ends.** The invariant is implemented as `x_transport::{SendGate, TrustGate}` —
+two state machines with tests — and wired into the two call sites that matter:
+`server_core::send_video_nal` (send half) and `client_core`'s video receive loop (display half).
+
+What that replaced is worth recording, because it explains a whole session. **Both ends already
+had this mechanism**, as a single `stream_corrupted` boolean, and both were wrong in the same
+two ways:
+
+1. **The display gate was armed on the wrong signal.** It fired on *datagram* loss. A frame the
+   server discarded consumes no datagrams, so the transport's sequence stayed unbroken,
+   `had_packet_loss()` stayed false, and the undecodable P-frames that followed were submitted
+   to the decoder. The frame-index gap that *would* have detected it was computed — and then
+   thrown away into a `warn!`. That is the "wrong trigger" note in the handoff, and it was
+   three characters of missing code.
+2. **Both gates were bypassed by a setting, and the setting defaulted off.** `avoid_video_glitching`
+   gated the *invariant itself*, so the shipped configuration transmitted and displayed frames
+   that could not be reconstructed. A settings toggle that disables an invariant is not a
+   configuration, it is the defect.
+
+Three consequences, all deliberate:
+
+- **`avoid_video_glitching` no longer disables anything.** It now controls the one genuinely
+  optional part of the response: whether the client spends a reliable control packet and an
+  encoder keyframe asking to *shorten* the hold. It defaults on. Its help text was rewritten
+  because the old text described the invariant, which is no longer what it does.
+- **A keyframe request is made once per recovery, not once per frame.** The old client asked on
+  every untrusted frame — up to 90 reliable control packets a second, each answered by the
+  sender with a keyframe. That is a control-plane flood with a bitrate spike attached, and it
+  would have been reached constantly once the gap check started arming the gate.
+- **A keyframe that arrived with datagrams missing does not restore trust.** A keyframe with a
+  hole in it is not a keyframe.
+
+**Not yet done, and it is the half that matters at scale:** the *recovery* half. The send gate
+stops poisoning the stream; it does not stop the loss that caused it. Repairing the lost
+datagram rather than suppressing around it is the media plane
+([ADR-0013](ADR-0013-media-plane.md)), which is built and bench-gated and **not wired into this
+path**. Until it is, a loss costs a hold — bounded and honest, but a hold.
+
+**Verification.** The send-half state machine and the display-half state machine are unit-tested
+(13 tests, including the two-ends-agree timeline). Both call sites type-check and lint clean for
+`x86_64-pc-windows-gnu`. **Neither has been exercised on hardware** — `.36` is offline — so the
+first action when it returns is still a capture with `RUST_LOG=info` to see the gating, the hold
+counts and the keyframe requests in the log.

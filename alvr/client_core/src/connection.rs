@@ -305,15 +305,14 @@ fn connection_pipeline(
     let video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         move || {
-            let mut stream_corrupted = true;
-            // Last frame sequence seen. A gap here means the server discarded a
-            // frame (its queue was full) — a P-frame after it cannot be
-            // reconstructed, so the picture is not trustworthy even though every
-            // packet that did arrive was intact. The transport's own
-            // `packet_index` cannot see this: a dropped frame consumes no
-            // datagrams, so its sequence stays unbroken. See ADR-0011.
-            let mut last_frame_index: Option<u64> = None;
-            let mut missed_frames: u64 = 0;
+            // ADR-0011's display half. A frame the client cannot reconstruct is never
+            // submitted to the decoder: it keeps showing the last good frame, reprojected by
+            // the compositor. That is the permitted response; showing the grey is not.
+            //
+            // The rule lives in `x_transport::TrustGate` because it was previously two bare
+            // booleans in two places and both were wrong the same way — armed on *datagram*
+            // loss, which a server-side discarded frame does not produce. See the module docs.
+            let mut trust = x_transport::TrustGate::new();
             let mut frames_seen: u64 = 0;
             let mut first_report = true;
             while is_streaming(&ctx) {
@@ -330,17 +329,10 @@ fn connection_pipeline(
                     stats.report_video_packet_received(header.timestamp);
                 }
 
-                if let Some(last) = last_frame_index {
-                    if header.frame_index > last + 1 {
-                        let lost = header.frame_index - last - 1;
-                        missed_frames += lost;
-                        warn!(
-                            "Server dropped {lost} frame(s) before frame_index={}: {} total                              missed this session",
-                            header.frame_index, missed_frames
-                        );
-                    }
-                }
-                last_frame_index = Some(header.frame_index);
+                let had_datagram_loss = data.had_packet_loss();
+                let decision =
+                    trust.may_present(header.frame_index, header.is_idr, had_datagram_loss);
+
                 // Prove the sequence is actually advancing. Without this, a
                 // frame_index pinned at 0 is indistinguishable from a perfectly
                 // contiguous stream by the gap check alone.
@@ -350,56 +342,78 @@ fn connection_pipeline(
                         "video frame_index={} (frames seen {}, missed {})",
                         header.frame_index,
                         frames_seen,
-                        missed_frames
+                        trust.missed_frames()
                     );
                 }
                 frames_seen += 1;
 
-                if header.is_idr {
-                    stream_corrupted = false;
-                } else if data.had_packet_loss() {
-                    stream_corrupted = true;
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
-                    }
-                    warn!("Network dropped video packet");
-                }
+                match decision {
+                    x_transport::FrameTrust::Trusted => {
+                        // Metadata must be available before the decoder can return this frame.
+                        {
+                            let queue_mut = &mut *ctx.video_frame_metadata_queue.lock();
+                            queue_mut.push_back((
+                                header.timestamp,
+                                VideoFrameMetadata {
+                                    view_params: header.global_view_params,
+                                    foveation_center_shifts: header.foveation_center_shifts,
+                                },
+                            ));
 
-                if !stream_corrupted || !settings.connection.avoid_video_glitching {
-                    // Metadata must be available before the decoder can return this frame.
-                    {
-                        let queue_mut = &mut *ctx.video_frame_metadata_queue.lock();
-                        queue_mut.push_back((
-                            header.timestamp,
-                            VideoFrameMetadata {
-                                view_params: header.global_view_params,
-                                foveation_center_shifts: header.foveation_center_shifts,
-                            },
-                        ));
+                            while queue_mut.len() > VIDEO_FRAME_METADATA_HISTORY_SIZE {
+                                queue_mut.pop_front();
+                            }
+                        }
 
-                        while queue_mut.len() > VIDEO_FRAME_METADATA_HISTORY_SIZE {
-                            queue_mut.pop_front();
+                        let submitted = ctx
+                            .decoder_callback
+                            .lock()
+                            .as_mut()
+                            .is_some_and(|callback| callback(header.timestamp, nal));
+
+                        trust.on_decoder_result(submitted);
+                        if !submitted {
+                            // The decoder refused it, so we have no frame and the next one's
+                            // reference is broken. Same response as a lost frame: hold, and
+                            // optionally ask for a keyframe.
+                            if settings.connection.avoid_video_glitching
+                                && let Some(sender) = &mut *ctx.control_sender.lock()
+                            {
+                                sender.send(&ClientControlPacket::RequestIdr).ok();
+                            }
+                            warn!("Dropped video packet. Reason: Decoder saturation")
                         }
                     }
-
-                    let submitted = ctx
-                        .decoder_callback
-                        .lock()
-                        .as_mut()
-                        .is_some_and(|callback| callback(header.timestamp, nal));
-
-                    if !submitted {
-                        stream_corrupted = true;
-                        if let Some(sender) = &mut *ctx.control_sender.lock() {
-                            sender.send(&ClientControlPacket::RequestIdr).ok();
+                    x_transport::FrameTrust::Untrusted { reason, first } => {
+                        // Ask for a keyframe once per recovery, not once per frame. During a
+                        // recovery window this branch runs for every frame that arrives, and a
+                        // reliable control packet per frame — each answered by the sender with a
+                        // keyframe — is a flood with a bitrate spike attached.
+                        //
+                        // `avoid_video_glitching` now means exactly this and nothing else: it
+                        // used to be the switch for the invariant itself, which is how the
+                        // invariant came to be bypassed by default. It can no longer disable
+                        // holding an untrusted frame; it decides only whether we spend a round
+                        // trip and a keyframe asking to shorten the hold.
+                        if first {
+                            if settings.connection.avoid_video_glitching
+                                && let Some(sender) = &mut *ctx.control_sender.lock()
+                            {
+                                sender.send(&ClientControlPacket::RequestIdr).ok();
+                            }
+                            warn!(
+                                "Holding video: frame_index={} is not trustworthy ({reason:?}); \
+                                 {} frame(s) missed so far",
+                                header.frame_index,
+                                trust.missed_frames()
+                            );
+                        } else {
+                            debug!(
+                                "Holding video: frame_index={} ({reason:?})",
+                                header.frame_index
+                            );
                         }
-                        warn!("Dropped video packet. Reason: Decoder saturation")
                     }
-                } else {
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
-                    }
-                    warn!("Dropped video packet. Reason: Waiting for IDR frame")
                 }
             }
         }

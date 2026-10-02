@@ -260,6 +260,7 @@ dependencies = [
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "x-transport",
 ]
 
 [[package]]
@@ -442,6 +443,7 @@ dependencies = [
  "tower-http",
  "x-foveation",
  "x-link",
+ "x-transport",
 ]
 
 [[package]]

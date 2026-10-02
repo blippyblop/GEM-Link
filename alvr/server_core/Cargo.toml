@@ -24,6 +24,7 @@ alvr_session.workspace = true
 alvr_sockets.workspace = true
 x-foveation = { path = "../x-foveation" }
 x-link = { path = "../x-link" }
+x-transport = { path = "../x-transport" }
 
 ash = "0.38"
 axum = { version = "0.8", features = ["ws"] }

@@ -18,7 +18,7 @@ pub use x_foveation::{EyeTrackedFoveation, align_foveation_center_shift};
 use crate::connection::VideoPacket;
 use alvr_common::{
     AlvrFoveatedEncodingParams, ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState,
-    Pose, ViewParams, dbg_server_core, error,
+    Pose, ViewParams, dbg_server_core, debug, error,
     glam::{Quat, UVec2, Vec2},
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
@@ -43,8 +43,7 @@ use std::{
     io::Write,
     sync::{
         Arc, LazyLock, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, SyncSender, TrySendError},
+        mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -404,17 +403,16 @@ impl ServerCoreContext {
     ) {
         dbg_server_core!("send_video_nal");
 
-        // start in the corrupts state, the client didn't receive the initial IDR yet.
-        static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
+        // ADR-0011's send half. Was a bare `AtomicBool` named STREAM_CORRUPTED, plus a bypass
+        // when `avoid_video_glitching` was off (it defaults off), which is how a frame that
+        // broke the decoder's reference chain got transmitted anyway. The rule now lives in
+        // `x_transport::SendGate` with tests, and there is no setting that disables it.
+        static SEND_GATE: Mutex<x_transport::SendGate> = Mutex::new(x_transport::SendGate::new());
         static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
             LazyLock::new(|| Mutex::new(Instant::now()));
 
         if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
             let buffer_size = nal_buffer.len();
-
-            if is_idr {
-                STREAM_CORRUPTED.store(false, Ordering::SeqCst);
-            }
 
             if let Switch::Enabled(config) = &SESSION_MANAGER
                 .read()
@@ -439,53 +437,72 @@ impl ServerCoreContext {
                 }
             }
 
-            if !STREAM_CORRUPTED.load(Ordering::SeqCst)
-                || !SESSION_MANAGER
-                    .read()
-                    .settings()
-                    .connection
-                    .avoid_video_glitching
-            {
-                if let Some(sender) = &*self.connection_context.video_mirror_sender.lock() {
-                    sender.send(nal_buffer.clone()).ok();
-                }
+            // ADR-0011, phase one. A frame whose reference the client does not have is not
+            // transmitted at all — not the frame that was lost, and not the P-frames that
+            // follow it, because those are the ones that decode to a plausible-looking
+            // picture that is entirely wrong.
+            let mut gate = SEND_GATE.lock();
+            match gate.may_transmit(is_idr) {
+                x_transport::SendDecision::Transmit => {
+                    // The mirror and the rolling-file recording are records of what the
+                    // client received, so they live inside the gate, as they did before.
+                    if let Some(sender) = &*self.connection_context.video_mirror_sender.lock() {
+                        sender.send(nal_buffer.clone()).ok();
+                    }
 
-                if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
-                    file.write_all(&nal_buffer).ok();
-                }
+                    if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
+                        file.write_all(&nal_buffer).ok();
+                    }
 
-                let sender_result = sender.try_send(VideoPacket {
-                    header: VideoPacketHeader {
-                        frame_index,
-                        timestamp,
-                        global_view_params,
-                        foveation_center_shifts,
-                        is_idr,
-                    },
-                    payload: nal_buffer,
-                });
-                if matches!(sender_result, Err(TrySendError::Full(_))) {
-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
-                    self.connection_context
-                        .events_sender
-                        .send(ServerCoreEvent::RequestIDR)
-                        .ok();
-                    // Name the frame. Without the sequence number a dropped frame
-                    // was anonymous, so the server could not tell whether the IDR it
-                    // had just asked the encoder for was the frame it had just
-                    // thrown away — and would loop: drop, request IDR, drop the IDR,
-                    // request again. DROPPED counts frames lost here; the client
-                    // sees the same number as a gap.
-                    static DROPPED: AtomicU64 = AtomicU64::new(0);
-                    let n = DROPPED.fetch_add(1, Ordering::SeqCst) + 1;
-                    warn!(
-                        "Dropping video frame_index={frame_index} idr={is_idr}                          (reason: can't push to network). Total dropped: {n}"
+                    let admitted = sender
+                        .try_send(VideoPacket {
+                            header: VideoPacketHeader {
+                                frame_index,
+                                timestamp,
+                                global_view_params,
+                                foveation_center_shifts,
+                                is_idr,
+                            },
+                            payload: nal_buffer,
+                        })
+                        .is_ok();
+
+                    gate.on_send_result(admitted);
+                    if !admitted {
+                        self.connection_context
+                            .events_sender
+                            .send(ServerCoreEvent::RequestIDR)
+                            .ok();
+                        // Name the frame. Without the sequence number a dropped frame was
+                        // anonymous, so the server could not tell whether the keyframe it had
+                        // just asked the encoder for was the frame it had just thrown away —
+                        // and would loop: drop, request a keyframe, drop the keyframe, request
+                        // again.
+                        warn!(
+                            "Dropped video frame_index={frame_index} idr={is_idr} (reason: can't \
+                             push to network). Total dropped: {}. Suppressing until a keyframe \
+                             goes out",
+                            gate.discarded()
+                        );
+                    }
+                }
+                x_transport::SendDecision::Suppress(reason) => {
+                    // Deliberately not silent: the count of these is the cost of the
+                    // invariant, and it is the number that was missing when 41 % of frames
+                    // were garbage behind a "0 errors" telemetry line.
+                    debug!(
+                        "Suppressing video frame_index={frame_index} idr={is_idr} ({reason:?}); \
+                         {} suppressed so far this session",
+                        gate.suppressed_frames()
                     );
                 }
-            } else {
-                warn!("Dropping video packet. Reason: Waiting for IDR frame");
             }
+            drop(gate);
 
+            // The encoder did this work whether or not the frame could be transmitted, so the
+            // statistics and the bitrate controller see it either way: the cost is real even
+            // when the output is suppressed, and hiding it would make the controller believe
+            // the link is better than it is.
             if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
                 let encoder_latency = stats.report_frame_encoded(timestamp, buffer_size);
 
@@ -494,9 +511,12 @@ impl ServerCoreContext {
                     .lock()
                     .report_frame_encoded(timestamp, encoder_latency, buffer_size);
             }
+        } else {
+            // No video channel at all: the socket has not been set up yet, which is a
+            // connection-stage condition rather than a frame decision.
+            debug!("No video channel; dropping frame_index={frame_index} idr={is_idr}");
         }
     }
-
     pub fn get_dynamic_encoder_params(&self) -> Option<DynamicEncoderParams> {
         dbg_server_core!("get_dynamic_encoder_params");
 

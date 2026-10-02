@@ -1458,7 +1458,10 @@ TCP: Slower than UDP, but more stable. Pick this if you experience video or audi
     pub allow_remote_dashboard: bool,
 
     #[schema(strings(
-        help = r#"If the client, server or the network discarded one packet, discard packets until a IDR packet is found."#
+        display_name = "Ask for a keyframe when the picture is untrusted",
+        help = r#"When the client holds a frame because it cannot be reconstructed — the server discarded a frame, the network lost packets, or the decoder refused it — ask for a keyframe rather than waiting for the next scheduled one.
+
+Holding the last good frame is not optional and this setting does not change it: a frame the client cannot reconstruct is never presented, whatever this is set to (ADR-0011). What it controls is whether we spend a control packet and an encoder keyframe to shorten the hold. Off means longer holds and no bitrate spike."#
     ))]
     pub avoid_video_glitching: bool,
 
@@ -2262,7 +2265,9 @@ pub fn session_settings_default() -> SettingsDefault {
             server_buffer_config: socket_buffer_config.clone(),
             client_buffer_config: socket_buffer_config,
             max_queued_server_video_frames: 1024,
-            avoid_video_glitching: false,
+            // On by default: the invariant holds either way, and asking shortens a hold the
+            // client would otherwise sit through.
+            avoid_video_glitching: true,
             minimum_idr_interval_ms: 100,
             wlan_optimizer: true,
             host_scheduling: true,
