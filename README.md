@@ -1,5 +1,9 @@
 # GemLink
 
+**IMPORTANT** : This project is going to get parked and development is going to slow massively because of this: FRAME STREAM (also styled as Frame Stream), developed by @ji10me (ジトメ / JTOME on VRChat).
+
+Basically someone else already made what I was trying to put together; and chances are they actually have a device already. I'll use this project as a dump project for tokens since it'd be cool to get an open source project for this; also if FRAME STREAM is closed source this project will keep moving but priority will be low as functionality is the primary focus. 
+
 *A free, open, non-commercial PC-VR streaming stack, rebuilt ground-up with the **Steam Frame** as its first-class device — game **and** desktop streaming from Windows, virtual displays, gaze-driven foveated encoding, and a single-minded obsession with the latency **tail**. Built on [ALVR](https://github.com/alvr-org/ALVR), licensed [MIT](LICENSE) — do what you want, attribution included.*
 
 No ads. No tiers. No telemetry. Encryption always on.
