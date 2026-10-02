@@ -1,5 +1,7 @@
 # GemLink
 
+What even is this? This is to stream video from your PC to your Headset. Currently uses SteamVR on the PC end because it's less dev work.
+
 **IMPORTANT** : This project is going to get parked and development is going to slow massively because of this: FRAME STREAM (also styled as Frame Stream), developed by @ji10me (ジトメ / JTOME on VRChat).
 
 Basically someone else already made what I was trying to put together; and chances are they actually have a device already. I'll use this project as a dump project for tokens since it'd be cool to get an open source project for this; also if FRAME STREAM is closed source this project will keep moving but priority will be low as functionality is the primary focus. 
