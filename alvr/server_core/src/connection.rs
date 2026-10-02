@@ -589,6 +589,29 @@ fn connection_pipeline(
 
     let initial_settings = session_manager_lock.settings().clone();
 
+    // Hold the PC's Wi-Fi adapter in streaming posture for exactly as long as this
+    // connection lives: the guard restores the adapter when it drops, and it is dropped
+    // on every return path out of this function, including a failed handshake.
+    //
+    // This is the one link-layer action that has no upstream equivalent; it is ported
+    // from Virtual Desktop, whose `OptimizeWLAN` drives
+    // `wlan_intf_opcode_media_streaming_mode` and `wlan_intf_opcode_background_scan_enabled`
+    // on every connected WLAN interface (VD_RE/24-vd-link-qos.md).
+    let _wlan_session = if initial_settings.connection.wlan_optimizer {
+        match x_link::WlanSession::start(x_link::WlanPosture::streaming()) {
+            Ok(session) => Some(session),
+            Err(e) => {
+                // Not an error worth failing a session over: a wired-only machine has no
+                // WLAN API to find, and "no connected WLAN interface" is reported by the
+                // session's own log line, not by this branch.
+                info!("WLAN optimizer not started: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     fn get_view_res(config: FrameSize, default_res: UVec2) -> UVec2 {
         let res = match config {
             FrameSize::Scale(scale) => default_res.as_vec2() * scale,

@@ -1520,6 +1520,62 @@ mod tests {
         assert_eq!(m.missed_mandatory_pct, 0.0);
         assert_eq!(m.within_optimal_pct, 100.0);
     }
+
+    /// The wire negotiation and the link layer must agree about what a link is.
+    ///
+    /// `x-protocol` decides which [`LinkClass`] a session runs on; `x-link` decides what
+    /// the server then *does* to that link. If a class can be negotiated but has no QoS
+    /// posture, the server would silently do nothing on exactly the links it was told to
+    /// tune — so this walks every class the sample devices and the sample server have in
+    /// common (not just the one negotiation happens to pick, which is always the best of
+    /// them) and requires a usable profile for each. It is the cheap half of the M4
+    /// link-classification item: the classification exists, is total, and is wired to the
+    /// negotiation that produces it.
+    #[test]
+    fn every_negotiable_link_class_has_a_qos_posture() {
+        use x_link::{LinkClass, profile_for};
+
+        let server = samples::server();
+        let mut negotiable = std::collections::BTreeSet::new();
+
+        for client in [
+            samples::steam_frame(),
+            samples::quest_pro(),
+            samples::quest_3(),
+        ] {
+            let plan = negotiate(&client, &server).expect("sample device must negotiate");
+            assert_eq!(
+                profile_for(&plan.link_class).wlan.media_streaming,
+                plan.link_class != LinkClass::UsbNcm,
+                "the negotiated link class must drive the WLAN posture"
+            );
+
+            negotiable.extend(
+                client
+                    .link_classes
+                    .intersection(&server.link_classes)
+                    .cloned(),
+            );
+        }
+
+        // The Frame's own two links must be in the set, or this test is not testing the
+        // device it exists for.
+        assert!(
+            negotiable.contains(&LinkClass::UsbNcm) && negotiable.contains(&LinkClass::Wifi7SoftAp),
+            "the samples must cover the two Frame links, got {negotiable:?}"
+        );
+
+        for class in &negotiable {
+            let profile = profile_for(class);
+            // The one invariant that is a mechanism rather than a preference: the wired
+            // link must not touch the radio, and every radio link must be.
+            assert_eq!(
+                profile.wlan.media_streaming,
+                *class != LinkClass::UsbNcm,
+                "{class:?}: media-streaming posture does not follow the link class"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

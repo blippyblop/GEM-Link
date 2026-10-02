@@ -441,6 +441,7 @@ dependencies = [
  "tokio",
  "tower-http",
  "x-foveation",
+ "x-link",
 ]
 
 [[package]]
@@ -8325,6 +8326,7 @@ dependencies = [
  "serde_json",
  "x-crypto",
  "x-foveation",
+ "x-link",
  "x-protocol",
 ]
 
@@ -8352,6 +8354,15 @@ name = "x-foveation"
 version = "21.0.0-dev14"
 dependencies = [
  "alvr_common",
+]
+
+[[package]]
+name = "x-link"
+version = "21.0.0-dev14"
+dependencies = [
+ "log",
+ "windows 0.58.0",
+ "x-protocol",
 ]
 
 [[package]]

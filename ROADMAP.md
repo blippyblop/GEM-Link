@@ -122,7 +122,11 @@ hardware test — never an opinion. Status is per 2026-10-01.
 
 ### M4 — Transport v2 (parallel to M2/M3)
 - [ ] Frame-agnostic typed chunks (video/audio/tracking/events), per-class reliability; **media-plane AEAD** (with M1)
-- [ ] Hot codec/config/foveation switch (no teardown); link classification (`wifi7_softap` / `wifi7_lan` / `usb_ncm`)
+- [ ] Hot codec/config/foveation switch (no teardown)
+- [x] **Link classification + per-class QoS posture** (`x-link`): interface descriptor → `LinkClass` → a QoS profile (WLAN posture, DSCP, jitter-buffer depth, planned throughput). Total over every class the protocol can negotiate, which `x-bench` asserts against `x-protocol`'s own negotiation.
+- [x] **WLAN optimizer (VD parity)**: hold the PC's Wi-Fi adapter in media-streaming mode with background scanning off for the life of a session, re-asserting every 11 s and restoring on exit. Ported from Virtual Desktop's `libVirtualDesktopNet.dll` (notes in `VD_RE/24-vd-link-qos.md`); no upstream ALVR equivalent exists. Wired to the session lifecycle as `connection.wlan_optimizer` (default on).
+- [ ] **Measure the WLAN optimizer** — it has never been A/B'd. The instrument is its own log line (per interface, per opcode, before and after); the experiment is the delivery tail on `frame_wifi7_160` with the setting on and off **within one capture** (the grey-frame lesson: the link's own noise is larger than the effect). Until that runs this is parity, not an improvement.
+- [ ] **Make the posture class-aware.** Today the server takes the streaming posture for any session; the classification exists but nothing resolves the *client's* local interface to a `LinkClass` yet, so `profile_for` has no runtime consumer.
 - [ ] SoftAP-topology aware discovery (server joins the Frame AP or NCM tether); known RF failure modes as bench profiles (reg-race TX cap, CQM churn, GI/LTF pinning)
 - **Gate → `v0.5.0`:** mid-session codec switch, zero dropped frames on the impairment profiles
 

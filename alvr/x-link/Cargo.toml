@@ -1,0 +1,18 @@
+[package]
+name = "x-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["GemLink contributors"]
+description = "GemLink link layer: link classification, per-class QoS posture, and the VD-parity WLAN optimizer"
+
+[dependencies]
+log = "0.4"
+x-protocol = { path = "../x-protocol" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WiFi",
+] }

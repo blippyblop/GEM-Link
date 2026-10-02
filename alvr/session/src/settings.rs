@@ -1490,6 +1490,18 @@ This could happen on TCP. A IDR frame is requested in this case."#
 
     #[schema(strings(display_name = "DSCP (packet prio hints)"))]
     pub dscp: Option<DscpTos>,
+
+    #[schema(strings(
+        display_name = "WLAN optimizer",
+        help = "While a session runs, put the PC's Wi-Fi adapter into media-streaming mode \
+                and turn background scanning off, re-asserting both while the session is \
+                live and restoring them when it ends. Background scans tune off-channel and \
+                are a self-inflicted latency spike on the AP being streamed from. Ported \
+                from Virtual Desktop (see VD_RE/24-vd-link-qos.md). Does nothing when the \
+                session is not on a connected WLAN interface, and nothing on a platform \
+                without a WLAN control API."
+    ))]
+    pub wlan_optimizer: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
@@ -2232,6 +2244,7 @@ pub fn session_settings_default() -> SettingsDefault {
             max_queued_server_video_frames: 1024,
             avoid_video_glitching: false,
             minimum_idr_interval_ms: 100,
+            wlan_optimizer: true,
             enable_on_connect_script: false,
             enable_on_disconnect_script: false,
             allow_untrusted_http: false,

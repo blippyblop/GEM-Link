@@ -24,13 +24,13 @@ jobs:
           toolchain: "1.97.1"
           components: rustfmt, clippy
       - name: Format
-        run: cargo fmt -p x-protocol -p x-bench -p x-crypto -p x-dda -p x-nvenc -p x-foveation -- --check
+        run: cargo fmt -p x-protocol -p x-bench -p x-crypto -p x-dda -p x-nvenc -p x-foveation -p x-link -- --check
       - name: Build
-        run: cargo build -p x-protocol -p x-bench -p x-crypto
+        run: cargo build -p x-protocol -p x-bench -p x-crypto -p x-link
       - name: Clippy
-        run: cargo clippy -p x-protocol -p x-bench -p x-crypto -p x-foveation -- -D warnings
+        run: cargo clippy -p x-protocol -p x-bench -p x-crypto -p x-foveation -p x-link -- -D warnings
       - name: Test
-        run: cargo test -p x-protocol -p x-bench -p x-crypto
+        run: cargo test -p x-protocol -p x-bench -p x-crypto -p x-link
 
   bench-gates:
     if: github.repository == 'blippyblop/GEM-Link'
@@ -82,7 +82,7 @@ jobs:
           set RUSTUP_HOME=C:\Gemlink\tools\rustup
           set CARGO_HOME=C:\Gemlink\tools\cargo
           set PATH=C:\Gemlink\tools\cargo\bin;%PATH%
-          cargo test -p x-protocol -p x-bench -p x-crypto
+          cargo test -p x-protocol -p x-bench -p x-crypto -p x-link
       - name: SteamVR driver build (server_openvr, ADR-0005)
         shell: cmd
         run: |
