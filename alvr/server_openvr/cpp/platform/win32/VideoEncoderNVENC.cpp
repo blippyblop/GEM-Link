@@ -1,4 +1,6 @@
 #include "VideoEncoderNVENC.h"
+
+#include "GreyProbe.h"
 #include "NvCodecUtils.h"
 
 #include "alvr_server/Logger.h"
@@ -119,7 +121,49 @@ void VideoEncoderNVENC::Transmit(
 
     ID3D11Texture2D* pInputTexture
         = reinterpret_cast<ID3D11Texture2D*>(encoderInputFrame->inputPtr);
+
+    // --- grey-frame instrumentation: does CopyResource actually have matching
+    // formats? ID3D11DeviceContext::CopyResource returns void and requires the
+    // source and destination formats to agree; a mismatch is a silent no-op that
+    // only the D3D11 debug layer would mention, and a release driver build has it
+    // off. Print the numbers the runtime reports rather than trusting the enum.
+    // See /workspace/VD_RE/51-grey-frame-ruled-out.md
+    {
+        D3D11_TEXTURE2D_DESC srcDesc{}, dstDesc{};
+        pTexture->GetDesc(&srcDesc);
+        pInputTexture->GetDesc(&dstDesc);
+        static bool formatsLogged = false;
+        if (!formatsLogged) {
+            formatsLogged = true;
+            Info(
+                "NVENCPROBE: copy source %ux%u fmt=%d  ->  nvenc input buffer %ux%u fmt=%d  "
+                "(match=%d)  ring buffers=%u",
+                srcDesc.Width,
+                srcDesc.Height,
+                (int)srcDesc.Format,
+                dstDesc.Width,
+                dstDesc.Height,
+                (int)dstDesc.Format,
+                (int)(srcDesc.Format == dstDesc.Format),
+                m_NvNecoder->GetEncoderBufferCount()
+            );
+        }
+    }
+
     m_pD3DRender->GetContext()->CopyResource(pInputTexture, pTexture);
+
+    // The buffer NVENC is about to read, sampled at the moment it reads it. This is
+    // the one link never measured: every other probe sampled inside FrameRender.
+    // Stage "encin" = the encoder's actual input, after the copy.
+    greyprobe::Probe::Instance().Sample(
+        m_pD3DRender->GetDevice(),
+        m_pD3DRender->GetContext(),
+        pInputTexture,
+        targetTimestampNs,
+        0,
+        0,
+        "encin"
+    );
 
     NV_ENC_PIC_PARAMS picParams = {};
     if (insertIDR) {
