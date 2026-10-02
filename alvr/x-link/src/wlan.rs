@@ -239,6 +239,8 @@ pub enum LinkError {
     Unsupported,
     /// `WlanOpenHandle` failed with this Win32 error.
     Open(u32),
+    /// A WLAN query failed with this Win32 error.
+    Query(u32),
 }
 
 impl fmt::Display for LinkError {
@@ -246,6 +248,7 @@ impl fmt::Display for LinkError {
         match self {
             LinkError::Unsupported => f.write_str("WLAN control is not available on this platform"),
             LinkError::Open(code) => write!(f, "WlanOpenHandle failed (win32 {code})"),
+            LinkError::Query(code) => write!(f, "WLAN query failed (win32 {code})"),
         }
     }
 }
@@ -425,15 +428,117 @@ fn run(inner: Arc<SessionInner>) {
     }
 }
 
+/// The 802.11 PHY a connection is using, as `wlan_intf_opcode_current_connection` reports
+/// it. Only the members that map to a Wi-Fi generation are named; anything else is
+/// [`WlanPhy::Other`] and maps to no generation rather than to a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WlanPhy {
+    /// 802.11n — Wi-Fi 4.
+    Ht,
+    /// 802.11ac — Wi-Fi 5.
+    Vht,
+    /// 802.11ax — Wi-Fi 6.
+    He,
+    /// 802.11be — Wi-Fi 7.
+    Eht,
+    /// Anything else, carrying the raw `DOT11_PHY_TYPE`.
+    Other(i32),
+}
+
+impl WlanPhy {
+    /// The generation number, or `None` when the PHY does not correspond to one we name.
+    ///
+    /// Returning `None` rather than a default is the whole point: an unknown PHY must not
+    /// be silently promoted to Wi-Fi 7 (which would earn a session the least conservative
+    /// posture) nor demoted to Wi-Fi 4 (which would waste a good link).
+    pub const fn wifi_generation(self) -> Option<u8> {
+        match self {
+            WlanPhy::Ht => Some(4),
+            WlanPhy::Vht => Some(5),
+            WlanPhy::He => Some(6),
+            WlanPhy::Eht => Some(7),
+            WlanPhy::Other(_) => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WlanPhy::Ht => "802.11n (Wi-Fi 4)",
+            WlanPhy::Vht => "802.11ac (Wi-Fi 5)",
+            WlanPhy::He => "802.11ax (Wi-Fi 6)",
+            WlanPhy::Eht => "802.11be (Wi-Fi 7)",
+            WlanPhy::Other(_) => "unknown PHY",
+        }
+    }
+
+    /// Map a raw `DOT11_PHY_TYPE`.
+    ///
+    /// The numeric values are the SDK's and are stable (`dot11_phy_type_ht` = 7,
+    /// `_vht` = 8, `_he` = 10, `_eht` = 11). They are written out here rather than taken
+    /// from the Windows bindings so that this mapping is testable everywhere, including
+    /// where there is no Windows.
+    pub const fn from_raw(raw: i32) -> Self {
+        match raw {
+            7 => WlanPhy::Ht,
+            8 => WlanPhy::Vht,
+            10 => WlanPhy::He,
+            11 => WlanPhy::Eht,
+            other => WlanPhy::Other(other),
+        }
+    }
+
+    pub const fn raw(self) -> i32 {
+        match self {
+            WlanPhy::Ht => 7,
+            WlanPhy::Vht => 8,
+            WlanPhy::He => 10,
+            WlanPhy::Eht => 11,
+            WlanPhy::Other(raw) => raw,
+        }
+    }
+}
+
+/// The live state of a connected WLAN interface.
+///
+/// VD does not read any of this — its optimizer uses exactly two opcodes (§2 of
+/// `VD_RE/24-vd-link-qos.md`) — but the information is what our classifier needs and it
+/// costs one query. In particular `phy` is the only way to learn the radio generation from
+/// the host side, and `rx_kbps`/`tx_kbps` are a real, current rate rather than a nominal
+/// link speed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WlanConnection {
+    /// Empty when the network is hidden.
+    pub ssid: String,
+    pub bssid: [u8; 6],
+    pub phy: WlanPhy,
+    /// Current receive rate, kbps, as the driver reports it.
+    pub rx_kbps: u32,
+    /// Current transmit rate, kbps.
+    pub tx_kbps: u32,
+    /// 0–100.
+    pub signal_quality: u32,
+    /// The connected profile's name.
+    pub profile_name: String,
+}
+
+/// Read the current connection of the first connected WLAN interface.
+///
+/// `Ok(None)` means "there is a WLAN API and nothing is connected" — the ordinary answer
+/// on a wired machine, and not an error. An `Err` means we could not ask.
+pub fn current_connection() -> Result<Option<WlanConnection>, LinkError> {
+    platform::current_connection()
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
     use std::ffi::c_void;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::NetworkManagement::WiFi::{
-        WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST, WLAN_INTF_OPCODE, WLAN_OPCODE_VALUE_TYPE,
-        WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
-        WlanSetInterface, wlan_interface_state_connected, wlan_opcode_value_type_invalid,
+        WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST,
+        WLAN_INTF_OPCODE, WLAN_OPCODE_VALUE_TYPE, WlanCloseHandle, WlanEnumInterfaces,
+        WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, WlanSetInterface,
+        wlan_interface_state_connected, wlan_opcode_value_type_invalid,
     };
     use windows::core::GUID;
 
@@ -450,6 +555,21 @@ mod platform {
     /// numbers VD uses stay obviously the same thing.
     fn opcode(value: u32) -> WLAN_INTF_OPCODE {
         WLAN_INTF_OPCODE(value as i32)
+    }
+
+    /// `wlan_intf_opcode_current_connection`.
+    const OPCODE_CURRENT_CONNECTION: u32 = 7;
+
+    pub(super) fn current_connection() -> Result<Option<WlanConnection>, LinkError> {
+        let wlan = Win32Wlan::open()?;
+        let interfaces = wlan.connected_interfaces().map_err(LinkError::Query)?;
+        for info in interfaces {
+            // `connection_attributes` is `None` when the interface is not associated.
+            if let Some(conn) = wlan.connection_attributes(&info.InterfaceGuid) {
+                return Ok(Some(conn));
+            }
+        }
+        Ok(None)
     }
 
     struct Win32Wlan {
@@ -555,6 +675,59 @@ mod platform {
                     None,
                 )
             }
+        }
+
+        /// `WlanQueryInterface` for the full connection attributes.
+        ///
+        /// `None` covers every "there is nothing to report" case — not associated, a
+        /// short buffer, an API error — because the caller's only sensible response to any
+        /// of them is the same: carry on without radio detail.
+        fn connection_attributes(&self, guid: &GUID) -> Option<WlanConnection> {
+            let mut size: u32 = 0;
+            let mut data: *mut c_void = std::ptr::null_mut();
+            let mut value_type = wlan_opcode_value_type_invalid;
+
+            let err = unsafe {
+                WlanQueryInterface(
+                    self.handle,
+                    guid,
+                    opcode(OPCODE_CURRENT_CONNECTION),
+                    None,
+                    &mut size,
+                    &mut data,
+                    Some(&mut value_type),
+                )
+            };
+            if err != ERROR_SUCCESS || data.is_null() {
+                if !data.is_null() {
+                    unsafe { WlanFreeMemory(data as *const c_void) };
+                }
+                return None;
+            }
+
+            let attributes = unsafe {
+                if (size as usize) < size_of::<WLAN_CONNECTION_ATTRIBUTES>() {
+                    None
+                } else {
+                    let attrs = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
+                    let assoc = &attrs.wlanAssociationAttributes;
+                    let ssid_len = (assoc.dot11Ssid.uSSIDLength as usize).min(32);
+
+                    Some(WlanConnection {
+                        ssid: String::from_utf8_lossy(&assoc.dot11Ssid.ucSSID[..ssid_len])
+                            .into_owned(),
+                        bssid: assoc.dot11Bssid,
+                        phy: WlanPhy::from_raw(assoc.dot11PhyType.0),
+                        rx_kbps: assoc.ulRxRate,
+                        tx_kbps: assoc.ulTxRate,
+                        signal_quality: assoc.wlanSignalQuality,
+                        profile_name: wide_to_string(&attrs.strProfileName),
+                    })
+                }
+            };
+
+            unsafe { WlanFreeMemory(data as *const c_void) };
+            attributes
         }
 
         fn apply_opcode(&self, guid: &GUID, opcode_value: u32, desired: bool) -> OpcodeOutcome {
@@ -674,6 +847,10 @@ mod platform {
         // doing this" rather than nothing at all.
         Err(LinkError::Unsupported)
     }
+
+    pub(super) fn current_connection() -> Result<Option<WlanConnection>, LinkError> {
+        Err(LinkError::Unsupported)
+    }
 }
 
 #[cfg(test)]
@@ -761,6 +938,32 @@ mod tests {
             None,
             "autoconf is not ours"
         );
+    }
+
+    #[test]
+    fn phy_types_map_to_the_right_generations() {
+        // The SDK's DOT11_PHY_TYPE values. Getting these wrong would silently mislabel the
+        // client's radio, which is worse than not classifying it at all.
+        assert_eq!(WlanPhy::from_raw(7).wifi_generation(), Some(4)); // ht  = 802.11n
+        assert_eq!(WlanPhy::from_raw(8).wifi_generation(), Some(5)); // vht = 802.11ac
+        assert_eq!(WlanPhy::from_raw(10).wifi_generation(), Some(6)); // he  = 802.11ax
+        assert_eq!(WlanPhy::from_raw(11).wifi_generation(), Some(7)); // eht = 802.11be
+    }
+
+    #[test]
+    fn an_unknown_phy_has_no_generation() {
+        // Neither promoted nor demoted: `None` means the classifier falls back to its own
+        // conservative path, rather than this layer picking a posture for us.
+        assert_eq!(WlanPhy::from_raw(4).wifi_generation(), None); // ofdm = 802.11a
+        assert_eq!(WlanPhy::from_raw(0).wifi_generation(), None); // unknown
+        assert_eq!(WlanPhy::Other(99).wifi_generation(), None);
+    }
+
+    #[test]
+    fn phy_round_trips() {
+        for raw in [0, 4, 7, 8, 10, 11, 42] {
+            assert_eq!(WlanPhy::from_raw(raw).raw(), raw);
+        }
     }
 
     #[test]

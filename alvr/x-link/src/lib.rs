@@ -45,14 +45,18 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod classify;
+pub mod host;
 pub mod qos;
+pub mod sched;
 pub mod wlan;
 
 pub use classify::{LinkDescriptor, LinkKind, classify};
-pub use qos::{Dscp, LinkQosProfile, profile_for};
+pub use host::{HostAdapter, HostLink, LinkResolution, classify_host, is_soft_ap_ssid, resolve};
+pub use qos::{Dscp, LinkQosProfile, profile_for, profile_for_resolution};
+pub use sched::{HostScheduler, SchedError, SchedReport};
 pub use wlan::{
     InterfaceOutcome, LinkError, OpcodeOutcome, OptimizeReport, REASSERT_PERIOD, WlanBackend,
-    WlanPosture, WlanSession,
+    WlanConnection, WlanPhy, WlanPosture, WlanSession,
 };
 
 /// Re-exported so callers do not have to depend on `x-protocol` for the one type this

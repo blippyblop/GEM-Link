@@ -16,8 +16,8 @@ use std::{
     sync::Mutex,
     time::Duration,
 };
-use x_crypto::{HandshakeRole, Identity, fingerprint_of};
 use x_crypto::framed::NoiseSocket;
+use x_crypto::{HandshakeRole, Identity, fingerprint_of};
 
 pub struct SecureControlSocket {
     inner: Mutex<NoiseSocket>,
@@ -174,7 +174,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
 
-        let server_id = Identity::generate().map_err(|e| e)?;
+        let server_id = Identity::generate()?;
         let server_pub = server_id.public().to_vec();
         let server_handle = std::thread::spawn(move || {
             SecureControlSocket::accept_from_client(
@@ -186,7 +186,7 @@ mod tests {
             .map_err(|e| e.to_string())
         });
 
-        let client_id = Identity::generate().map_err(|e| e)?;
+        let client_id = Identity::generate()?;
         let (client, client_remote) = SecureControlSocket::connect_to_server(
             Duration::from_secs(5),
             &[addr.ip()],
@@ -209,14 +209,18 @@ mod tests {
 
         let out = ClientControlPacket::KeepAlive;
         client.send(&out).expect("send");
-        let got: ClientControlPacket =
-            server.recv(Duration::from_secs(2)).map_err(|e| e.to_string()).expect("recv");
+        let got: ClientControlPacket = server
+            .recv(Duration::from_secs(2))
+            .map_err(|e| e.to_string())
+            .expect("recv");
         assert!(matches!(got, ClientControlPacket::KeepAlive));
 
         let reply = ServerControlPacket::Reserved("ack".into());
         server.send(&reply).expect("server send");
-        let got: ServerControlPacket =
-            client.recv(Duration::from_secs(2)).map_err(|e| e.to_string()).expect("recv");
+        let got: ServerControlPacket = client
+            .recv(Duration::from_secs(2))
+            .map_err(|e| e.to_string())
+            .expect("recv");
         assert!(matches!(got, ServerControlPacket::Reserved(_)));
     }
 

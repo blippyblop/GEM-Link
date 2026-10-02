@@ -174,6 +174,70 @@ pub fn profile_for(class: &LinkClass) -> LinkQosProfile {
     }
 }
 
+/// The posture for a **resolved** link: the radio's class combined with how the host
+/// itself is attached.
+///
+/// This is the function the server should call, because it is the only one that can be
+/// wrong *safely*. [`profile_for`] alone cannot know whether the session is running over
+/// the PC's radio or over a cable, so it can only answer from the client's side; resolving
+/// both axes makes the two decisions that matter actually decidable:
+///
+/// 1. **Whether to touch the WLAN adapter at all.** The honest condition is *"the local
+///    interface that reaches this client is wireless"* — not *"the negotiated class is
+///    NCM"*. A session over the Frame's SoftAP on a PC plugged into Ethernet must not
+///    disable background scanning on a radio that is not carrying the stream, and a
+///    wireless host must have it done regardless of which class won the negotiation.
+/// 2. **Whether the wire is the constraint.** A `NotGigabit` host path caps what the
+///    session can honestly be asked to carry, whatever the client's envelope says.
+///
+/// Every field is merged in the conservative direction: lower throughput, more buffering,
+/// more contention. Where the two axes disagree about the WLAN posture the *host* wins,
+/// because it is the one that knows about the actual socket.
+pub fn profile_for_resolution(resolution: &crate::host::LinkResolution) -> LinkQosProfile {
+    let mut profile = profile_for(&resolution.class);
+
+    profile.wlan = if resolution.host_link.is_wireless() {
+        // `Unknown` is permissive on purpose: an over-eager posture costs nothing because
+        // the optimizer reports "no connected WLAN interface" and stops, whereas a
+        // wrongly-disabled posture loses the feature silently.
+        WlanPosture::streaming()
+    } else {
+        WlanPosture::off()
+    };
+
+    match resolution.host_link {
+        crate::host::HostLink::NotGigabit => {
+            // A 100 Mbit path. Upper bound is the wire less typical overhead; the number is
+            // a planning figure and is labelled as one, not a measurement.
+            profile.expected_throughput_mbps = profile.expected_throughput_mbps.min(90);
+            profile.contended = true;
+            profile.jitter_buffer_frames = profile.jitter_buffer_frames.max(2);
+        }
+        crate::host::HostLink::Ethernet => {
+            profile.jitter_buffer_frames = profile.jitter_buffer_frames.min(2);
+        }
+        crate::host::HostLink::Local => {
+            // A loopback peer is not a link, so none of the wire or radio reasoning
+            // applies and none of its pessimism should. This is the case that keeps the
+            // local test clients measuring what they measured before this module existed.
+            profile.expected_throughput_mbps = 1000;
+            profile.contended = false;
+            profile.jitter_buffer_frames = 1;
+        }
+        crate::host::HostLink::Wireless | crate::host::HostLink::Unknown => {
+            // A radio on the host side means reordering and retries are real, whatever the
+            // client's own radio is doing.
+            profile.jitter_buffer_frames = profile.jitter_buffer_frames.max(2);
+            profile.contended = true;
+        }
+    }
+
+    // Media is marked wherever it goes; a wired link is exactly where marking is most
+    // likely to be honoured end to end.
+    profile.dscp = Dscp::ExpeditedForwarding;
+    profile
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +333,156 @@ mod tests {
             "assured forwarding needs the drop precedence shifted into its own bit — \
              upstream ALVR omits that shift and every AF mark it emits is wrong"
         );
+    }
+
+    // -- the resolved-link profile: the two axes, and which one wins ----------------
+
+    fn resolution(
+        class: LinkClass,
+        host_link: crate::host::HostLink,
+    ) -> crate::host::LinkResolution {
+        crate::host::LinkResolution {
+            peer: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            local_ip: None,
+            adapter: None,
+            host_link,
+            class,
+            wlan: None,
+        }
+    }
+
+    #[test]
+    fn the_host_axis_decides_the_wlan_posture_not_the_class() {
+        use crate::host::HostLink;
+
+        // A wired host must not touch the radio, whatever class won the negotiation.
+        for class in &ALL {
+            let wired = profile_for_resolution(&resolution(class.clone(), HostLink::Ethernet));
+            assert_eq!(
+                wired.wlan,
+                WlanPosture::off(),
+                "{class:?} on a wired host must leave the adapter alone"
+            );
+        }
+
+        // And a wireless host must have it applied even for the class that used to say
+        // "never touch the radio" — because that class is about the client's link and says
+        // nothing about the host's.
+        let wireless = profile_for_resolution(&resolution(
+            LinkClass::UsbNcm,
+            crate::host::HostLink::Wireless,
+        ));
+        assert_eq!(wireless.wlan, WlanPosture::streaming());
+    }
+
+    #[test]
+    fn unknown_host_is_permissive_about_the_posture() {
+        // The safety argument: an over-eager posture costs nothing because the optimizer
+        // reports "no connected WLAN interface" and stops.
+        let unknown = profile_for_resolution(&resolution(
+            LinkClass::Wifi7Lan,
+            crate::host::HostLink::Unknown,
+        ));
+        assert_eq!(unknown.wlan, WlanPosture::streaming());
+    }
+
+    #[test]
+    fn a_non_gigabit_wire_caps_what_we_plan_to_carry() {
+        use crate::host::HostLink;
+
+        let fast = profile_for_resolution(&resolution(LinkClass::UsbNcm, HostLink::Ethernet));
+        let slow = profile_for_resolution(&resolution(LinkClass::UsbNcm, HostLink::NotGigabit));
+        assert_eq!(slow.expected_throughput_mbps, 90);
+        assert!(slow.expected_throughput_mbps < fast.expected_throughput_mbps);
+        assert!(
+            slow.contended,
+            "a 100 Mbit path is a constraint worth flagging"
+        );
+
+        // And it must never *raise* a class that was already lower than the wire.
+        let already_low =
+            profile_for_resolution(&resolution(LinkClass::Wifi6Lan, HostLink::NotGigabit));
+        assert!(already_low.expected_throughput_mbps <= 90);
+    }
+
+    #[test]
+    fn a_loopback_peer_is_not_pessimised_as_a_link() {
+        // The loopback client ("client.wired", WIRED_CLIENT_HOSTNAME) is how the local test
+        // clients connect. It is not on a wire and not on a radio, so none of the reasoning
+        // applies — and if it were treated as a 100 Mbit path the harness would silently be
+        // measuring a different product than the one that ships.
+        let local = profile_for_resolution(&resolution(
+            LinkClass::Other("local".into()),
+            crate::host::HostLink::Local,
+        ));
+        assert_eq!(
+            local.wlan,
+            WlanPosture::off(),
+            "loopback is not on the radio"
+        );
+        assert!(!local.contended);
+        assert_eq!(local.jitter_buffer_frames, 1);
+        assert_eq!(local.expected_throughput_mbps, 1000);
+    }
+
+    #[test]
+    fn resolve_marks_a_loopback_peer_as_local() {
+        let r = crate::host::resolve(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(r.host_link, crate::host::HostLink::Local);
+        assert_eq!(r.class, LinkClass::Other("local".into()));
+        assert!(r.wlan.is_none());
+        assert!(r.summary().contains("host local"), "{}", r.summary());
+    }
+
+    #[test]
+    fn merging_only_ever_moves_in_the_conservative_direction() {
+        use crate::host::HostLink;
+
+        for class in &ALL {
+            let radio = profile_for(class);
+            for host in [
+                HostLink::Ethernet,
+                HostLink::NotGigabit,
+                HostLink::Wireless,
+                HostLink::Unknown,
+            ] {
+                let merged = profile_for_resolution(&resolution(class.clone(), host));
+                assert!(
+                    merged.expected_throughput_mbps <= radio.expected_throughput_mbps,
+                    "{class:?}/{host:?}: the merge raised the planned throughput"
+                );
+                assert!(
+                    merged.jitter_buffer_frames >= radio.jitter_buffer_frames.min(2)
+                        || host == HostLink::Ethernet,
+                    "{class:?}/{host:?}: the merge dropped buffering below what the radio asked for"
+                );
+                if radio.contended {
+                    assert!(
+                        merged.contended,
+                        "{class:?}/{host:?}: the merge un-flagged a contended radio"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_is_marked_on_every_resolved_link() {
+        use crate::host::HostLink;
+
+        for class in &ALL {
+            for host in [
+                HostLink::Ethernet,
+                HostLink::NotGigabit,
+                HostLink::Wireless,
+                HostLink::Unknown,
+            ] {
+                assert_eq!(
+                    profile_for_resolution(&resolution(class.clone(), host)).dscp,
+                    Dscp::ExpeditedForwarding,
+                    "{class:?}/{host:?}"
+                );
+            }
+        }
     }
 }

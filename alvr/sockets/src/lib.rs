@@ -77,20 +77,37 @@ fn set_socket_buffers(socket: &socket2::Socket, buffer_config: SocketBufferConfi
     Ok(())
 }
 
-fn set_dscp(socket: &Socket, dscp: Option<DscpTos>) {
+/// The 6-bit DSCP for a settings value, as the DS field byte the socket takes.
+///
+/// Pulled out of [`set_dscp`] so it can be tested, which is the point: this arithmetic was
+/// wrong for as long as it was inline and unexercised. Two defects, both fixed here and in
+/// `DropProbability`:
+///
+/// * `DropProbability` held `0x10` and `0x11` for `Medium`/`High` — hex literals where
+///   binary ones were meant. As `u8`, `Medium` was **16**, so OR-ing it in landed on top of
+///   the class field.
+/// * The drop precedence was never shifted into its own bit. The IETF value for assured
+///   forwarding is `class * 8 + drop * 2` (AF11 = 10, AF13 = 14), so the precedence needs a
+///   `<< 1`; without it even the `Low` case was one off (9 instead of 10).
+///
+/// With both fixed, `class` 1–4 and `drop` 1–3 produce the documented DSCP values.
+fn dscp_to_tos(dscp: DscpTos) -> u8 {
     // https://en.wikipedia.org/wiki/Differentiated_services
-    if let Some(dscp) = dscp {
-        let tos = match dscp {
-            DscpTos::BestEffort => 0,
-            DscpTos::ClassSelector(precedence) => precedence << 3,
-            DscpTos::AssuredForwarding {
-                class,
-                drop_probability,
-            } => (class << 3) | drop_probability as u8,
-            DscpTos::ExpeditedForwarding => 0b101110,
-        };
+    match dscp {
+        DscpTos::BestEffort => 0,
+        DscpTos::ClassSelector(precedence) => (precedence & 0b111) << 3,
+        DscpTos::AssuredForwarding {
+            class,
+            drop_probability,
+        } => ((class & 0b111) << 3) | ((drop_probability as u8 & 0b11) << 1),
+        DscpTos::ExpeditedForwarding => 0b101110,
+    }
+}
 
-        socket.set_tos_v4((tos << 2) as u32).ok();
+fn set_dscp(socket: &Socket, dscp: Option<DscpTos>) {
+    if let Some(dscp) = dscp {
+        // `set_tos_v4` takes the DS *field*, i.e. the 6-bit DSCP shifted up by two.
+        socket.set_tos_v4((dscp_to_tos(dscp) << 2) as u32).ok();
     }
 }
 
@@ -264,5 +281,73 @@ impl SocketConnection {
 
     pub fn recv_poll(&mut self) -> ConResult<()> {
         self.stream_socket.recv()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alvr_session::DropProbability;
+
+    #[test]
+    fn dscp_values_match_the_ietf_classes() {
+        assert_eq!(dscp_to_tos(DscpTos::BestEffort), 0);
+        assert_eq!(dscp_to_tos(DscpTos::ClassSelector(5)), 40); // CS5
+        assert_eq!(dscp_to_tos(DscpTos::ExpeditedForwarding), 46); // EF
+
+        // The three assured-forwarding precedences of class 1: AF11, AF12, AF13.
+        for (label, drop, expected) in [
+            ("low", DropProbability::Low, 10),
+            ("medium", DropProbability::Medium, 12),
+            ("high", DropProbability::High, 14),
+        ] {
+            assert_eq!(
+                dscp_to_tos(DscpTos::AssuredForwarding {
+                    class: 1,
+                    drop_probability: drop,
+                }),
+                expected,
+                "AF1x with {label} precedence"
+            );
+        }
+
+        assert_eq!(
+            dscp_to_tos(DscpTos::AssuredForwarding {
+                class: 4,
+                drop_probability: DropProbability::High,
+            }),
+            38,
+            "AF43 = 4*8 + 3*2"
+        );
+    }
+
+    #[test]
+    fn the_drop_precedence_never_touches_the_class_bits() {
+        // The regression that motivated pulling this out: a precedence value that is not
+        // masked into its own bits corrupts the class. Every combination must land on the
+        // arithmetic, not merely on something in range.
+        for class in 1..=4u8 {
+            for (drop, drop_bits) in [
+                (DropProbability::Low, 1u8),
+                (DropProbability::Medium, 2),
+                (DropProbability::High, 3),
+            ] {
+                let value = dscp_to_tos(DscpTos::AssuredForwarding {
+                    class,
+                    drop_probability: drop,
+                });
+                assert_eq!(value, class * 8 + drop_bits * 2);
+                assert_eq!(value >> 3, class, "class bits changed by the precedence");
+            }
+        }
+    }
+
+    #[test]
+    fn the_ds_field_is_the_dscp_shifted_up_by_two() {
+        // `set_tos_v4` wants the field, not the code point: EF (46) becomes 184.
+        assert_eq!(
+            (dscp_to_tos(DscpTos::ExpeditedForwarding) << 2) as u32,
+            0b1011_1000
+        );
     }
 }

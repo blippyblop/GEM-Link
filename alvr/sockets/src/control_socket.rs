@@ -1,9 +1,9 @@
 use crate::{CONTROL_PORT, LOCAL_IP};
-use socket2::Socket;
 use alvr_common::{ConResult, HandleTryAgain, ToCon, anyhow::Result, con_bail};
 use alvr_session::{DscpTos, SocketBufferConfig};
 use bincode::config;
 use serde::{Serialize, de::DeserializeOwned};
+use socket2::Socket;
 use std::{
     io::{Read, Write},
     marker::PhantomData,

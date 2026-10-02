@@ -589,16 +589,37 @@ fn connection_pipeline(
 
     let initial_settings = session_manager_lock.settings().clone();
 
+    // Resolve what this link actually is, once, and drive everything link-shaped from it:
+    // the QoS posture, the WLAN optimizer, and host scheduling. The resolution is logged
+    // in full because it is its own instrument — if the posture looks wrong later, this
+    // line says what we thought the link was and why.
+    let link = x_link::resolve(client_ip);
+    let link_profile = x_link::profile_for_resolution(&link);
+    info!(
+        "Link resolved: {} -> wlan posture media_streaming={} background_scan={}, \
+         planned {} Mbps, dscp {:?}, jitter buffer {} frames",
+        link.summary(),
+        link_profile.wlan.media_streaming,
+        link_profile.wlan.background_scan,
+        link_profile.expected_throughput_mbps,
+        link_profile.dscp,
+        link_profile.jitter_buffer_frames,
+    );
+
     // Hold the PC's Wi-Fi adapter in streaming posture for exactly as long as this
-    // connection lives: the guard restores the adapter when it drops, and it is dropped
-    // on every return path out of this function, including a failed handshake.
+    // connection lives: the guard restores the adapter when it drops, and it is dropped on
+    // every return path out of this function, including a failed handshake.
     //
-    // This is the one link-layer action that has no upstream equivalent; it is ported
-    // from Virtual Desktop, whose `OptimizeWLAN` drives
-    // `wlan_intf_opcode_media_streaming_mode` and `wlan_intf_opcode_background_scan_enabled`
-    // on every connected WLAN interface (VD_RE/24-vd-link-qos.md).
-    let _wlan_session = if initial_settings.connection.wlan_optimizer {
-        match x_link::WlanSession::start(x_link::WlanPosture::streaming()) {
+    // This is the one link-layer action that has no upstream equivalent; it is ported from
+    // Virtual Desktop, whose `OptimizeWLAN` drives `wlan_intf_opcode_media_streaming_mode`
+    // and `wlan_intf_opcode_background_scan_enabled` on every connected WLAN interface
+    // (VD_RE/24-vd-link-qos.md).
+    //
+    // Whether to do it at all is *the resolved link's* decision, not the negotiated class's:
+    // the honest condition is "the interface that reaches this client is wireless".
+    let _wlan_session = if initial_settings.connection.wlan_optimizer && !link_profile.wlan.is_off()
+    {
+        match x_link::WlanSession::start(link_profile.wlan) {
             Ok(session) => Some(session),
             Err(e) => {
                 // Not an error worth failing a session over: a wired-only machine has no
@@ -611,6 +632,12 @@ fn connection_pipeline(
     } else {
         None
     };
+
+    // Scheduling is process-wide and is restored on drop for the same reason.
+    let _scheduler = initial_settings
+        .connection
+        .host_scheduling
+        .then(x_link::HostScheduler::start);
 
     fn get_view_res(config: FrameSize, default_res: UVec2) -> UVec2 {
         let res = match config {

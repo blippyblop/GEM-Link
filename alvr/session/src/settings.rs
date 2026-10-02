@@ -1502,15 +1502,29 @@ This could happen on TCP. A IDR frame is requested in this case."#
                 without a WLAN control API."
     ))]
     pub wlan_optimizer: bool,
+
+    #[schema(strings(
+        display_name = "Real-time host scheduling",
+        help = "While a session runs, raise this process's scheduling priority, opt out of \
+                Windows power throttling (EcoQoS), and request a 1 ms timer resolution. \
+                Without the timer the scheduler tick is 15.6 ms, so every wait in the send \
+                and pacing paths is quantised to a whole frame interval at 90 Hz. The timer \
+                is released when the session ends; the priority is not, deliberately (see \
+                x-link::sched)."
+    ))]
+    pub host_scheduling: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
 #[repr(u8)]
 #[schema(gui = "button_group")]
 pub enum DropProbability {
-    Low = 0x01,
-    Medium = 0x10,
-    High = 0x11,
+    // Binary literals, written as such. `Medium` was `0x10` — sixteen, not two — which put
+    // a bit inside the assured-forwarding class field and made every AF marking wrong. See
+    // `alvr_sockets`'s `dscp_to_tos` and its tests.
+    Low = 0b01,
+    Medium = 0b10,
+    High = 0b11,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
@@ -2227,7 +2241,13 @@ pub fn session_settings_default() -> SettingsDefault {
             stream_port: 9944,
             osc_local_port: 9942,
             dscp: OptionalDefault {
-                set: false,
+                // On by default: the media path is the one flow on the machine that is
+                // genuinely latency-critical, and marking it is free. `ExpeditedForwarding`
+                // is what the IETF recommends for real-time media (RFC 4594), and on a home
+                // LAN it at least lands the datagrams in the adapter's voice/video access
+                // category rather than best-effort. It is a hint the network may ignore,
+                // never a guarantee.
+                set: true,
                 content: DscpTosDefault {
                     ClassSelector: 7,
                     AssuredForwarding: DscpTosAssuredForwardingDefault {
@@ -2245,6 +2265,7 @@ pub fn session_settings_default() -> SettingsDefault {
             avoid_video_glitching: false,
             minimum_idr_interval_ms: 100,
             wlan_optimizer: true,
+            host_scheduling: true,
             enable_on_connect_script: false,
             enable_on_disconnect_script: false,
             allow_untrusted_http: false,
