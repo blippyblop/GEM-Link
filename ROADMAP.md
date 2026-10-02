@@ -33,6 +33,13 @@ every other number.
 
 - **Mandatory gate — 90 Hz:** **0 %** of frames may miss one 90 Hz frame interval,
   **1000/90 ms = 11.11 ms**.
+- **Mandatory gate — never show a bogus frame** ([ADR-0011](docs/adr/ADR-0011-never-show-an-untrusted-frame.md)):
+  **0 %** of displayed frames may be frames the client could not reconstruct, at
+  **any** source frame rate and **any** induced loss. Holding and reprojecting the
+  last good frame is the permitted response; displaying a grey or otherwise
+  unfit frame is not. Counted separately from the 90 Hz gate, because a frame can
+  be both on time and worthless — which is exactly how this defect hid for a
+  session behind a "0 errors" telemetry line.
 - **Published target — 120 Hz:** **1000/120 ms = 8.33 ms**; tracked and trended, not
   enforced (`within_optimal_pct`).
 - **Secondary:** absolute latency minimized — p50 / p95 / p99 trended downward.
@@ -132,5 +139,6 @@ hardware test — never an opinion. Status is per 2026-10-01.
 `main` stays shippable; a release every 6–8 weeks from M1 (the anti-ALVR lesson). Revisit triggers per ADR-0002.
 
 ## Known coverage gaps (fix these, they undermine the gates)
+- **Nothing measures trustworthiness of a displayed frame.** The client reported "0 errors, 0 skipped" while 41 % of the frames it displayed were HEVC reconstruction garbage from dropped references (ADR-0011). Until "frames displayed that could not be reconstructed" is counted, the never-show-a-bogus-frame gate has no instrument.
 - **CI builds neither `client_core` nor the harnesses** (`x-framesim`, `x-pcsim`) — "main stays shippable" and "measured, not vibes" both have a hole exactly where the newest code lives.
 - **No glass-to-glass measurement exists** (no shared clock between PC and client), so DoD #3's field bar is **⛔ blocked on hardware** and every "is it good enough vs X" question is currently unanswerable. See `docs/BENCH.md` §"Not yet measured".
