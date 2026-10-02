@@ -22,6 +22,9 @@
 //   GEMLINK_GREYDIR   directory for images (and implies the CSV is written there)
 //   GEMLINK_GREYMAX   max images to write, total (default 120)
 
+#include <d3d11.h>
+#include <wrl.h>
+
 #include "alvr_server/openvr_driver_wrap.h"
 
 #include <algorithm>
@@ -378,7 +381,7 @@ private:
     size_t m_max = 120;
     size_t m_written = 0;
     std::FILE *m_file = nullptr;
-    ComPtr<ID3D11Texture2D> m_staging;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging;
     UINT m_w = 0;
     UINT m_h = 0;
     DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
