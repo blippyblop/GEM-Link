@@ -900,10 +900,16 @@ bool FrameRender::RenderFrame(
 
     if (enableFFE) {
         m_ffr->Render(targetTimestampNs);
+        if (greyprobe::Probe::Instance().Enabled()) {
+            GreyProbeStage(m_pD3DRender, m_pStagingTexture.Get(), targetTimestampNs, "ffr");
+        }
     }
 
     if (Settings_Instance()->m_enableHdr) {
         m_yuvPipeline->Render();
+        if (greyprobe::Probe::Instance().Enabled()) {
+            GreyProbeStage(m_pD3DRender, m_pStagingTexture.Get(), targetTimestampNs, "yuv");
+        }
     }
 
     if (greyprobe::Probe::Instance().Enabled()) {

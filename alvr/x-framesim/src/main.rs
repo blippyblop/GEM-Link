@@ -649,7 +649,11 @@ fn main() {
         default_view_resolution: view_resolution,
         max_view_resolution: view_resolution,
         refresh_rates: refresh_rates.clone(),
-        foveated_encoding: true,
+        // The streamer only enables foveated encoding if the client advertises
+        // the capability (or the setting forces it), so this is a one-word way to
+        // run the same rig with FFR on or off — no settings edit, and therefore no
+        // invalidated restart hash and no wasted connection cycle.
+        foveated_encoding: std::env::var("FRAMESIM_FOVEATED").map_or(true, |v| v != "0"),
         encoder_high_profile: true,
         encoder_10_bits: false,
         encoder_av1: false,
