@@ -4,30 +4,31 @@
 
 Basically someone else already made what I was trying to put together; and chances are they actually have a device already. I'll use this project as a dump project for tokens since it'd be cool to get an open source project for this; also if FRAME STREAM is closed source this project will keep moving but priority will be low as functionality is the primary focus. 
 
-*A free, open, non-commercial PC-VR streaming stack, rebuilt ground-up with the **Steam Frame** as its first-class device — game **and** desktop streaming from Windows, virtual displays, gaze-driven foveated encoding, and a single-minded obsession with the latency **tail**. Built on [ALVR](https://github.com/alvr-org/ALVR), licensed [MIT](LICENSE) — do what you want, attribution included.*
+Goal for this project is to take inspiration from what already works and build it into a framework that can have other ideas applied. Take what works; use it. Take ideas, try them. 
 
-No ads. No tiers. No telemetry. Encryption always on.
+Focus is user experience and streaming usability. Latency is the primary bottleneck, but image quality, what happens when packets are lost, audio fidelity, controller and desktop-streaming use; basically the goal is to make this into not only software that's worth using, but the best software to use. 
+
+Built on [ALVR](https://github.com/alvr-org/ALVR), licensed [MIT](LICENSE). Thanks to the ALVR project fr fr but the changes I want are so deep that folding them into ALVR mainline isn't feasible. 
 
 ## Target
 
-**Device:** Steam Frame (Qualcomm SM8650 / Adreno 750, 2160×2160 LCD per eye, panel 72–144 Hz; the gating envelope is 90–120 Hz; eye-tracking cameras). Render resolution is the **client's** call.
-**Links:** Wi-Fi 7 on 6 GHz (the Frame's own SoftAP + dongle, or LAN) · USB-C NCM wired.
-**Envelope:** 300 Mbps **with gaze-driven foveated encoding** — the flagship feature; fixed foveation the fallback. Decode is **HEVC/H.264** (the Frame kernel decodes neither AV1 nor 10-bit today).
-**North-star metric:** the **tail**, not the mean — **0 % of frames over the 90 Hz budget (1000/90 ms)**, the 120 Hz budget (1000/120 ms) as the published target, absolute latency minimized after that. Motion synthesis happens exactly once, at the client — never baked into the PC's encoded frame.
+<deleted AI rambling>
 
-Single source of truth for targets and gates: [ROADMAP.md](ROADMAP.md). What we are measured against: [docs/BAR.md](docs/BAR.md). How we measure: [docs/BENCH.md](docs/BENCH.md).
+Steam frame is the primary targeted device. Other devices I want to support, but I'll need the hardware for that.
 
-## Why this fork exists
-
-Upstream ALVR is a SteamVR driver maintained at a declining cadence (754→49 commits/yr, 445 commits unshipped past its last release). This project executes the ground-up rebuild upstream cannot absorb: a four-seam architecture (sources → transform → codec plug-ins → transport v2), desktop capture + virtual displays without SteamVR, encrypted frame-agnostic transport, and an open per-device policy engine. See [CHARTER.md](CHARTER.md), [ROADMAP.md](ROADMAP.md) and the [ADR log](docs/adr/).
+<more AI rambling>
 
 ## Status
 
-🚧 Pre-release. The **server half of the first shippable target works** — a real SteamVR game streams end-to-end through GemLink's `server_openvr` driver (2026-10-01); the Steam Frame client is the long pole and is next. See [ROADMAP.md](ROADMAP.md) and [docs/BAR.md](docs/BAR.md). Honest, bench-generated compatibility data: [COMPAT.md](COMPAT.md).
+IT FUCKING SUCKS. Development will slow for now but I would like to get this done.
+
+Seriously it's in 'emulated bench test' at the moment. Very cringe. 
 
 ## Bench & development
 
-Every feature lands with a measured scenario ([docs/BENCH.md](docs/BENCH.md)): frame-delivery tail (missed-deadline %), latency p50/p95/p99, SSIM at equal bitrate. PRs require a scenario. See [CONTRIBUTING.md](CONTRIBUTING.md).
+<more AI rambling>
+
+Benchmarks are being folded into development. IE; if there's latency, lag, missed or out of sequence delivery, it will be found and polished out. 
 
 ## Provenance & attribution
 
@@ -35,4 +36,14 @@ Built on ALVR (MIT) — see [NOTICE](NOTICE). Per-device presets are interoperab
 
 ## License
 
-MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) — do what you want, attribution included. Our builds are free forever — [funding policy](CHARTER.md#funding-policy).
+MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) — do what you want, attribution included. I don't know what this funding policy says.
+
+## Funding
+
+The AI slop machine wrote a policy but basically; this project will be free. But if I ever get it to a state where I'd actually want myself to use it let alone others I'll open a ko-fi so people can donate to token cost.
+
+[funding policy](CHARTER.md#funding-policy).
+
+## AI Disclaimer
+
+Yes I used a lot of AI to do this. I hate reading AI readmes though so this is all human written. The garbage language that the AIs shit out is so horrific I cannot subject people to it. It dumps garbage to documentation, then it reads its own fecal matter and keeps the language after that. Awful stuff.
