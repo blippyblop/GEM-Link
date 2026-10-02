@@ -66,7 +66,8 @@ struct Api {
     new_decoder: unsafe extern "C" fn() -> *mut DecoderCtx,
     free_decoder: unsafe extern "C" fn(*mut DecoderCtx) -> Error,
     start_worker_threads: unsafe extern "C" fn(*mut DecoderCtx, c_int) -> Error,
-    push_nal: unsafe extern "C" fn(*mut DecoderCtx, *const c_void, c_int, Pts, *mut c_void) -> Error,
+    push_nal:
+        unsafe extern "C" fn(*mut DecoderCtx, *const c_void, c_int, Pts, *mut c_void) -> Error,
     push_end_of_frame: unsafe extern "C" fn(*mut DecoderCtx),
     decode: unsafe extern "C" fn(*mut DecoderCtx, *mut c_int) -> Error,
     get_next_picture: unsafe extern "C" fn(*mut DecoderCtx) -> *const Image,
@@ -252,7 +253,10 @@ impl HevcDecoder {
     pub fn new(lib_path: &Path, threads: usize) -> Result<Self> {
         let api = Api::load(lib_path)?;
         let version = api.version_string();
-        println!("[framesim] libde265 {version} loaded from {}", lib_path.display());
+        println!(
+            "[framesim] libde265 {version} loaded from {}",
+            lib_path.display()
+        );
 
         let ctx = unsafe { (api.new_decoder)() };
         if ctx.is_null() {
@@ -261,7 +265,10 @@ impl HevcDecoder {
         if threads > 0 {
             let err = unsafe { (api.start_worker_threads)(ctx, threads as c_int) };
             if err != DE265_OK && unsafe { (api.is_ok)(err) } == 0 {
-                println!("[framesim] decode threads not started: {}", api.describe(err));
+                println!(
+                    "[framesim] decode threads not started: {}",
+                    api.describe(err)
+                );
             } else {
                 println!("[framesim] decode: {threads} worker thread(s)");
             }
@@ -290,7 +297,10 @@ impl HevcDecoder {
     pub fn push_config(&mut self, data: &[u8]) {
         self.saw_config = true;
         let n = self.push_stream(data, 0, "config");
-        println!("[framesim] decode: fed {n} config NAL(s) ({} bytes)", data.len());
+        println!(
+            "[framesim] decode: fed {n} config NAL(s) ({} bytes)",
+            data.len()
+        );
     }
 
     /// Whether the parameter sets have been fed yet. Video can arrive before the
@@ -367,7 +377,13 @@ impl HevcDecoder {
                 continue;
             }
             let err = unsafe {
-                (self.api.push_nal)(self.ctx, unit.as_ptr().cast(), unit.len() as c_int, pts_ns, std::ptr::null_mut())
+                (self.api.push_nal)(
+                    self.ctx,
+                    unit.as_ptr().cast(),
+                    unit.len() as c_int,
+                    pts_ns,
+                    std::ptr::null_mut(),
+                )
             };
             if err != DE265_OK && unsafe { (self.api.is_ok)(err) } == 0 {
                 self.errors += 1;

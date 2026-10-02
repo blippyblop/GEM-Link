@@ -43,11 +43,15 @@ mod png;
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
-    DeviceMotion, HEAD_ID, Pose, ViewParams,
+    CONTROLLER_PROFILE_INFO, DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID,
+    LEFT_THUMBSTICK_CLICK_ID, LEFT_THUMBSTICK_X_ID, LEFT_THUMBSTICK_Y_ID, LEFT_TRIGGER_VALUE_ID,
+    Pose, QUEST_CONTROLLER_PROFILE_ID, RIGHT_A_CLICK_ID, RIGHT_THUMBSTICK_X_ID,
+    RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID, ViewParams,
     glam::{Quat, UVec2, Vec3},
 };
-use alvr_packets::{FaceData, TrackingData};
+use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
 use std::{
+    collections::HashSet,
     fs::File,
     io::Write,
     path::{Path, PathBuf},
@@ -112,8 +116,12 @@ struct DecodeCfg {
 impl DecodeCfg {
     fn from_env() -> Self {
         let env_flag = |k: &str| std::env::var(k).is_ok_and(|v| v != "0" && !v.is_empty());
-        let env_u64 =
-            |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let env_u64 = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
         Self {
             enabled: env_flag("FRAMESIM_DECODE"),
             lib_path: std::env::var("FRAMESIM_LIBDE265")
@@ -234,9 +242,7 @@ impl DecodeState {
             }
             let rgb = frame.to_rgb8();
             let path = dir.join(format!("frame_{idx:06}.png"));
-            if let Err(e) =
-                png::write_rgb(&path, frame.width as u32, frame.height as u32, &rgb)
-            {
+            if let Err(e) = png::write_rgb(&path, frame.width as u32, frame.height as u32, &rgb) {
                 eprintln!("[framesim] PNG write failed for {}: {e}", path.display());
             }
         }
@@ -363,6 +369,15 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 /// poses even though it has no head.
 ///
 /// Rate matches the mock client's: a third of the frame rate.
+///
+/// Controllers are driven from here too (env `FRAMESIM_CONTROLLERS=0` to turn
+/// them off). Sending a *controller motion* for a hand is what makes the driver
+/// select the controller device over its separate hand-tracker twin:
+/// `server_openvr` sets `isHandTracker = use_separate_hand_trackers &&
+/// controller_motion.is_none() && hand_skeleton.is_some()`. With a motion and no
+/// skeleton, the controller wins and the hand tracker stays disconnected — which
+/// is the "has Touch controllers" state a game expects. With neither, SteamVR
+/// sees the device but never tracking, and HL2VR never gets hands.
 fn tracking_thread(ctx: Arc<ClientCoreContext>, streaming: Arc<AtomicBool>, origin: Instant) {
     ctx.send_view_params([ViewParams::DUMMY; 2]);
 
@@ -374,6 +389,13 @@ fn tracking_thread(ctx: Arc<ClientCoreContext>, streaming: Arc<AtomicBool>, orig
     // keeps the motion plausible.
     let mut lcg: u32 = 0x1234_5678;
 
+    let controllers = controllers_enabled();
+    // Buttons go at ~20 Hz rather than at the tracking rate: the server maps each
+    // entry and queues a driver event, so the tracking rate would be 270 Hz of
+    // input traffic for no gain.
+    let button_period = Duration::from_millis(50);
+    let mut next_buttons = Instant::now();
+
     let mut deadline = Instant::now();
     loop {
         if streaming.load(Ordering::SeqCst) {
@@ -383,29 +405,116 @@ fn tracking_thread(ctx: Arc<ClientCoreContext>, streaming: Arc<AtomicBool>, orig
             let t = origin.elapsed().as_secs_f32();
             let orientation = Quat::from_rotation_y(t * 0.5) * Quat::from_rotation_z(jitter);
 
-            ctx.send_tracking(TrackingData {
-                poll_timestamp: origin.elapsed(),
-                device_motions: vec![(
-                    *HEAD_ID,
+            let mut device_motions = vec![(
+                *HEAD_ID,
+                DeviceMotion {
+                    pose: Pose {
+                        orientation,
+                        // Standing height, so the pose is plausible rather
+                        // than at the floor origin.
+                        position: Vec3::new(0.0, 1.6, 0.0),
+                    },
+                    linear_velocity: Vec3::ZERO,
+                    angular_velocity: Vec3::ZERO,
+                },
+            )];
+
+            if controllers {
+                // Hands in front of the chest, drifting on different periods so
+                // each is separately identifiable in a decoded frame and neither
+                // looks frozen. Held in the head's frame: `send_tracking` poses
+                // are played back relative to the head pose, so this stays in
+                // front of the user as the head sweeps.
+                let lx = -0.22 + 0.08 * (t * 0.7).sin();
+                let ly = 1.10 + 0.05 * (t * 0.9).sin();
+                let rx = 0.22 + 0.08 * (t * 0.7).cos();
+                let ry = 1.10 + 0.05 * (t * 1.1).sin();
+
+                device_motions.push((
+                    *HAND_LEFT_ID,
                     DeviceMotion {
                         pose: Pose {
-                            orientation,
-                            // Standing height, so the pose is plausible rather
-                            // than at the floor origin.
-                            position: Vec3::new(0.0, 1.6, 0.0),
+                            orientation: Quat::from_rotation_x(-0.9),
+                            position: Vec3::new(lx, ly, -0.35),
                         },
                         linear_velocity: Vec3::ZERO,
                         angular_velocity: Vec3::ZERO,
                     },
-                )],
+                ));
+                device_motions.push((
+                    *HAND_RIGHT_ID,
+                    DeviceMotion {
+                        pose: Pose {
+                            orientation: Quat::from_rotation_x(-0.9),
+                            position: Vec3::new(rx, ry, -0.35),
+                        },
+                        linear_velocity: Vec3::ZERO,
+                        angular_velocity: Vec3::ZERO,
+                    },
+                ));
+            }
+
+            ctx.send_tracking(TrackingData {
+                poll_timestamp: origin.elapsed(),
+                device_motions,
                 hand_skeletons: [None, None],
                 face: FaceData::default(),
                 body: None,
             });
+
+            if controllers && Instant::now() >= next_buttons {
+                next_buttons = Instant::now() + button_period;
+                ctx.send_buttons(controller_buttons(t));
+            }
         }
         deadline += Duration::from_micros(FRAME_INTERVAL_US / 3);
         thread::sleep(deadline.saturating_duration_since(Instant::now()));
     }
+}
+
+/// Controller tracking is on by default: without it SteamVR registers the
+/// devices but never tracks them, so a game gets no hands at all. `=0` restores
+/// the pre-controller harness for A/B.
+fn controllers_enabled() -> bool {
+    std::env::var("FRAMESIM_CONTROLLERS").map_or(true, |v| v != "0")
+}
+
+/// A deterministic, always-moving input pattern so the button path is exercised
+/// and is obviously the harness rather than a stuck controller.
+///
+/// Both triggers sweep 0..1 on different periods, both thumbsticks describe a
+/// circle (so a game reading them sees smooth analog motion), and A / stick-click
+/// toggle as edges.
+fn controller_buttons(t: f32) -> Vec<ButtonEntry> {
+    let scalar = |path_id: u64, value: f32| ButtonEntry {
+        path_id,
+        value: ButtonValue::Scalar(value),
+    };
+    let binary = |path_id: u64, value: bool| ButtonEntry {
+        path_id,
+        value: ButtonValue::Binary(value),
+    };
+
+    vec![
+        scalar(*LEFT_TRIGGER_VALUE_ID, 0.5 + 0.5 * (t * 0.8).sin()),
+        scalar(*RIGHT_TRIGGER_VALUE_ID, 0.5 + 0.5 * (t * 1.3).cos()),
+        scalar(*LEFT_THUMBSTICK_X_ID, (t * 0.5).sin()),
+        scalar(*LEFT_THUMBSTICK_Y_ID, (t * 0.5).cos()),
+        scalar(*RIGHT_THUMBSTICK_X_ID, (t * 0.4).cos()),
+        scalar(*RIGHT_THUMBSTICK_Y_ID, (t * 0.4).sin()),
+        binary(*RIGHT_A_CLICK_ID, (t * 0.5).sin() > 0.0),
+        binary(*LEFT_THUMBSTICK_CLICK_ID, (t * 1.7).sin() > 0.0),
+    ]
+}
+
+/// The client's *active* input set, advertised so the streamer can build its
+/// button mapping table. The server's default emulation mode is Quest 2 Touch
+/// (`session.json`), so advertising the Quest profile makes the mapping a
+/// passthrough instead of a re-map. Returns `None` if the profile is unknown.
+fn quest_button_set() -> Option<HashSet<u64>> {
+    CONTROLLER_PROFILE_INFO
+        .get(&QUEST_CONTROLLER_PROFILE_ID)
+        .map(|info| info.button_set.clone())
 }
 
 fn main() {
@@ -483,6 +592,14 @@ fn main() {
         capabilities.encoder_10_bits,
     );
     println!("[framesim] advertising refresh rates {refresh_rates:?} at view {view_resolution}");
+    println!(
+        "[framesim] controllers: {}",
+        if controllers_enabled() {
+            "on (Quest profile, synthetic hands + moving buttons)"
+        } else {
+            "OFF (FRAMESIM_CONTROLLERS=0)"
+        }
+    );
 
     let ctx = Arc::new(ClientCoreContext::new(capabilities, vec![]));
 
@@ -558,7 +675,9 @@ fn main() {
     {
         let ctx_for_tracking = Arc::clone(&ctx);
         let streaming_for_tracking = Arc::clone(&streaming);
-        thread::spawn(move || tracking_thread(ctx_for_tracking, streaming_for_tracking, tracking_origin));
+        thread::spawn(move || {
+            tracking_thread(ctx_for_tracking, streaming_for_tracking, tracking_origin)
+        });
     }
 
     ctx.resume();
@@ -591,6 +710,29 @@ fn main() {
                         "[framesim] NEGOTIATED view={}x{} refresh={}Hz",
                         n.view_resolution.x, n.view_resolution.y, n.refresh_rate_hint,
                     );
+                    // The active interaction profile only means anything once
+                    // there is a control socket to carry it, which is why it is
+                    // sent here and not alongside the tracking thread's start.
+                    if controllers_enabled() {
+                        match quest_button_set() {
+                            Some(input_ids) => {
+                                for device_id in [*HAND_LEFT_ID, *HAND_RIGHT_ID] {
+                                    ctx.send_active_interaction_profile(
+                                        device_id,
+                                        *QUEST_CONTROLLER_PROFILE_ID,
+                                        input_ids.clone(),
+                                    );
+                                }
+                                println!(
+                                    "[framesim] controllers: Quest profile advertised ({} inputs) for both hands",
+                                    input_ids.len()
+                                );
+                            }
+                            None => eprintln!(
+                                "[framesim] controllers: Quest profile missing from CONTROLLER_PROFILE_INFO"
+                            ),
+                        }
+                    }
                     if want_frames == 0 {
                         println!("[framesim] M1 OK: negotiation completed");
                         exit(0);
@@ -757,14 +899,23 @@ fn report(
             centred[i],
             gap,
             s[i].size,
-            if s[i].size > median_size * 2 { "yes" } else { "" },
+            if s[i].size > median_size * 2 {
+                "yes"
+            } else {
+                ""
+            },
             s[i].header_ts.as_micros()
         );
     }
 
     // Is the tail explained by big frames (IDRs) rather than by the transport?
-    let outlier_idx: Vec<usize> = (0..n).filter(|&i| centred[i].abs() > DEADLINES_MS[0].0).collect();
-    let big = outlier_idx.iter().filter(|&&i| s[i].size > median_size * 2).count();
+    let outlier_idx: Vec<usize> = (0..n)
+        .filter(|&i| centred[i].abs() > DEADLINES_MS[0].0)
+        .collect();
+    let big = outlier_idx
+        .iter()
+        .filter(|&&i| s[i].size > median_size * 2)
+        .count();
     println!(
         "[framesim] {}/{} outliers are >2x median size ({} B); median frame {} B",
         big,

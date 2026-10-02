@@ -69,7 +69,11 @@ pub fn yuv420_to_rgb8(
     full_range: bool,
 ) -> Vec<u8> {
     // Scaling of the chroma difference, and of luma for the limited range.
-    let (kr, kb) = if matrix_709 { (0.2126, 0.0722) } else { (0.299, 0.114) };
+    let (kr, kb) = if matrix_709 {
+        (0.2126, 0.0722)
+    } else {
+        (0.299, 0.114)
+    };
     let (kr, kb) = (kr as f32, kb as f32);
     let kg = 1.0 - kr - kb;
 
