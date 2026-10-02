@@ -271,6 +271,29 @@ impl DecodeState {
         decoder.lock().map(|d| d.decoded > 0).unwrap_or(true)
     }
 
+    /// Per-picture content fingerprints, keyed by the sender's frame timestamp.
+    fn content_stats(&self) -> std::collections::HashMap<i64, libde265::ContentStat> {
+        self.decoder
+            .as_ref()
+            .and_then(|d| d.lock().ok().map(|d| d.content.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Classify one picture the same way the grey-frame work does: a real scene
+    /// has structure, the compositor's standby frame is a flat fill, and nothing
+    /// rendered is black.
+    fn classify(st: &libde265::ContentStat) -> &'static str {
+        if st.tile_std >= 25.0 {
+            "content"
+        } else if st.mean < 20.0 {
+            "black"
+        } else if (st.mean - 128.0).abs() < 4.0 && st.tile_std < 10.0 {
+            "grey"
+        } else {
+            "other"
+        }
+    }
+
     fn print_stats(&self) {
         let Some(decoder) = &self.decoder else {
             return;
@@ -303,6 +326,23 @@ impl DecodeState {
                 "[framesim]   coherency: mean luma delta {mean:.2} between consecutive pictures \
                  (max {max:.2}); {similar}/{count} pairs near-identical"
             );
+        }
+        if !d.content.is_empty() {
+            let mut counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for st in d.content.values() {
+                *counts.entry(Self::classify(st)).or_default() += 1;
+            }
+            let total = counts.values().sum::<usize>().max(1);
+            let mut sorted: Vec<_> = counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("[framesim]   EXACT content over all {total} decoded pictures:");
+            for (class, count) in &sorted {
+                println!(
+                    "[framesim]     {class:<10} {count:>6}  ({:.1}%)",
+                    100.0 * *count as f64 / total as f64
+                );
+            }
         }
     }
 }
@@ -813,7 +853,7 @@ fn main() {
         }
 
         if want_frames > 0 && frames.load(Ordering::SeqCst) >= want_frames {
-            let code = report(&samples, &bytes, &fov, start);
+            let code = report(&samples, &bytes, &fov, &decode, start);
             decode.print_stats();
             exit(code);
         }
@@ -837,6 +877,7 @@ fn report(
     samples: &Arc<Mutex<Vec<Sample>>>,
     bytes: &Arc<AtomicUsize>,
     fov: &Arc<Mutex<Vec<[[f32; 2]; 2]>>>,
+    decode: &Arc<DecodeState>,
     start: Instant,
 ) -> i32 {
     let s = match samples.lock() {
@@ -963,24 +1004,64 @@ fn report(
     if let Ok(path) = std::env::var("FRAMESIM_CSV") {
         match File::create(&path) {
             Ok(mut f) => {
-                let _ = writeln!(f, "idx,header_ts_us,size_bytes,dev_ms,gap_ms");
+                let content = decode.content_stats();
+                let _ = writeln!(
+                    f,
+                    "idx,header_ts_us,size_bytes,dev_ms,gap_ms,mean_luma,luma_std,tile_std,class"
+                );
+                let mut counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                let mut missing = 0usize;
                 for i in 0..n {
                     let gap = if i == 0 {
                         0.0
                     } else {
                         s[i].at.duration_since(s[i - 1].at).as_secs_f64() * 1e3
                     };
+                    let key = s[i].header_ts.as_nanos() as i64;
+                    let (mean, std, tile, class) = match content.get(&key) {
+                        Some(st) => (
+                            format!("{:.2}", st.mean),
+                            format!("{:.2}", st.std),
+                            format!("{:.2}", st.tile_std),
+                            DecodeState::classify(st),
+                        ),
+                        None => {
+                            missing += 1;
+                            ("".into(), "".into(), "".into(), "undecoded")
+                        }
+                    };
+                    *counts.entry(class).or_default() += 1;
                     let _ = writeln!(
                         f,
-                        "{},{},{},{:.3},{:.3}",
+                        "{},{},{},{:.3},{:.3},{},{},{},{}",
                         i,
                         s[i].header_ts.as_micros(),
                         s[i].size,
                         centred[i],
-                        gap
+                        gap,
+                        mean,
+                        std,
+                        tile,
+                        class
                     );
                 }
+                let total = counts.values().sum::<usize>().max(1);
+                let mut sorted: Vec<_> = counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
                 println!("[framesim] per-frame CSV written to {path}");
+                println!(
+                    "[framesim] EXACT content over all {total} received frames (not sampled):"
+                );
+                for (class, count) in &sorted {
+                    println!(
+                        "[framesim]   {class:<10} {count:>6}  ({:.1}%)",
+                        100.0 * *count as f64 / total as f64
+                    );
+                }
+                if missing > 0 {
+                    println!("[framesim]   ({missing} frames had no decoded picture to fingerprint)");
+                }
             }
             Err(e) => eprintln!("[framesim] could not write CSV {path}: {e}"),
         }

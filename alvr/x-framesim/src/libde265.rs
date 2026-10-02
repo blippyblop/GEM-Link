@@ -216,6 +216,79 @@ impl Frame {
             self.full_range,
         )
     }
+
+    /// Content fingerprint of this picture, on the luma plane.
+    pub fn content(&self) -> ContentStat {
+        ContentStat::of(self)
+    }
+}
+
+/// A cheap content fingerprint of one decoded picture.
+///
+/// This exists because the grey-frame rate was being reported from captures that
+/// wrote one PNG in 20 (or one in 40), which cannot resolve it — the user
+/// eyeballing a run and counting ~27 of 30 grey is a measurement the sampling was
+/// not capable of contradicting. Counting properly costs nothing here: the
+/// picture is already in memory.
+///
+/// `tile_std` is the standard deviation of 8x8 tile means. It separates a real
+/// scene (tens) from a flat fill (near zero) far more robustly than a whole-frame
+/// luma `std`, which per-pixel coding noise alone can push to double digits.
+#[derive(Clone)]
+pub struct ContentStat {
+    pub mean: f64,
+    pub std: f64,
+    pub tile_std: f64,
+}
+
+impl ContentStat {
+    pub fn of(frame: &Frame) -> Self {
+        let (w, h, stride) = (frame.width, frame.height, frame.y_stride);
+        let n = (w * h).max(1) as f64;
+
+        let mut sum = 0f64;
+        let mut sum_sq = 0f64;
+        for y in 0..h {
+            let row = &frame.y[y * stride..y * stride + w];
+            for &v in row {
+                let v = f64::from(v);
+                sum += v;
+                sum_sq += v * v;
+            }
+        }
+        let mean = sum / n;
+        let std = (sum_sq / n - mean * mean).max(0.0).sqrt();
+
+        // 8x8 tile means, ignoring any remainder at the right/bottom edge.
+        let (tw, th) = (w / 8, h / 8);
+        let mut tile_sum = 0f64;
+        let mut tile_sq = 0f64;
+        let mut tiles = 0f64;
+        for ty in 0..th {
+            for tx in 0..tw {
+                let mut s = 0f64;
+                for y in ty * 8..ty * 8 + 8 {
+                    let base = y * stride + tx * 8;
+                    for &v in &frame.y[base..base + 8] {
+                        s += f64::from(v);
+                    }
+                }
+                let m = s / 64.0;
+                tile_sum += m;
+                tile_sq += m * m;
+                tiles += 1.0;
+            }
+        }
+        let tiles = tiles.max(1.0);
+        let tmean = tile_sum / tiles;
+        let tile_std = (tile_sq / tiles - tmean * tmean).max(0.0).sqrt();
+
+        Self {
+            mean,
+            std,
+            tile_std,
+        }
+    }
 }
 
 pub struct HevcDecoder {
@@ -236,6 +309,11 @@ pub struct HevcDecoder {
     /// number; a broken reference chain (missing frames, or parameter sets fed
     /// mid-stream) gives one as large as two unrelated pictures. This is the
     /// metric that says "the pixels are real *and* in the right order".
+    /// Per-picture content fingerprints, keyed by the sender's frame timestamp
+    /// (`pts_ns`), so they can be joined to the per-frame CSV. Keyed rather than
+    /// indexed because the picture count is not the frame count — config NALs
+    /// also yield pictures.
+    pub content: std::collections::HashMap<i64, ContentStat>,
     prev_luma: Option<Vec<u8>>,
     cmp_count: u64,
     cmp_sum: f64,
@@ -284,6 +362,7 @@ impl HevcDecoder {
             last_error: None,
             saw_config: false,
             logged_geometry: AtomicBool::new(false),
+            content: std::collections::HashMap::new(),
             prev_luma: None,
             cmp_count: 0,
             cmp_sum: 0.0,
@@ -312,6 +391,10 @@ impl HevcDecoder {
 
     /// Track how much consecutive decoded pictures differ, on the luma plane.
     fn note_coherence(&mut self, frame: &Frame) {
+        // Content fingerprint for *every* picture, before any early return: this
+        // is what makes the grey fraction exact rather than sampled.
+        self.content.insert(frame.pts_ns, frame.content());
+
         let (Some(prev), len) = (self.prev_luma.as_ref(), frame.y.len()) else {
             self.prev_luma = Some(frame.y.clone());
             return;
