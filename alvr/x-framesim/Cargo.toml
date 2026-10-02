@@ -17,4 +17,6 @@ alvr_packets.workspace = true
 alvr_session.workspace = true
 alvr_system_info.workspace = true
 env_logger = "0.11"
+flate2 = "1"
+libloading = "0.8"
 log = "0.4"

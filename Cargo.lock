@@ -8412,6 +8412,8 @@ dependencies = [
  "alvr_session",
  "alvr_system_info",
  "env_logger",
+ "flate2",
+ "libloading 0.8.9",
  "log",
 ]
 

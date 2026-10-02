@@ -18,6 +18,28 @@
 //! `idx,header_ts_us,size_bytes,dev_ms,gap_ms` — so a run can be joined against
 //! the streamer's own per-frame trace on `header_ts_us`. Without that join, a
 //! budget miss is just a number with no cause.
+//!
+//! ## Emulated prototype mode (env `FRAMESIM_DECODE=1`)
+//!
+//! Turns the null decoder into a **real** one (libde265, loaded at runtime) so
+//! the harness can prove the whole client side end to end: real streamer →
+//! real HEVC → real pixels. Decode goes through the *public* client_core decoder
+//! API, so `client_core` is untouched.
+//!
+//!   FRAMESIM_DECODE=1              decode received access units
+//!   FRAMESIM_LIBDE265=<path>       decoder library (default `libde265.so.0`)
+//!   FRAMESIM_DECODE_THREADS=N      decoder worker threads (default 4)
+//!   FRAMESIM_PNG_DIR=<dir>         write decoded frames as PNG
+//!   FRAMESIM_PNG_EVERY=N           write every Nth decoded frame (default 1)
+//!   FRAMESIM_PNG_MAX=N             stop writing after N files (0 = all)
+//!   FRAMESIM_DUMP_NALS=<file>      also dump raw access units (u32 LE length
+//!                                  prefix), so a real bitstream can be kept as
+//!                                  a regression fixture
+//!
+//! libde265 is LGPL-3: **harness only**, never linked into shipped code.
+
+mod libde265;
+mod png;
 
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
@@ -28,6 +50,7 @@ use alvr_packets::{FaceData, TrackingData};
 use std::{
     fs::File,
     io::Write,
+    path::{Path, PathBuf},
     process::exit,
     sync::{
         Arc, Mutex,
@@ -72,6 +95,253 @@ fn frame_target() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+/// Emulated-prototype decode settings, all env-driven so the same binary is both
+/// the transport harness and the emulated client.
+struct DecodeCfg {
+    enabled: bool,
+    lib_path: PathBuf,
+    threads: usize,
+    png_dir: Option<PathBuf>,
+    png_every: u64,
+    png_max: u64,
+    dump_nals: Option<PathBuf>,
+}
+
+impl DecodeCfg {
+    fn from_env() -> Self {
+        let env_flag = |k: &str| std::env::var(k).is_ok_and(|v| v != "0" && !v.is_empty());
+        let env_u64 =
+            |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        Self {
+            enabled: env_flag("FRAMESIM_DECODE"),
+            lib_path: std::env::var("FRAMESIM_LIBDE265")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("libde265.so.0")),
+            threads: env_u64("FRAMESIM_DECODE_THREADS", 4) as usize,
+            png_dir: std::env::var("FRAMESIM_PNG_DIR").ok().map(PathBuf::from),
+            png_every: env_u64("FRAMESIM_PNG_EVERY", 1).max(1),
+            png_max: env_u64("FRAMESIM_PNG_MAX", 0),
+            dump_nals: std::env::var("FRAMESIM_DUMP_NALS").ok().map(PathBuf::from),
+        }
+    }
+}
+
+/// Everything the decode path needs, behind one `Arc` so the decoder-input
+/// callback (connection thread) and the event loop (main thread) share it.
+struct DecodeState {
+    decoder: Option<Mutex<libde265::HevcDecoder>>,
+    /// Parameter sets from `ClientCoreEvent::DecoderConfig`. Held here because
+    /// video can arrive before the event loop has polled that event.
+    csd: Mutex<Option<Vec<u8>>>,
+    dump: Option<Mutex<File>>,
+    png_dir: Option<PathBuf>,
+    png_every: u64,
+    png_max: u64,
+    png_written: AtomicUsize,
+    decode_ns: AtomicUsize,
+    reported: AtomicUsize,
+}
+
+impl DecodeState {
+    fn new(cfg: &DecodeCfg) -> Self {
+        let decoder = if cfg.enabled {
+            match libde265::HevcDecoder::new(&cfg.lib_path, cfg.threads) {
+                Ok(d) => Some(Mutex::new(d)),
+                Err(e) => {
+                    eprintln!("[framesim] FRAMESIM_DECODE=1 but no decoder: {e}");
+                    exit(4);
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(dir) = &cfg.png_dir {
+            let _ = std::fs::create_dir_all(dir);
+            println!("[framesim] decoded frames -> {}", dir.display());
+        }
+
+        let dump = cfg.dump_nals.as_ref().and_then(|p| match File::create(p) {
+            Ok(f) => {
+                println!("[framesim] dumping access units -> {}", p.display());
+                Some(Mutex::new(f))
+            }
+            Err(e) => {
+                eprintln!("[framesim] cannot create dump {}: {e}", p.display());
+                None
+            }
+        });
+
+        Self {
+            decoder,
+            csd: Mutex::new(None),
+            dump,
+            png_dir: cfg.png_dir.clone(),
+            png_every: cfg.png_every,
+            png_max: cfg.png_max,
+            png_written: AtomicUsize::new(0),
+            decode_ns: AtomicUsize::new(0),
+            reported: AtomicUsize::new(0),
+        }
+    }
+
+    /// Feed one access unit, report every picture it yields back to client_core
+    /// with the timestamp the streamer gave it, and optionally write it out.
+    fn on_access_unit(&self, ctx: Option<&ClientCoreContext>, header_ts: Duration, nal: &[u8]) {
+        if let Some(f) = &self.dump
+            && let Ok(mut f) = f.lock()
+        {
+            let _ = f.write_all(&(nal.len() as u32).to_le_bytes());
+            let _ = f.write_all(nal);
+        }
+
+        let Some(decoder) = &self.decoder else {
+            return;
+        };
+        let Ok(mut decoder) = decoder.lock() else {
+            return;
+        };
+
+        if !decoder.saw_config()
+            && let Ok(csd) = self.csd.lock()
+            && let Some(csd) = csd.as_ref()
+        {
+            decoder.push_config(csd);
+        }
+
+        let started = Instant::now();
+        let frames = decoder.push_access_unit(nal, header_ts.as_nanos() as i64);
+        self.decode_ns
+            .fetch_add(started.elapsed().as_nanos() as usize, Ordering::SeqCst);
+
+        for frame in &frames {
+            if let Some(ctx) = ctx {
+                ctx.report_frame_decoded(Duration::from_nanos(frame.pts_ns.max(0) as u64));
+            }
+            self.reported.fetch_add(1, Ordering::SeqCst);
+
+            let Some(dir) = &self.png_dir else {
+                continue;
+            };
+            let idx = self.png_written.fetch_add(1, Ordering::SeqCst) as u64;
+            if self.png_max != 0 && idx >= self.png_max {
+                continue;
+            }
+            if idx % self.png_every != 0 {
+                continue;
+            }
+            let rgb = frame.to_rgb8();
+            let path = dir.join(format!("frame_{idx:06}.png"));
+            if let Err(e) =
+                png::write_rgb(&path, frame.width as u32, frame.height as u32, &rgb)
+            {
+                eprintln!("[framesim] PNG write failed for {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Whether the decoder can actually take frames yet.
+    ///
+    /// The streamer sends the HEVC parameter sets (VPS/SPS/PPS) out-of-band in
+    /// `ServerControlPacket::DecoderConfig`, and it sends that packet **only in
+    /// response to `ClientControlPacket::RequestIdr`**. `client_core` raises that
+    /// request when the decoder callback reports it could not take the frame —
+    /// which is precisely true until the parameter sets have arrived. So we
+    /// report honestly, client_core asks for a keyframe, and the config lands.
+    ///
+    /// A "null decoder" that always returns true deadlocks here: no keyframe is
+    /// ever requested, no parameter sets ever arrive, and nothing decodes. That
+    /// is exactly what the first prototype run did.
+    fn ready(&self) -> bool {
+        let Some(decoder) = &self.decoder else {
+            // Decode disabled: transport-harness behaviour, accept everything.
+            return true;
+        };
+        decoder.lock().map(|d| d.decoded > 0).unwrap_or(true)
+    }
+
+    fn print_stats(&self) {
+        let Some(decoder) = &self.decoder else {
+            return;
+        };
+        let Ok(d) = decoder.lock() else {
+            return;
+        };
+        if d.decoded == 0 && d.pushed_units == 0 {
+            return;
+        }
+        let decode_ms = self.decode_ns.load(Ordering::SeqCst) as f64 / 1e6;
+        println!(
+            "[framesim] DECODE: {} pictures from {} NAL units ({} errors, {} skipped non-8bit-420)",
+            d.decoded, d.pushed_units, d.errors, d.skipped_10bit
+        );
+        if d.decoded > 0 {
+            println!(
+                "[framesim]   decode cost: {:.2} ms/frame over {:.0} ms total; {} reported to client_core; {} PNG",
+                decode_ms / d.decoded as f64,
+                decode_ms,
+                self.reported.load(Ordering::SeqCst),
+                self.png_written.load(Ordering::SeqCst),
+            );
+        }
+        if let Some(e) = &d.last_error {
+            println!("[framesim]   last decoder error: {e}");
+        }
+        if let Some((mean, max, similar, count)) = d.coherence() {
+            println!(
+                "[framesim]   coherency: mean luma delta {mean:.2} between consecutive pictures \
+                 (max {max:.2}); {similar}/{count} pairs near-identical"
+            );
+        }
+    }
+}
+
+/// Decode a captured access-unit stream: repeated `[u32 LE len][bytes]`, with an
+/// optional `<path>.csd` sidecar holding the stream's parameter sets.
+///
+/// This is the offline half of the emulated prototype: one capture from a real
+/// run becomes a fixture the decoder can be iterated against (and regressed
+/// against) with no streamer, no network and no box.
+fn decode_file(path: &Path) -> i32 {
+    let mut cfg = DecodeCfg::from_env();
+    cfg.enabled = true;
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[framesim] cannot read fixture {}: {e}", path.display());
+            return 5;
+        }
+    };
+
+    let state = DecodeState::new(&cfg);
+    if let Ok(csd) = std::fs::read(format!("{}.csd", path.display()))
+        && let Ok(mut slot) = state.csd.lock()
+    {
+        println!("[framesim] fixture: {} bytes of parameter sets", csd.len());
+        *slot = Some(csd);
+    }
+
+    println!("[framesim] fixture: {} bytes of access units", data.len());
+    let (mut off, mut n) = (0usize, 0usize);
+    while off + 4 <= data.len() {
+        let len =
+            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+        off += 4;
+        if off + len > data.len() {
+            eprintln!("[framesim] truncated access unit #{n} at byte {off} (declared {len})");
+            break;
+        }
+        // PTS is synthetic: the fixture preserves order, not arrival timing.
+        state.on_access_unit(None, Duration::from_millis(n as u64), &data[off..off + len]);
+        off += len;
+        n += 1;
+    }
+    println!("[framesim] fixture: fed {n} access units");
+    state.print_stats();
+    0
 }
 
 fn percentile(sorted: &[f64], q: f64) -> f64 {
@@ -141,14 +411,38 @@ fn tracking_thread(ctx: Arc<ClientCoreContext>, streaming: Arc<AtomicBool>, orig
 fn main() {
     env_logger::init();
 
+    // Offline mode: decode a captured access-unit stream. No networking, no
+    // streamer — used to iterate on the decoder without the box, and as the
+    // regression-fixture runner for a real captured bitstream.
+    if let Ok(path) = std::env::var("FRAMESIM_DECODE_FILE") {
+        exit(decode_file(Path::new(&path)));
+    }
+
     // A Steam Frame-ish capability set per ADR-0008: HEVC-capable, foveated
     // encoding on; no AV1 and no 10-bit, because the Frame kernel decodes
     // neither. The streamer negotiates down from here.
+    //
+    // The refresh-rate list is what the streamer paces the encoder to (it picks
+    // the closest advertised rate to its own `preferred_fps`). Under qemu-user
+    // software decode we cannot keep up with 72 Hz, and a client that drops 90%
+    // of frames cannot reconstruct P-frames at all — it decodes noise. So the
+    // rate list is overridable, to run the emulator at a rate it can actually
+    // decode. On real hardware this list reflects the panel.
+    let refresh_rates = std::env::var("FRAMESIM_REFRESH_RATES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|p| p.trim().parse::<f32>().ok())
+                .collect::<Vec<f32>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![60.0, 72.0, 80.0, 90.0, 120.0]);
+
     let capabilities = ClientCapabilities {
         platform: alvr_system_info::platform(None, None),
         default_view_resolution: UVec2::new(2160, 2160),
         max_view_resolution: UVec2::new(2160, 2160),
-        refresh_rates: vec![60.0, 72.0, 80.0, 90.0, 120.0],
+        refresh_rates: refresh_rates.clone(),
         foveated_encoding: true,
         encoder_high_profile: true,
         encoder_10_bits: false,
@@ -167,8 +461,13 @@ fn main() {
         capabilities.encoder_av1,
         capabilities.encoder_10_bits,
     );
+    println!("[framesim] advertising refresh rates {refresh_rates:?}");
 
     let ctx = Arc::new(ClientCoreContext::new(capabilities, vec![]));
+
+    // Emulated-prototype decode. Absent unless FRAMESIM_DECODE=1, so the
+    // transport harness behaves exactly as before.
+    let decode = Arc::new(DecodeState::new(&DecodeCfg::from_env()));
 
     // A null decoder: accept every frame and record it. Returning `false` is
     // read as decoder saturation and makes the client spam RequestIdr, so always
@@ -178,11 +477,13 @@ fn main() {
     let bytes = Arc::new(AtomicUsize::new(0));
     let samples: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
     let first = Arc::new(AtomicBool::new(true));
+    let warned_not_ready = Arc::new(AtomicBool::new(false));
     // Foveation centres the streamer sent with each frame, via the real metadata
     // API the compositor uses (report_compositor_start).
     let fov: Arc<Mutex<Vec<[[f32; 2]; 2]>>> = Arc::new(Mutex::new(Vec::new()));
     let fov_seen = Arc::clone(&fov);
     let ctx_for_cb = Arc::clone(&ctx);
+    let decode_cb = Arc::clone(&decode);
 
     let frames_seen = Arc::clone(&frames);
     let bytes_seen = Arc::clone(&bytes);
@@ -204,13 +505,27 @@ fn main() {
                 header_ts,
             });
         }
+
+        // Real decode: this is what turns "packets arrived" into "the client can
+        // actually show this".
+        decode_cb.on_access_unit(Some(&ctx_for_cb), header_ts, nal);
+
         if first_frame.swap(false, Ordering::SeqCst) || n % 60 == 0 {
             println!(
                 "[framesim] video frame #{n} ts={header_ts:?} bytes={}",
                 nal.len()
             );
         }
-        true
+
+        // Reporting "not yet" is what makes client_core ask for a keyframe, which
+        // is what makes the streamer send the parameter sets. See ready().
+        let ready = decode_cb.ready();
+        if !ready && !warned_not_ready.swap(true, Ordering::SeqCst) {
+            println!(
+                "[framesim] decoder not ready (no parameter sets yet) — requesting a keyframe"
+            );
+        }
+        ready
     }));
 
     let want_frames = frame_target();
@@ -266,6 +581,17 @@ fn main() {
                         "[framesim] decoder config: codec={codec:?} config_nal={} bytes",
                         config_nal.len()
                     );
+                    if let Ok(mut csd) = decode.csd.lock() {
+                        *csd = Some(config_nal.clone());
+                    }
+                    if let Ok(dump) = std::env::var("FRAMESIM_DUMP_NALS") {
+                        let _ = std::fs::write(format!("{dump}.csd"), &config_nal);
+                    }
+                    if let Some(decoder) = &decode.decoder
+                        && let Ok(mut d) = decoder.lock()
+                    {
+                        d.push_config(&config_nal);
+                    }
                 }
                 ClientCoreEvent::StreamingStopped => {
                     streaming.store(false, Ordering::SeqCst);
@@ -289,6 +615,7 @@ fn main() {
 
         if want_frames > 0 && frames.load(Ordering::SeqCst) >= want_frames {
             let code = report(&samples, &bytes, &fov, start);
+            decode.print_stats();
             exit(code);
         }
 
@@ -298,6 +625,7 @@ fn main() {
                 start.elapsed(),
                 frames.load(Ordering::SeqCst)
             );
+            decode.print_stats();
             exit(2);
         }
 
