@@ -242,6 +242,17 @@ pub struct TrackingData {
 
 #[derive(Serialize, Deserialize)]
 pub struct VideoPacketHeader {
+    /// Monotonic, allocated once per frame at the point the frame enters GemLink
+    /// (OvrDirectModeComponent::Present) and carried unchanged to the client.
+    ///
+    /// This exists because the only identity a frame had was `timestamp`, which
+    /// the driver *derives by pose-matching* against its own tracking history
+    /// (measured 87% duplicated) and which the encoder thread reads without
+    /// synchronisation. Nothing detected a frame going missing: the transport's
+    /// `packet_index` counts datagrams, and a dropped frame consumes none, so the
+    /// sequence stayed unbroken and the client could not tell it had been handed
+    /// a P-frame whose reference never arrived.
+    pub frame_index: u64,
     pub timestamp: Duration,
     pub global_view_params: [ViewParams; 2],
     /// Centers used to encode this frame, already aligned. Normally absent when FFR is disabled.

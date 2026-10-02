@@ -48,7 +48,7 @@ public:
      * successfully acquired the sync texture in Present.*/
     virtual void PostPresent(const vr::IVRDriverDirectModeComponent::Throttling_t* pThrottling);
 
-    void CopyTexture(uint32_t layerCount);
+    void CopyTexture(uint32_t layerCount, uint64_t frameSequence);
 
 private:
     std::shared_ptr<CD3DRender> m_pD3DRender;
@@ -71,6 +71,11 @@ private:
     vr::HmdQuaternion_t m_framePoseRotation;
     uint64_t m_targetTimestampNs;
     uint64_t m_prevTargetTimestampNs;
+    /// Monotonic sequence for frames entering this pipeline. Allocated in
+    /// Present(), before the sync-texture acquire, so that a frame which is
+    /// dropped or skipped at any later stage leaves a visible hole rather than
+    /// vanishing silently. See /workspace/VD_RE/51-grey-frame-ruled-out.md.
+    uint64_t m_frameSequence = 0;
 
     std::mutex m_presentMutex;
 };

@@ -106,11 +106,13 @@ bool CEncoder::CopyToStaging(
     bool recentering,
     uint64_t presentationTime,
     uint64_t targetTimestampNs,
+    uint64_t frameSequence,
     const std::string& message,
     const std::string& debugText
 ) {
     m_presentationTime = presentationTime;
     m_targetTimestampNs = targetTimestampNs;
+    m_frameSequence = frameSequence;
     m_FrameRender->Startup();
 
     m_FrameRender->RenderFrame(
@@ -129,6 +131,9 @@ void CEncoder::Run() {
             break;
 
         if (m_FrameRender->GetTexture()) {
+            // The frame's identity, handed to the NAL emission point so it can be
+            // carried to the client. The encoder thread is the only writer here.
+            SetFrameSequence(m_frameSequence);
             m_videoEncoder->Transmit(
                 m_FrameRender->GetTexture().Get(),
                 m_presentationTime,

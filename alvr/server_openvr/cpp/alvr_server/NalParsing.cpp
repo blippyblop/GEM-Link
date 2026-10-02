@@ -95,6 +95,10 @@ void processHevcNals(unsigned char*& buf, int& len) {
     }
 }
 
+static unsigned long long g_frameSequence = 0;
+
+void SetFrameSequence(unsigned long long frameSequence) { g_frameSequence = frameSequence; }
+
 void ParseFrameNals(
     int codec, unsigned char* buf, int len, unsigned long long targetTimestampNs, bool isIdr
 ) {
@@ -113,5 +117,5 @@ void ParseFrameNals(
         SetVideoConfigNals(0, 0, codec);
     }
 
-    VideoSend(targetTimestampNs, buf, len, isIdr);
+    VideoSend(g_frameSequence, targetTimestampNs, buf, len, isIdr);
 }

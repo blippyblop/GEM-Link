@@ -216,6 +216,10 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
 
     m_presentMutex.lock();
 
+    // Earliest point a frame exists in GemLink. Allocated before the sync-texture
+    // acquire so that even a frame we skip leaves a gap visible downstream.
+    const uint64_t frameSequence = ++m_frameSequence;
+
     ReportPresent(m_targetTimestampNs, 0);
 
     bool useMutex = true;
@@ -256,7 +260,7 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
         }
     }
 
-    CopyTexture(layerCount);
+    CopyTexture(layerCount, frameSequence);
 
     if (useMutex) {
         if (pKeyedMutex) {
@@ -280,7 +284,7 @@ void OvrDirectModeComponent::PostPresent(const vr::IVRDriverDirectModeComponent:
     WaitForVSync();
 }
 
-void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
+void OvrDirectModeComponent::CopyTexture(uint32_t layerCount, uint64_t frameSequence) {
 
     uint64_t presentationTime = GetTimestampUs();
 
@@ -371,6 +375,7 @@ void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
             false,
             presentationTime,
             submitFrameIndex,
+            frameSequence,
             "",
             debugText
         );

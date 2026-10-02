@@ -306,6 +306,14 @@ fn connection_pipeline(
         let ctx = Arc::clone(&ctx);
         move || {
             let mut stream_corrupted = true;
+            // Last frame sequence seen. A gap here means the server discarded a
+            // frame (its queue was full) — a P-frame after it cannot be
+            // reconstructed, so the picture is not trustworthy even though every
+            // packet that did arrive was intact. The transport's own
+            // `packet_index` cannot see this: a dropped frame consumes no
+            // datagrams, so its sequence stays unbroken. See ADR-0011.
+            let mut last_frame_index: Option<u64> = None;
+            let mut missed_frames: u64 = 0;
             while is_streaming(&ctx) {
                 let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(data) => data,
@@ -319,6 +327,18 @@ fn connection_pipeline(
                 if let Some(stats) = &mut *ctx.statistics_manager.lock() {
                     stats.report_video_packet_received(header.timestamp);
                 }
+
+                if let Some(last) = last_frame_index {
+                    if header.frame_index > last + 1 {
+                        let lost = header.frame_index - last - 1;
+                        missed_frames += lost;
+                        warn!(
+                            "Server dropped {lost} frame(s) before frame_index={}: {} total                              missed this session",
+                            header.frame_index, missed_frames
+                        );
+                    }
+                }
+                last_frame_index = Some(header.frame_index);
 
                 if header.is_idr {
                     stream_corrupted = false;

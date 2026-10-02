@@ -49,6 +49,7 @@ public:
         bool recentering,
         uint64_t presentationTime,
         uint64_t targetTimestampNs,
+        uint64_t frameSequence,
         const std::string& message,
         const std::string& debugText
     );
@@ -73,6 +74,8 @@ private:
     bool m_bExiting;
     uint64_t m_presentationTime;
     uint64_t m_targetTimestampNs;
+    /// Monotonic per-frame sequence allocated at OvrDirectModeComponent::Present.
+    uint64_t m_frameSequence = 0;
 
     std::shared_ptr<FrameRender> m_FrameRender;
 

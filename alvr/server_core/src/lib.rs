@@ -43,7 +43,7 @@ use std::{
     io::Write,
     sync::{
         Arc, LazyLock, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -395,6 +395,7 @@ impl ServerCoreContext {
 
     pub fn send_video_nal(
         &self,
+        frame_index: u64,
         timestamp: Duration,
         global_view_params: [ViewParams; 2],
         foveation_center_shifts: Option<[[f32; 2]; 2]>,
@@ -455,6 +456,7 @@ impl ServerCoreContext {
 
                 let sender_result = sender.try_send(VideoPacket {
                     header: VideoPacketHeader {
+                        frame_index,
                         timestamp,
                         global_view_params,
                         foveation_center_shifts,
@@ -468,7 +470,17 @@ impl ServerCoreContext {
                         .events_sender
                         .send(ServerCoreEvent::RequestIDR)
                         .ok();
-                    warn!("Dropping video packet. Reason: Can't push to network");
+                    // Name the frame. Without the sequence number a dropped frame
+                    // was anonymous, so the server could not tell whether the IDR it
+                    // had just asked the encoder for was the frame it had just
+                    // thrown away — and would loop: drop, request IDR, drop the IDR,
+                    // request again. DROPPED counts frames lost here; the client
+                    // sees the same number as a gap.
+                    static DROPPED: AtomicU64 = AtomicU64::new(0);
+                    let n = DROPPED.fetch_add(1, Ordering::SeqCst) + 1;
+                    warn!(
+                        "Dropping video frame_index={frame_index} idr={is_idr}                          (reason: can't push to network). Total dropped: {n}"
+                    );
                 }
             } else {
                 warn!("Dropping video packet. Reason: Waiting for IDR frame");

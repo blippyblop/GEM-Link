@@ -351,6 +351,7 @@ fn main() {
         }
 
         let header = VideoPacketHeader {
+            frame_index: i as u64,
             timestamp: ts,
             global_view_params: [ViewParams::DUMMY; 2],
             foveation_center_shifts: shifts,

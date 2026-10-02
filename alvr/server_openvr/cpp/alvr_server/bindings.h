@@ -208,7 +208,21 @@ extern "C" void LogPeriodically(const char* tag, const char* stringPtr);
 extern "C" void DriverReadyIdle(bool setDefaultChaprone);
 extern "C" void SetVideoConfigNals(const unsigned char* configBuffer, int len, int codec);
 extern "C" void
-VideoSend(unsigned long long targetTimestampNs, unsigned char* buf, int len, bool isIdr);
+VideoSend(
+    unsigned long long frameSequence,
+    unsigned long long targetTimestampNs,
+    unsigned char* buf,
+    int len,
+    bool isIdr
+);
+
+// NalParsing.cpp: the sequence number of the frame currently being emitted.
+//
+// Set by CEncoder::Run immediately before Transmit and read by ParseFrameNals.
+// Deliberately a file-scope value rather than a parameter threaded through
+// VideoEncoder::Transmit and its four overrides: the encoder thread is the only
+// writer and the only reader, and this is diagnostic plumbing, not state.
+void SetFrameSequence(unsigned long long frameSequence);
 extern "C" void
 HapticsSend(unsigned long long path, float duration_s, float frequency, float amplitude);
 extern "C" void ShutdownRuntime();

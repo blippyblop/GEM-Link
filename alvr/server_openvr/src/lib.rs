@@ -625,7 +625,13 @@ extern "C" fn report_encoder_foveation_centers(
 }
 
 #[unsafe(export_name = "VideoSend")]
-extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_idr: bool) {
+extern "C" fn send_video(
+    frame_index: u64,
+    timestamp_ns: u64,
+    buffer_ptr: *mut u8,
+    len: i32,
+    is_idr: bool,
+) {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
         let timestamp = Duration::from_nanos(timestamp_ns);
         let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
@@ -663,6 +669,7 @@ extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_id
                 });
 
         context.send_video_nal(
+            frame_index,
             timestamp,
             global_view_params,
             foveation_center_shifts,
