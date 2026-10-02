@@ -139,6 +139,7 @@ fn serial_number(device_id: u64) -> String {
                 | ControllersEmulationMode::Pico4
                 | ControllersEmulationMode::PSVR2Sense
                 | ControllersEmulationMode::ValveIndex
+                | ControllersEmulationMode::SteamFrame
                 | ControllersEmulationMode::ViveWand
                 | ControllersEmulationMode::ViveTracker => "ALVR Remote Controller",
                 ControllersEmulationMode::Custom { serial_number, .. } => serial_number,
