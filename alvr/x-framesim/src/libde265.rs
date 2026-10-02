@@ -543,15 +543,10 @@ impl HevcDecoder {
                 }
                 if let Some(frame) = self.copy_image(img) {
                     self.note_coherence(&frame);
-                    // libde265's own opinion of this picture. Called for every
-                    // picture, in order, so a warning is attributable to the frame
-                    // it belongs to — which is what ffmpeg's equivalent could not
-                    // give us (it numbers *output* frames and skips some).
-                    if let Some(w) = self.take_warning() {
-                        self.warned += 1;
-                        *self.warn_counts.entry(w.clone()).or_insert(0) += 1;
-                        self.warnings.insert(frame.pts_ns, w);
-                    }
+                    // de265_get_warning() is deliberately NOT called: it crashes the
+                    // harness inside qemu (SIGSEGV right after the first picture).
+                    // The symbol resolves but the 1.0.11 signature/ABI is not what
+                    // was assumed. Verify in isolation before re-adding.
                     frames.push(frame);
                     self.decoded += 1;
                 } else {
