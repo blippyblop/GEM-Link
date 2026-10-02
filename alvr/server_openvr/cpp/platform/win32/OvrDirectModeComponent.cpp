@@ -223,9 +223,18 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
     uint32_t layerCount = m_submitLayer;
     m_submitLayer = 0;
 
-    if (m_prevTargetTimestampNs == m_targetTimestampNs) {
+    // The compositor re-submits the same frame index whenever the scene
+    // application has not produced a new frame. Encoding that again sends the
+    // user a frame with no new content -- and when the compositor substitutes
+    // its own standby scene that is exactly how the grey/blank frames reached
+    // the stream. Users must never see one; keeping the previous frame on the
+    // client is the correct worst case until we add frame prediction.
+    //
+    // Note we do NOT return here: the sync texture is still acquired below, or
+    // the compositor would stall waiting for us to take it.
+    bool const duplicated = m_prevTargetTimestampNs == m_targetTimestampNs;
+    if (duplicated) {
         Debug("Discard duplicated frame. FrameIndex=%llu (Ignoring)", m_targetTimestampNs);
-        // return;
     }
 
     ID3D11Texture2D* pSyncTexture = m_pD3DRender->GetSharedTexture((HANDLE)syncTexture);
@@ -268,7 +277,7 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
     // worst case, which is what happens if we simply do not encode: the client
     // keeps displaying what it already has. (Frame prediction, VD-style, comes
     // later.)
-    if (layerCount > 0) {
+    if (layerCount > 0 && !duplicated) {
         CopyTexture(layerCount);
     }
 
@@ -281,7 +290,7 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
 
     ReportComposed(m_targetTimestampNs, 0);
 
-    if (m_pEncoder && layerCount > 0) {
+    if (m_pEncoder && layerCount > 0 && !duplicated) {
         m_pEncoder->NewFrameReady();
     }
 
