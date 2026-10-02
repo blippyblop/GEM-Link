@@ -314,6 +314,8 @@ fn connection_pipeline(
             // datagrams, so its sequence stays unbroken. See ADR-0011.
             let mut last_frame_index: Option<u64> = None;
             let mut missed_frames: u64 = 0;
+            let mut frames_seen: u64 = 0;
+            let mut first_report = true;
             while is_streaming(&ctx) {
                 let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(data) => data,
@@ -339,6 +341,19 @@ fn connection_pipeline(
                     }
                 }
                 last_frame_index = Some(header.frame_index);
+                // Prove the sequence is actually advancing. Without this, a
+                // frame_index pinned at 0 is indistinguishable from a perfectly
+                // contiguous stream by the gap check alone.
+                if first_report || header.frame_index % 300 == 0 {
+                    first_report = false;
+                    info!(
+                        "video frame_index={} (frames seen {}, missed {})",
+                        header.frame_index,
+                        frames_seen,
+                        missed_frames
+                    );
+                }
+                frames_seen += 1;
 
                 if header.is_idr {
                     stream_corrupted = false;
