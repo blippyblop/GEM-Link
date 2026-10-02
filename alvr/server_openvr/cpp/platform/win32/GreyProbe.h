@@ -25,6 +25,7 @@
 #include <d3d11.h>
 #include <wrl.h>
 
+#include "alvr_server/Logger.h"
 #include "alvr_server/openvr_driver_wrap.h"
 
 #include <algorithm>
