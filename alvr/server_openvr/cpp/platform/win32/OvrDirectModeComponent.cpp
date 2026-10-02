@@ -1,5 +1,7 @@
 #include "OvrDirectModeComponent.h"
 
+#include "GreyProbe.h"
+
 OvrDirectModeComponent::OvrDirectModeComponent(
     std::shared_ptr<CD3DRender> pD3DRender, std::shared_ptr<PoseHistory> poseHistory
 )
@@ -328,6 +330,23 @@ void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
         bounds[i][0] = m_submitLayers[i][0].bounds;
         bounds[i][1] = m_submitLayers[i][1].bounds;
         poses[i] = m_submitLayers[i][0].mHmdPose;
+
+        // Measurement only, and off unless GEMLINK_GREYPROBE is set: fingerprint
+        // the compositor's own output before anything of ours touches it, so a
+        // grey frame can be attributed to upstream or to GemLink. See
+        // VD_RE/50-grey-frame-experiments.md.
+        if (greyprobe::Probe::Instance().Enabled()) {
+            for (int eye = 0; eye < 2; eye++) {
+                greyprobe::Probe::Instance().Sample(
+                    m_pD3DRender->GetDevice(),
+                    m_pD3DRender->GetContext(),
+                    pTexture[i][eye],
+                    m_targetTimestampNs,
+                    static_cast<int>(i),
+                    eye
+                );
+            }
+        }
     }
 
     // This can go away, but is useful to see it as a separate packet on the gpu in traces.
