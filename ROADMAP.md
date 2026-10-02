@@ -105,7 +105,8 @@ hardware test — never an opinion. Status is per 2026-10-01.
 
 ### M3 — Client & runtime (weeks 15–32) 🚧 **long pole — the device side is at zero**
 - [x] **Runtime decided: stay on Valve's SteamVR runtime** (ADR-0009) — the client is an OpenXR application on the bundled runtime; a second runtime is out of scope. No GPL code merge.
-- [ ] Frame client binary: `client_core` port to aarch64 Linux — entry point (`c_api.rs` is `#[cfg(target_os = "android")]`; `graphics.rs::session_create_info` is `unimplemented!()`), `Platform::SteamFrame`, GLES `SessionCreateInfo` (the vendored `openxr-0.21.1` opengles arm is Android-only)
+- [ ] Frame client binary: `client_core` port to aarch64 Linux — **the Android→Linux port *is* this milestone**: 39 `#[cfg(target_os = "android")]` gates across `client_core` (22), `client_openxr` (11), `system_info` (6). Entry point (`c_api.rs` is JNI-only; `graphics.rs::session_create_info` is `unimplemented!()`), `Platform::SteamFrame`, GLES `SessionCreateInfo` (the vendored `openxr-0.21.1` opengles arm is Android-only), interaction gates
+- [ ] **Linux client audio** — `client_core::audio` is `#[cfg(target_os = "android")]` (NDK) and the module only exists on Android. `alvr_audio` already ships a Linux path (`cpal` + `linux.rs::try_load_pipewire()`), so this is plumbing rather than research. Not optional — there is no "audio off" flag.
 - [ ] **V4L2 iris decode backend** (`client_core/src/video_decoder` currently has Android/MediaCodec only)
 - [ ] Presentation into the Frame's native compositor
 - [ ] **Client-side de-foveation + sharpen** — today we spend the foveation bitrate saving and recover nothing; without it the 300 Mbps envelope is not real (DoD #2)
