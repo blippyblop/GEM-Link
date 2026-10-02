@@ -254,7 +254,23 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
         }
     }
 
-    CopyTexture(layerCount);
+    // A Present that carried no submitted layer has no fresh content to encode.
+    //
+    // Present() is called more often than SubmitLayer() -- measured 11,196
+    // Present vs 5,969 SubmitLayer over 37 minutes -- so on roughly half of all
+    // presents the compositor has nothing new for us. CopyTexture(0) copies
+    // nothing AND would hand CopyToStaging an array of uninitialised texture
+    // pointers, and the unconditional NewFrameReady() below then asked the
+    // encoder to encode a texture that was never refreshed this frame. That is
+    // where the grey/blank frames came from.
+    //
+    // Users must never see one. Repeating the previous frame is the correct
+    // worst case, which is what happens if we simply do not encode: the client
+    // keeps displaying what it already has. (Frame prediction, VD-style, comes
+    // later.)
+    if (layerCount > 0) {
+        CopyTexture(layerCount);
+    }
 
     if (useMutex) {
         if (pKeyedMutex) {
@@ -265,7 +281,7 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
 
     ReportComposed(m_targetTimestampNs, 0);
 
-    if (m_pEncoder) {
+    if (m_pEncoder && layerCount > 0) {
         m_pEncoder->NewFrameReady();
     }
 
