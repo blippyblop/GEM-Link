@@ -513,6 +513,7 @@ pub unsafe extern "C" fn alvr_set_video_config_nals(
 /// The centers are copied; the pointer is not retained.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alvr_send_video_nal(
+    frame_index: u64,
     timestamp_ns: u64,
     global_view_params: *const AlvrViewParams,
     foveation_center_shifts: *const [[f32; 2]; 2],
@@ -531,6 +532,7 @@ pub unsafe extern "C" fn alvr_send_video_nal(
         };
 
         context.send_video_nal(
+            frame_index,
             Duration::from_nanos(timestamp_ns),
             global_view_params,
             // # Safety: the caller provides either null or a valid 2x2 centers array.
