@@ -24,13 +24,13 @@ jobs:
           toolchain: "1.97.1"
           components: rustfmt, clippy
       - name: Format
-        run: cargo fmt -p x-protocol -p x-bench -p x-crypto -p x-dda -p x-nvenc -p x-foveation -p x-link -- --check
+        run: cargo fmt -p x-protocol -p x-bench -p x-crypto -p x-dda -p x-nvenc -p x-foveation -p x-link -p x-transport -- --check
       - name: Build
-        run: cargo build -p x-protocol -p x-bench -p x-crypto -p x-link
+        run: cargo build -p x-protocol -p x-bench -p x-crypto -p x-link -p x-transport
       - name: Clippy
-        run: cargo clippy -p x-protocol -p x-bench -p x-crypto -p x-foveation -p x-link -- -D warnings
+        run: cargo clippy -p x-protocol -p x-bench -p x-crypto -p x-foveation -p x-link -p x-transport -- -D warnings
       - name: Test
-        run: cargo test -p x-protocol -p x-bench -p x-crypto -p x-link
+        run: cargo test -p x-protocol -p x-bench -p x-crypto -p x-link -p x-transport
 
   bench-gates:
     if: github.repository == 'blippyblop/GEM-Link'
@@ -57,6 +57,8 @@ jobs:
           done
       - name: Secure tier (Noise-XX gate, ADR-0006)
         run: cargo run -q -p x-bench --bin bench -- secure --iterations 200
+      - name: Media plane gates (ADR-0011: never present an unreconstructable frame)
+        run: cargo run -q -p x-bench --bin bench -- transport
       - name: Gaze pipeline gate (flagship)
         run: cargo run -q -p x-bench --bin bench -- gaze
 

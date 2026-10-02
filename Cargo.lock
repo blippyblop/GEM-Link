@@ -8328,6 +8328,7 @@ dependencies = [
  "x-foveation",
  "x-link",
  "x-protocol",
+ "x-transport",
 ]
 
 [[package]]
@@ -8379,6 +8380,15 @@ version = "21.0.0-dev14"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "x-transport"
+version = "21.0.0-dev14"
+dependencies = [
+ "chacha20poly1305",
+ "log",
+ "rand_chacha 0.3.1",
 ]
 
 [[package]]

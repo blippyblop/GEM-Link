@@ -20,6 +20,8 @@ use std::{
 };
 use x_protocol::{ClientCapabilities, ServerCapabilities, SessionPlan, negotiate, samples};
 
+pub mod transport;
+
 pub const SCHEMA_VERSION: u32 = 4;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LOSS_PENALTY_MS: f64 = 12.0;
@@ -1503,7 +1505,7 @@ mod tests {
         assert_eq!(clean.within_optimal_pct, 100.0);
 
         // between the two budgets: mandatory-clean, optimal-imperfect
-        let mid = delivery_stats(&vec![9.5; 10], MANDATORY_DEADLINE_MS, OPTIMAL_DEADLINE_MS);
+        let mid = delivery_stats(&[9.5; 10], MANDATORY_DEADLINE_MS, OPTIMAL_DEADLINE_MS);
         assert_eq!(mid.missed_mandatory_pct, 0.0);
         assert_eq!(mid.within_optimal_pct, 0.0);
     }
@@ -1613,7 +1615,9 @@ mod gaze_tests {
         let mut f = EyeTrackedFoveation::new(params, UVec2::new(2048, 2048));
         f.view_params = Some(view_params);
         let poll = 1.0 / 90.0;
-        let mut t = 0.0f32;
+        // Warm the filter up over a second of samples at a steady gaze; `t` is then the
+        // convergence clock below.
+        let mut t;
         for i in 0..27 {
             t = i as f32 * poll;
             f.update(

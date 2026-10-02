@@ -1,0 +1,15 @@
+[package]
+name = "x-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["GemLink contributors"]
+description = "GemLink media plane: frame packetisation, GF(256) FEC, pacing, per-datagram AEAD, and a receiver that cannot present an unreconstructable frame"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+log = "0.4"
+
+[dev-dependencies]
+rand_chacha = "0.3"

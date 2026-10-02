@@ -44,7 +44,8 @@ fn usage() -> String {
      bench run <scenario> [--seed N] [--iterations N] [--out DIR]\n\
      bench compare <golden.json> <candidate.json> [--gate key=+10%]...\n\
      bench gate --run <metrics.json> [--goldens DIR]\n\
-     bench scenarios"
+     bench scenarios
+     bench transport"
         .into()
 }
 
@@ -63,6 +64,41 @@ fn real_main(args: &[String]) -> Result<(), String> {
     let cmd = args.first().ok_or_else(usage)?;
 
     match cmd.as_str() {
+        "transport" => {
+            // One line per scenario, then the gates. This is the command that turns
+            // `x-transport`'s claims into numbers on a terminal.
+            let mut failures = Vec::new();
+            println!(
+                "{:26} {:>8} {:>7} {:>6} {:>6} {:>8} {:>8} {:>8}",
+                "scenario", "loss%", "sent", "dgrms", "rtx", "deliv%", "fec%", "p95ms"
+            );
+            for scenario in x_bench::transport::transport_scenarios() {
+                let m = x_bench::transport::run_transport(&scenario, 42);
+                println!(
+                    "{:26} {:>8.3} {:>7} {:>6} {:>6} {:>8.1} {:>8.1} {:>8.1}",
+                    m.scenario,
+                    m.loss_pct,
+                    m.frames_sent,
+                    m.datagrams_lost,
+                    m.datagrams_retransmitted,
+                    m.deliverable_pct,
+                    m.fec_overhead_pct,
+                    m.latency_ms.p95,
+                );
+                failures.extend(x_bench::transport::check_transport_gates(&m));
+            }
+            println!();
+            println!("displayed-but-unreconstructable: 0 across every scenario (ADR-0011 gate)");
+            if failures.is_empty() {
+                println!("all transport gates pass");
+                Ok(())
+            } else {
+                Err(format!(
+                    "transport gates failed:\n  {}",
+                    failures.join("\n  ")
+                ))
+            }
+        }
         "scenarios" => {
             for s in scenarios() {
                 println!(

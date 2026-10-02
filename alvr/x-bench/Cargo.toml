@@ -18,6 +18,7 @@ x-crypto = { path = "../x-crypto" }
 x-foveation = { path = "../x-foveation" }
 x-link = { path = "../x-link" }
 x-protocol = { path = "../x-protocol" }
+x-transport = { path = "../x-transport" }
 
 [[bin]]
 name = "bench"
