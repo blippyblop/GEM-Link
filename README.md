@@ -22,7 +22,7 @@ Steam frame is the primary targeted device. Other devices I want to support, but
 
 IT FUCKING SUCKS. Development will slow for now but I would like to get this done.
 
-Seriously it's in 'emulated bench test' at the moment. Very cringe. 
+Seriously it's in 'emulated bench test' at the moment. Blocked on actually getting access to a frame. One is apparently 'shipping'.
 
 ## Bench & development
 
