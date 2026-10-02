@@ -271,6 +271,14 @@ impl DecodeState {
         decoder.lock().map(|d| d.decoded > 0).unwrap_or(true)
     }
 
+    /// libde265's warnings, keyed by the sender's frame timestamp.
+    fn warnings(&self) -> std::collections::HashMap<i64, String> {
+        self.decoder
+            .as_ref()
+            .and_then(|d| d.lock().ok().map(|d| d.warnings.clone()))
+            .unwrap_or_default()
+    }
+
     /// Per-picture content fingerprints, keyed by the sender's frame timestamp.
     fn content_stats(&self) -> std::collections::HashMap<i64, libde265::ContentStat> {
         self.decoder
@@ -326,6 +334,22 @@ impl DecodeState {
                 "[framesim]   coherency: mean luma delta {mean:.2} between consecutive pictures \
                  (max {max:.2}); {similar}/{count} pairs near-identical"
             );
+        }
+        if d.warned > 0 {
+            let total = d.decoded.max(1);
+            println!(
+                "[framesim]   libde265 warned about {} of {} pictures ({:.1}%):",
+                d.warned,
+                total,
+                100.0 * d.warned as f64 / total as f64
+            );
+            let mut v: Vec<_> = d.warn_counts.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            for (text, n) in v.into_iter().take(6) {
+                println!("[framesim]     {n:>6}x  {text}");
+            }
+        } else {
+            println!("[framesim]   libde265 reported no warnings for any picture");
         }
         if !d.content.is_empty() {
             let mut counts: std::collections::HashMap<&str, usize> =
@@ -1009,9 +1033,10 @@ fn report(
         match File::create(&path) {
             Ok(mut f) => {
                 let content = decode.content_stats();
+                let warns = decode.warnings();
                 let _ = writeln!(
                     f,
-                    "idx,header_ts_us,size_bytes,dev_ms,gap_ms,mean_luma,luma_std,tile_std,class"
+                    "idx,header_ts_us,size_bytes,dev_ms,gap_ms,mean_luma,luma_std,tile_std,class,de265_warning"
                 );
                 let mut counts: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
@@ -1036,9 +1061,13 @@ fn report(
                         }
                     };
                     *counts.entry(class).or_default() += 1;
+                    let warn = warns
+                        .get(&key)
+                        .map(|w| w.replace(',', ";"))
+                        .unwrap_or_default();
                     let _ = writeln!(
                         f,
-                        "{},{},{},{:.3},{:.3},{},{},{},{}",
+                        "{},{},{},{:.3},{:.3},{},{},{},{},{}",
                         i,
                         s[i].header_ts.as_micros(),
                         s[i].size,
@@ -1047,7 +1076,8 @@ fn report(
                         mean,
                         std,
                         tile,
-                        class
+                        class,
+                        warn
                     );
                 }
                 let total = counts.values().sum::<usize>().max(1);

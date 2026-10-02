@@ -83,6 +83,16 @@ struct Api {
     version: unsafe extern "C" fn() -> *const c_char,
     error_text: unsafe extern "C" fn(Error) -> *const c_char,
     is_ok: unsafe extern "C" fn(Error) -> c_int,
+    /// `const char* de265_get_warning(de265_decoder_context*)`.
+    ///
+    /// libde265 reports a per-picture warning here — including the case this
+    /// investigation needed and could not otherwise see: a picture that could not
+    /// be reconstructed because its reference was missing. The harness never
+    /// called it, which is part of why 41% of displayed frames being garbage left
+    /// the telemetry reading "0 errors". Unlike ffmpeg's equivalent this is
+    /// *index-aligned*: the harness sees pictures in order, so a warning can be
+    /// attributed to the frame it belongs to.
+    get_warning: unsafe extern "C" fn(*mut DecoderCtx) -> *const c_char,
 }
 
 impl Api {
@@ -114,6 +124,7 @@ impl Api {
             version,
             error_text,
             is_ok,
+            get_warning,
         ) = api!(
             lib,
             "de265_new_decoder" => unsafe extern "C" fn() -> *mut DecoderCtx,
@@ -135,6 +146,7 @@ impl Api {
             "de265_get_version" => unsafe extern "C" fn() -> *const c_char,
             "de265_get_error_text" => unsafe extern "C" fn(Error) -> *const c_char,
             "de265_isOK" => unsafe extern "C" fn(Error) -> c_int,
+            "de265_get_warning" => unsafe extern "C" fn(*mut DecoderCtx) -> *const c_char,
         );
 
         Ok(Self {
@@ -158,6 +170,7 @@ impl Api {
             version,
             error_text,
             is_ok,
+            get_warning,
         })
     }
 
@@ -314,6 +327,10 @@ pub struct HevcDecoder {
     /// indexed because the picture count is not the frame count — config NALs
     /// also yield pictures.
     pub content: std::collections::HashMap<i64, ContentStat>,
+    /// Pictures libde265 warned about, keyed by the sender's frame timestamp.
+    pub warnings: std::collections::HashMap<i64, String>,
+    pub warned: u64,
+    pub warn_counts: std::collections::HashMap<String, u64>,
     prev_luma: Option<Vec<u8>>,
     cmp_count: u64,
     cmp_sum: f64,
@@ -363,6 +380,9 @@ impl HevcDecoder {
             saw_config: false,
             logged_geometry: AtomicBool::new(false),
             content: std::collections::HashMap::new(),
+            warnings: std::collections::HashMap::new(),
+            warned: 0,
+            warn_counts: std::collections::HashMap::new(),
             prev_luma: None,
             cmp_count: 0,
             cmp_sum: 0.0,
@@ -387,6 +407,25 @@ impl HevcDecoder {
     /// CSD itself if the event has not landed.
     pub fn saw_config(&self) -> bool {
         self.saw_config
+    }
+
+    /// Ask libde265 what it thought of the most recent picture. Returns the
+    /// warning text if there was one.
+    fn take_warning(&mut self) -> Option<String> {
+        // SAFETY: ctx is valid for the life of this decoder and this is called
+        // with the enclosing Mutex held.
+        let p = unsafe { (self.api.get_warning)(self.ctx) };
+        if p.is_null() {
+            return None;
+        }
+        let text = unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned();
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Track how much consecutive decoded pictures differ, on the luma plane.
@@ -504,6 +543,15 @@ impl HevcDecoder {
                 }
                 if let Some(frame) = self.copy_image(img) {
                     self.note_coherence(&frame);
+                    // libde265's own opinion of this picture. Called for every
+                    // picture, in order, so a warning is attributable to the frame
+                    // it belongs to — which is what ffmpeg's equivalent could not
+                    // give us (it numbers *output* frames and skips some).
+                    if let Some(w) = self.take_warning() {
+                        self.warned += 1;
+                        *self.warn_counts.entry(w.clone()).or_insert(0) += 1;
+                        self.warnings.insert(frame.pts_ns, w);
+                    }
                     frames.push(frame);
                     self.decoded += 1;
                 } else {
