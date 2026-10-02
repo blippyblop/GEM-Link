@@ -57,6 +57,111 @@ static FILESYSTEM_LAYOUT: OnceLock<afs::Layout> = OnceLock::new();
 // needs to be initialized first using initialize_environment().
 // NB: this must remain a global because only one instance should exist for the whole application
 // execution time.
+/// ADR-0011's send gate for the video path, at module scope so the session summary can read
+/// its counters. One gate, because there is one video stream.
+pub(crate) static SEND_GATE: Mutex<x_transport::SendGate> =
+    Mutex::new(x_transport::SendGate::new());
+
+/// A snapshot of ADR-0011's send gate, for the session summary.
+pub fn send_gate_snapshot() -> SendGateSnapshot {
+    let gate = SEND_GATE.lock();
+    SendGateSnapshot {
+        discarded: gate.discarded(),
+        suppressed: gate.suppressed_frames(),
+    }
+}
+
+/// Start a session with the gate and the send probe at zero rather than accumulating across
+/// connections.
+pub fn reset_send_gate() {
+    *SEND_GATE.lock() = x_transport::SendGate::new();
+    send_probe::reset();
+}
+
+pub struct SendGateSnapshot {
+    pub discarded: u64,
+    pub suppressed: u64,
+}
+
+/// Instrumentation for the video send path, and the counters that make the grey-frame
+/// question answerable.
+///
+/// The question is *why* a frame goes missing, and there are three candidate mechanisms that
+/// look identical from the client:
+///
+/// 1. **The server discarded it** — the bounded channel was full. Already logged, and counted
+///    by [`crate::SendGate`].
+/// 2. **The network lost it** — every datagram vanished. Invisible on this side.
+/// 3. **The receiver stopped draining** — the client's kernel buffer filled, then this side's
+///    send buffer filled, and the send thread sat blocked inside a UDP `send()`. The frame is
+///    then discarded here (mechanism 1) *because* of mechanism 3.
+///
+/// 1 and 2 need the client's frame indices to separate, and every frame the server transmits
+/// carries one, so the client's capture and [`SEND_GATE`]'s counters are enough. Separating 3
+/// from 2 needs the two numbers here: **how deep the queue ever got**, and **how long the send
+/// thread spent blocked**. If the queue never went deep and nothing ever blocked, then
+/// mechanism 1 never fired, and a missing frame was the network's doing. If the thread spent
+/// seconds blocked, the drop is a symptom of a stalled receiver and the fix is not in the
+/// transport at all.
+pub(crate) mod send_probe {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// Frames currently queued for the send thread.
+    static QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+    /// The high-water mark, which is the number that says whether the channel ever came close
+    /// to the capacity that `try_send` fails at.
+    static MAX_QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+    /// Nanoseconds spent inside the blocking UDP send.
+    static SEND_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
+    /// The longest single blocking send, which distinguishes "steady slight backpressure"
+    /// from "one multi-second stall".
+    static LONGEST_SEND_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
+    static FRAMES_SENT: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        QUEUE_DEPTH.store(0, Ordering::SeqCst);
+        MAX_QUEUE_DEPTH.store(0, Ordering::SeqCst);
+        SEND_BLOCKED_NS.store(0, Ordering::SeqCst);
+        LONGEST_SEND_BLOCKED_NS.store(0, Ordering::SeqCst);
+        FRAMES_SENT.store(0, Ordering::SeqCst);
+    }
+
+    /// A frame was handed to the send thread.
+    pub fn enqueued() {
+        let depth = QUEUE_DEPTH.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_QUEUE_DEPTH.fetch_max(depth, Ordering::SeqCst);
+    }
+
+    /// The send thread took a frame off the queue.
+    pub fn dequeued() {
+        QUEUE_DEPTH.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// The send thread finished writing a frame to the socket, after this long.
+    pub fn sent(blocked: std::time::Duration) {
+        FRAMES_SENT.fetch_add(1, Ordering::SeqCst);
+        let ns = blocked.as_nanos() as u64;
+        SEND_BLOCKED_NS.fetch_add(ns, Ordering::SeqCst);
+        LONGEST_SEND_BLOCKED_NS.fetch_max(ns, Ordering::SeqCst);
+    }
+
+    pub struct Snapshot {
+        pub frames_sent: u64,
+        pub max_queue_depth: usize,
+        pub send_blocked_ms: f64,
+        pub longest_send_blocked_ms: f64,
+    }
+
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            frames_sent: FRAMES_SENT.load(Ordering::SeqCst),
+            max_queue_depth: MAX_QUEUE_DEPTH.load(Ordering::SeqCst),
+            send_blocked_ms: SEND_BLOCKED_NS.load(Ordering::SeqCst) as f64 / 1e6,
+            longest_send_blocked_ms: LONGEST_SEND_BLOCKED_NS.load(Ordering::SeqCst) as f64 / 1e6,
+        }
+    }
+}
+
 static SESSION_MANAGER: LazyLock<RwLock<ServerSessionManager>> = LazyLock::new(|| {
     RwLock::new(ServerSessionManager::new(
         FILESYSTEM_LAYOUT.get().map(|l| l.session()),
@@ -403,11 +508,10 @@ impl ServerCoreContext {
     ) {
         dbg_server_core!("send_video_nal");
 
-        // ADR-0011's send half. Was a bare `AtomicBool` named STREAM_CORRUPTED, plus a bypass
-        // when `avoid_video_glitching` was off (it defaults off), which is how a frame that
-        // broke the decoder's reference chain got transmitted anyway. The rule now lives in
-        // `x_transport::SendGate` with tests, and there is no setting that disables it.
-        static SEND_GATE: Mutex<x_transport::SendGate> = Mutex::new(x_transport::SendGate::new());
+        // ADR-0011's send half, at module scope so the session summary can read its counters.
+        // It used to be a bare `AtomicBool` here, plus a bypass when `avoid_video_glitching`
+        // was off — and it defaults off — which is how a frame that broke the decoder's
+        // reference chain got transmitted anyway.
         static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
             LazyLock::new(|| Mutex::new(Instant::now()));
 
@@ -468,7 +572,9 @@ impl ServerCoreContext {
                         .is_ok();
 
                     gate.on_send_result(admitted);
-                    if !admitted {
+                    if admitted {
+                        send_probe::enqueued();
+                    } else {
                         self.connection_context
                             .events_sender
                             .send(ServerCoreEvent::RequestIDR)

@@ -57,6 +57,29 @@ const VIDEO_FRAME_METADATA_HISTORY_SIZE: usize = 128;
 
 pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
 
+/// What the media plane knows about the frame currently being handed to the decoder.
+///
+/// Exists so a caller can *name* a frame. Without it, everything downstream — the
+/// harness CSV, the statistics, the display path — sees only a timestamp and a local
+/// index, and cannot join what it decoded against what the server transmitted. That join
+/// is the only way to tell "the server discarded this frame" from "the network lost it",
+/// which is the question the grey-frame investigation has never been able to answer.
+///
+/// Set immediately before the decoder callback is invoked, from the receive thread, so a
+/// callback reading it synchronously is reading its own frame. It is deliberately *not* a
+/// parameter of [`DecoderCallback`]: that signature is shared with the Android JNI bridge
+/// (`c_api.rs`), and widening it would change a C ABI the Android app is compiled against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurrentVideoFrame {
+    /// ADR-0011's monotonic frame index, allocated by the server at `Present`.
+    pub frame_index: u64,
+    /// Frames the server discarded, cumulative for this session, as seen from here.
+    pub missed_frames: u64,
+    /// Whether datagrams were lost *inside* this frame, as opposed to whole frames going
+    /// missing. The two have different causes and the distinction is the point.
+    pub had_datagram_loss: bool,
+}
+
 #[derive(Default)]
 pub struct ConnectionContext {
     pub state: RwLock<ConnectionState>,
@@ -66,6 +89,9 @@ pub struct ConnectionContext {
     pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
     pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
+    /// The frame the receive loop is about to hand to the decoder. See
+    /// [`CurrentVideoFrame`].
+    pub current_video_frame: RwLock<Option<CurrentVideoFrame>>,
     pub video_frame_metadata_queue: Mutex<VecDeque<(Duration, VideoFrameMetadata)>>,
     pub max_prediction: RwLock<Duration>,
 }
@@ -349,6 +375,15 @@ fn connection_pipeline(
 
                 match decision {
                     x_transport::FrameTrust::Trusted => {
+                        // Name the frame before handing it over, so anything the callback
+                        // does — decoding, logging, writing a CSV — can join what it got
+                        // against what the server sent.
+                        *ctx.current_video_frame.write() = Some(CurrentVideoFrame {
+                            frame_index: header.frame_index,
+                            missed_frames: trust.missed_frames(),
+                            had_datagram_loss,
+                        });
+
                         // Metadata must be available before the decoder can return this frame.
                         {
                             let queue_mut = &mut *ctx.video_frame_metadata_queue.lock();

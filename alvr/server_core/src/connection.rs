@@ -589,6 +589,10 @@ fn connection_pipeline(
 
     let initial_settings = session_manager_lock.settings().clone();
 
+    // Fresh instrumentation per session: counters that accumulate across connections are
+    // worse than none, because they look like a rate.
+    crate::reset_send_gate();
+
     // Resolve what this link actually is, once, and drive everything link-shaped from it:
     // the QoS posture, the WLAN optimizer, and host scheduling. The resolution is logged
     // in full because it is its own instrument — if the posture looks wrong later, this
@@ -986,15 +990,24 @@ fn connection_pipeline(
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
+                crate::send_probe::dequeued();
 
                 ctx.tracking_manager
                     .read()
                     .unrecenter_view_params(&mut header.global_view_params);
 
                 // todo: use get_buffer and make encoder write to socket buffers directly to avoid copy
+                //
+                // Timed because this is the *only* place the server can block: the socket
+                // write is a plain blocking `send`, so a receiver that stops draining fills
+                // the kernel send buffer and parks this thread here. That is the difference
+                // between the network losing a frame and the receiver being unable to take
+                // one, and the two need different fixes.
+                let write_started = Instant::now();
                 video_sender
                     .send_header_with_payload(&header, &payload)
                     .ok();
+                crate::send_probe::sent(write_started.elapsed());
             }
         }
     });
@@ -1498,6 +1511,26 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: Threads initialized; unlocking streams");
     alvr_common::wait_rwlock(&disconnect_notif, &mut session_manager_lock);
     dbg_connection!("connection_pipeline: Begin connection shutdown");
+
+    // The session's own instrumentation, printed before the threads come down so it is in the
+    // log even if the shutdown itself is what breaks. This is the block that answers "why did
+    // a frame go missing": the two counters at the end are what separate a stalled receiver
+    // from a lossy link, and nothing else can.
+    {
+        let probe = crate::send_probe::snapshot();
+        let gate = crate::send_gate_snapshot();
+        info!(
+            "Video send summary: {} frames sent, {} discarded (queue full), {} suppressed \
+             (reference chain), max queue depth {}/{}, send blocked {} ms total / {} ms longest",
+            probe.frames_sent,
+            gate.discarded,
+            gate.suppressed,
+            probe.max_queue_depth,
+            initial_settings.connection.max_queued_server_video_frames,
+            probe.send_blocked_ms,
+            probe.longest_send_blocked_ms,
+        );
+    }
 
     // This requests shutdown from threads
     *ctx.video_channel_sender.lock() = None;

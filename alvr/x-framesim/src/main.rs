@@ -81,12 +81,24 @@ const DEADLINES_MS: [(f64, &str); 2] = [
     (1000.0 / 120.0, "ideal    (120 Hz budget,  8.333 ms)"),
 ];
 
-/// One received frame: arrival instant, bitstream size, sender's timestamp.
+/// One received frame: arrival instant, bitstream size, sender's timestamp, and — since
+/// ADR-0011's frame index reaches here — its identity.
 #[derive(Clone, Copy)]
 struct Sample {
     at: Instant,
     size: usize,
     header_ts: Duration,
+    /// The server's monotonic frame index, if the receive loop could name it. `None` only
+    /// when no frame was in flight, which should not happen for a frame we are decoding.
+    frame_index: Option<u64>,
+    /// Cumulative frames the server discarded, as of this frame.
+    missed_frames: u64,
+    /// Whether datagrams were lost *inside* this frame, as opposed to whole frames going
+    /// missing. Different cause, different fix.
+    had_datagram_loss: bool,
+    /// How long this client spent inside the decode callback for this frame. The receive loop
+    /// calls it synchronously, so this is exactly the delay the receive path pays per frame.
+    client_ms: f64,
 }
 
 fn timeout() -> Duration {
@@ -734,23 +746,39 @@ fn main() {
     ctx.set_decoder_input_callback(Box::new(move |header_ts, nal| {
         let n = frames_seen.fetch_add(1, Ordering::SeqCst) + 1;
         bytes_seen.fetch_add(nal.len(), Ordering::SeqCst);
+        // ADR-0011's frame identity, read synchronously from the receive loop, which set it
+        // immediately before calling us. Without this the capture has no key to join against
+        // the server's own record of what it transmitted, and the two candidate causes of a
+        // missing frame — the server discarding it, and the network losing it — are
+        // indistinguishable.
+        let frame_id = ctx_for_cb.current_video_frame();
+        let arrived = Instant::now();
         if let Some(meta) = ctx_for_cb.report_compositor_start(header_ts)
             && let Some(shifts) = meta.foveation_center_shifts
             && let Ok(mut v) = fov_seen.lock()
         {
             v.push(shifts);
         }
-        if let Ok(mut s) = samples_seen.lock() {
-            s.push(Sample {
-                at: Instant::now(),
-                size: nal.len(),
-                header_ts,
-            });
-        }
 
         // Real decode: this is what turns "packets arrived" into "the client can
-        // actually show this".
+        // actually show this". Timed, because a client that cannot decode inside a frame
+        // interval is the leading hypothesis for the loss: the receive loop calls us
+        // synchronously, so a slow decode backs the socket up and the kernel starts
+        // discarding — which looks exactly like the network losing frames.
         decode_cb.on_access_unit(Some(&ctx_for_cb), header_ts, nal);
+        let client_ms = arrived.elapsed().as_secs_f64() * 1e3;
+
+        if let Ok(mut s) = samples_seen.lock() {
+            s.push(Sample {
+                at: arrived,
+                size: nal.len(),
+                header_ts,
+                frame_index: frame_id.map(|f| f.frame_index),
+                missed_frames: frame_id.map_or(0, |f| f.missed_frames),
+                had_datagram_loss: frame_id.is_some_and(|f| f.had_datagram_loss),
+                client_ms,
+            });
+        }
 
         if first_frame.swap(false, Ordering::SeqCst) || n % 60 == 0 {
             println!(
@@ -921,7 +949,28 @@ fn report(
     // Cadence deviation, centred on the median. The absolute offset is
     // unknowable (no shared clock, and the first frame sits queued behind
     // session setup); only the spread is real.
-    let interval = FRAME_INTERVAL_US as f64 / 1000.0;
+    //
+    // The interval is **derived, not assumed**. It used to be `FRAME_INTERVAL_US`, a
+    // hardcoded 90 Hz — and the emulated runs are pace-driven by whatever display rate the
+    // session negotiated, which was 30-45 Hz in every capture taken so far. With the wrong
+    // interval the deviation accumulates at (real - assumed) per frame and every number in
+    // the report is wrong by an amount proportional to the run length. Deriving it: loss only
+    // ever *multiplies* the true inter-arrival, so the smallest common observed gap is the
+    // source interval.
+    let interval = {
+        let mut gaps: Vec<f64> = (1..n)
+            .map(|i| s[i].header_ts.as_micros() as f64 - s[i - 1].header_ts.as_micros() as f64)
+            .filter(|g| *g > 0.0)
+            .collect();
+        if gaps.is_empty() {
+            FRAME_INTERVAL_US as f64 / 1000.0
+        } else {
+            gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            // The median of the smallest decile: robust to loss, and biased high if more
+            // than half the frames were lost, which makes the loss figure below a floor.
+            gaps[gaps.len() / 20] / 1000.0
+        }
+    };
     let mut dev: Vec<f64> = Vec::with_capacity(n);
     for (i, smp) in s.iter().enumerate() {
         let rel = smp.at.duration_since(s[0].at).as_secs_f64() * 1e3;
@@ -950,6 +999,67 @@ fn report(
         percentile(&cs, 0.99),
         cs[n - 1]
     );
+
+    // ---- ADR-0011's frame identity: the loss, exactly, and who caused it ----------------
+    //
+    // The server allocates `frame_index` once per frame at the earliest point the frame
+    // exists, and it reaches here. So the loss is a *set difference*, not an estimate from
+    // timestamps: frames the source produced, minus frames we decoded, and the shortfall is
+    // attributed by which ones never arrived.
+    {
+        let ids: Vec<u64> = s.iter().filter_map(|x| x.frame_index).collect();
+        if ids.len() >= 2 {
+            let first = ids[0];
+            let last = ids[ids.len() - 1];
+            let produced = last - first + 1;
+            let received = ids.len() as u64;
+            let lost = produced.saturating_sub(received);
+            println!(
+                "[framesim] LOSS (by frame identity, exact): source frames {first}..={last} = \
+                 {produced}, decoded {received}, missing {lost} ({:.1}%)",
+                100.0 * lost as f64 / produced.max(1) as f64
+            );
+
+            let with_loss = s.iter().filter(|x| x.had_datagram_loss).count();
+            println!(
+                "[framesim]   of the frames that did arrive: {with_loss} had datagrams lost \
+                 inside them (partial), {} arrived whole",
+                received as usize - with_loss
+            );
+            println!(
+                "[framesim]   server-reported cumulative discards at the last frame: {}",
+                s[n - 1].missed_frames
+            );
+
+            // The client's own per-frame cost. The receive loop calls the decode callback
+            // synchronously, so this is the time the receive path spends per frame — and if
+            // it exceeds the frame interval, the socket backs up and the *kernel* starts
+            // discarding, which is indistinguishable from the network losing frames unless
+            // you measure it.
+            let mut cost: Vec<f64> = s.iter().map(|x| x.client_ms).collect();
+            cost.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let over = cost.iter().filter(|c| **c > interval).count();
+            println!(
+                "[framesim] CLIENT COST: decode-callback p50 {:.2} ms, p90 {:.2} ms, p99 {:.2} \
+                 ms, max {:.2} ms; frame interval derived at {:.2} ms ({:.1} Hz); {over}/{} \
+                 frames ({:.1}%) exceeded it",
+                percentile(&cost, 0.5),
+                percentile(&cost, 0.9),
+                percentile(&cost, 0.99),
+                cost[cost.len() - 1],
+                interval,
+                1000.0 / interval,
+                n,
+                100.0 * over as f64 / n as f64,
+            );
+        } else {
+            println!(
+                "[framesim] LOSS: no frame identity reached the client — `frame_index` is \
+                 absent or not advancing, so the loss cannot be attributed. Fix that first; \
+                 every other number here is uninterpretable without it."
+            );
+        }
+    }
     println!("[framesim]   samples: {n} (99.99% needs >= 10000)");
 
     // Foveation on the wire: did the streamer actually send centres, and did
@@ -1036,7 +1146,7 @@ fn report(
                 let warns = decode.warnings();
                 let _ = writeln!(
                     f,
-                    "idx,header_ts_us,size_bytes,dev_ms,gap_ms,mean_luma,luma_std,tile_std,class,de265_warning"
+                    "idx,frame_index,header_ts_us,size_bytes,dev_ms,gap_ms,client_ms,missed_frames,datagram_loss,mean_luma,luma_std,tile_std,class,de265_warning"
                 );
                 let mut counts: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
@@ -1067,12 +1177,16 @@ fn report(
                         .unwrap_or_default();
                     let _ = writeln!(
                         f,
-                        "{},{},{},{:.3},{:.3},{},{},{},{},{}",
+                        "{},{},{},{},{:.3},{:.3},{:.3},{},{},{},{},{},{},{}",
                         i,
+                        s[i].frame_index.map_or(-1i64, |v| v as i64),
                         s[i].header_ts.as_micros(),
                         s[i].size,
                         centred[i],
                         gap,
+                        s[i].client_ms,
+                        s[i].missed_frames,
+                        s[i].had_datagram_loss as u8,
                         mean,
                         std,
                         tile,
@@ -1094,7 +1208,9 @@ fn report(
                     );
                 }
                 if missing > 0 {
-                    println!("[framesim]   ({missing} frames had no decoded picture to fingerprint)");
+                    println!(
+                        "[framesim]   ({missing} frames had no decoded picture to fingerprint)"
+                    );
                 }
             }
             Err(e) => eprintln!("[framesim] could not write CSV {path}: {e}"),

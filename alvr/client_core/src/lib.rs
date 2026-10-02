@@ -28,7 +28,7 @@ use alvr_packets::{
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
-use connection::{ConnectionContext, DecoderCallback};
+use connection::{ConnectionContext, CurrentVideoFrame, DecoderCallback};
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
@@ -266,6 +266,16 @@ impl ClientCoreContext {
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
             sender.send(&ClientControlPacket::RequestIdr).ok();
         }
+    }
+
+    /// The frame the receive loop is currently handing to the decoder, if any.
+    ///
+    /// Call this from inside a decoder callback: it is set synchronously immediately before
+    /// the callback runs, and it is the only way a callback can learn ADR-0011's frame
+    /// identity — which is what lets a capture separate a server-side discard from network
+    /// loss. See [`connection::CurrentVideoFrame`].
+    pub fn current_video_frame(&self) -> Option<CurrentVideoFrame> {
+        *self.connection_context.current_video_frame.read()
     }
 
     pub fn report_frame_decoded(&self, timestamp: Duration) {
