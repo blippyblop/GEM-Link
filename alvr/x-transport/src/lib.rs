@@ -58,8 +58,10 @@ pub use adaptive::{AdaptiveConfig, AdaptiveParity, RatioChange};
 pub use crypto::{KEY_LEN, MediaCipher};
 pub use fec::{FecError, decode_striped as fec_decode_striped, encode as fec_encode};
 pub use pacer::{Pacer, PacerConfig};
-pub use packetizer::{FrameMeta, Packetizer};
-pub use receiver::{DeliveredFrame, FrameOutcome, Receiver, ReceiverStats, ReleasePolicy};
+pub use packetizer::{FrameMeta, Packetizer, ParityPolicy};
+pub use receiver::{
+    DeliveredFrame, FrameOutcome, Receiver, ReceiverStats, RecvEvent, ReleasePolicy,
+};
 pub use trust::{FrameTrust, SendDecision, SendGate, SuppressReason, TrustGate, UntrustedReason};
 pub use wire::{Flags, FragmentHeader, HEADER_LEN};
 

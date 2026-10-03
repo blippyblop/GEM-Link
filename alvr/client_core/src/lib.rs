@@ -8,6 +8,9 @@
 mod c_api;
 mod connection;
 mod logging_backend;
+/// The client's video receive path, on the media plane (`x-transport`). See the module docs for
+/// why the receiver, the trust gate and the stall ladder are one type rather than three.
+pub mod media_plane;
 mod sockets;
 mod statistics;
 /// The stall ladder: one place where "how long do we wait, and what then" is decided. Shared by
