@@ -45,6 +45,13 @@ pub struct MediaSocket {
     datagrams_received: u64,
     datagrams_from_elsewhere: u64,
     datagrams_oversized: u64,
+    /// The last address a datagram actually came from.
+    ///
+    /// A receiver that does not know the sender's port — one that bound a well-known port and
+    /// accepted the first datagram from anywhere — needs this to reply. The media plane's feedback
+    /// goes back the way the stream came, and on a connection built this way that is the only way
+    /// to learn where "back" is.
+    last_sender: Option<SocketAddr>,
 }
 
 impl std::fmt::Debug for MediaSocket {
@@ -116,6 +123,7 @@ impl MediaSocket {
             datagrams_received: 0,
             datagrams_from_elsewhere: 0,
             datagrams_oversized: 0,
+            last_sender: None,
         }
     }
 
@@ -127,10 +135,28 @@ impl MediaSocket {
         self.peer
     }
 
+    /// A second handle on the same local port, for the other direction.
+    ///
+    /// A sender and a receiver should not share one object: the send path needs `&mut` for the
+    /// whole of a frame's datagrams while the receive path is blocked in `recv_from`, and the
+    /// counters for the two directions would be one jumbled number. Each half counts its own
+    /// direction, which is also the only way either number means anything.
+    pub fn try_clone(&self) -> ConResult<Self> {
+        let socket = self.socket.try_clone().to_con()?;
+        let mut clone = Self::from_socket(socket);
+        clone.peer = self.peer;
+        Ok(clone)
+    }
+
     /// Only accept datagrams from this address. A session knows its peer, and a client that accepts
     /// a datagram from anywhere is a client that will believe anything.
     pub fn accept_only_from(&mut self, peer: SocketAddr) {
         self.peer = Some(peer);
+    }
+
+    /// The address the last datagram came from, for a receiver that has to reply.
+    pub fn last_sender(&self) -> Option<SocketAddr> {
+        self.last_sender
     }
 
     pub fn datagrams_sent(&self) -> u64 {
@@ -208,6 +234,7 @@ impl DatagramSource for MediaSocket {
                 }
 
                 self.datagrams_received += 1;
+                self.last_sender = Some(from);
                 out.clear();
                 out.extend_from_slice(&buffer[..len]);
                 SourceEvent::Datagram

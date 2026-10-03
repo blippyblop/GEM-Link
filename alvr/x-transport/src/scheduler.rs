@@ -113,6 +113,16 @@ impl TimebaseOffset {
     pub fn to_client(&self, target: Duration) -> Duration {
         target + self.offset
     }
+
+    /// Translate this end's clock into the stream's — the inverse of [`Self::to_client`].
+    ///
+    /// The *sending* end needs this and not the other direction: its frames carry a target time in
+    /// the stream's clock, and its clock is its own, so "how stale is this frame" is
+    /// `from_local(now) - target`. Without the correction the two clocks are unrelated numbers and
+    /// every deadline check is nonsense.
+    pub fn from_local(&self, local: Duration) -> Duration {
+        local.saturating_sub(self.offset)
+    }
 }
 
 /// The knobs. Only two, and both are facts about the device rather than tuning parameters.

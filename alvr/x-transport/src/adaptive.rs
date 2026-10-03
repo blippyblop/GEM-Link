@@ -13,8 +13,11 @@
 //!
 //! **Fast up, slow down, and a deadband between.** Each of those is load-bearing:
 //!
-//! - **Fast up.** Parity you needed and did not have cost you a frame. The next window has to be
-//!   protected, so a loss observation raises the ratio immediately — one step, per window.
+//! - **Fast up, and *proportional*.** Parity you needed and did not have cost you a frame, so a loss
+//!   observation raises the ratio immediately — and to where the measurement says it belongs, not one
+//!   step toward it. A purely multiplicative ramp has to *search* for the right ratio, and every
+//!   window it spends searching is a window of lost frames. `loss × safety` answers directly; the
+//!   multiplicative step is kept as a floor so a barely-over-threshold window still moves.
 //! - **Slow down.** Parity you have and do not need costs bandwidth, which is recoverable. A single
 //!   clean window proves very little (loss is bursty — the bench found that i.i.d. loss is kinder
 //!   than reality), so lowering takes several consecutive clean windows.
@@ -33,17 +36,22 @@ use crate::packetizer::ParityPolicy;
 /// bench scenario can move.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdaptiveConfig {
-    /// Where the ratio starts. Matches the static default so behaviour without adaptation is
-    /// unchanged for the first window.
+    /// Where the ratio starts. **High**, deliberately: see "start protected" above. It is earned
+    /// down over the first second of a clean session rather than found upward from a lossy one.
     pub initial: f32,
     /// Never go below this.
     pub min: f32,
     /// Never go above this. A ratio is overhead on every byte; past this it is cheaper to lower
     /// the source rate than to keep buying repair shards.
     pub max: f32,
-    /// Multiplicative step upward. Multiplicative, not additive, because the useful ratio scales
-    /// with the loss: 1 % -> 2 % is one doubling, and so is 8 % -> 16 %.
+    /// Multiplicative step upward, kept as a *floor* under the proportional step. Multiplicative
+    /// rather than additive because the useful ratio scales with the loss: 1 % -> 2 % is one
+    /// doubling, and so is 8 % -> 16 %.
     pub up_factor: f32,
+    /// How many times the measured loss to buy, when raising. Three is the point where the expected
+    /// residual after one repair round is negligible *and* the FEC alone usually covers it, which is
+    /// the difference between a repair that is asked for and a repair that is not needed.
+    pub loss_safety: f32,
     /// Multiplicative step downward, applied only after a run of clean windows.
     pub down_factor: f32,
     /// Measured loss above this raises the ratio.
@@ -57,12 +65,15 @@ pub struct AdaptiveConfig {
 impl Default for AdaptiveConfig {
     fn default() -> Self {
         Self {
-            initial: 0.05,
+            // Start protected. A link's loss is unknown at the first frame, and the cost of being
+            // wrong upward is bandwidth while the cost of being wrong downward is lost frames.
+            initial: 0.25,
             min: 0.0,
             // 50 % overhead is the ceiling: beyond it the code rate is below 1.5:1 and the honest
             // move is to send fewer pixels, not more shards.
             max: 0.5,
             up_factor: 1.6,
+            loss_safety: 3.0,
             down_factor: 0.8,
             // A window at or below 0.5 % loss is "clean"; above 2 % it needs more parity. Between
             // them, do nothing — that band is what stops the oscillation.
@@ -160,7 +171,21 @@ impl AdaptiveParity {
             // Any loss means the current ratio was insufficient. Raise now, and reset the clean
             // run: a lossy window is not a clean one.
             self.clean_run = 0;
-            let to = (self.fraction * self.config.up_factor).min(self.config.max);
+
+            // Does the ratio already cover this loss? If it does, there is nothing to buy: parity
+            // that is already sufficient is sufficient, and raising anyway is a ratchet that walks
+            // to the ceiling and stays there. This check is what makes "no loss" a target the
+            // controller can *reach* rather than overshoot.
+            let proportional = loss_fraction as f32 * self.config.loss_safety;
+            if self.fraction >= proportional {
+                return RatioChange::Unchanged;
+            }
+
+            // Where the measurement says, not one step toward it. The multiplicative step stays as
+            // a floor so a ratio far below the measurement still moves by a useful amount.
+            let to = (self.fraction * self.config.up_factor)
+                .max(proportional)
+                .min(self.config.max);
             if to > self.fraction {
                 let from = self.fraction;
                 self.fraction = to;
@@ -209,15 +234,76 @@ mod tests {
     }
 
     #[test]
-    fn loss_raises_the_ratio_immediately() {
+    fn loss_raises_the_ratio_immediately_and_to_where_the_measurement_says() {
         let mut c = controller();
-        assert_eq!(c.fraction(), 0.05);
+        assert_eq!(c.fraction(), 0.25);
+
+        // A window that starts at the protected floor and sees 10 % loss must jump straight past
+        // it: `loss × safety` is 30 %, which the ceiling of 50 % allows.
         let change = c.observe(0.10);
         assert!(
             matches!(change, RatioChange::Raised { .. }),
             "a lossy window must buy parity at once, not after a run of them"
         );
-        assert!(c.fraction() > 0.05);
+        assert!(
+            c.fraction() >= 0.30,
+            "the ratio must be at least what the measurement asks for: {} ",
+            c.fraction()
+        );
+
+        // And from a low ratio the proportional step is what decides.
+        let mut c = AdaptiveParity::new(AdaptiveConfig {
+            initial: 0.02,
+            ..AdaptiveConfig::default()
+        });
+        assert_eq!(
+            c.observe(0.08),
+            RatioChange::Raised {
+                from: 0.02,
+                to: 0.24
+            }
+        );
+    }
+
+    #[test]
+    fn a_ratio_that_covers_the_link_stops_rising() {
+        // The property that makes "no loss" a target rather than a hope. An overshooting controller
+        // walks to the ceiling and stays there, buying parity for loss that is already covered.
+        let mut c = controller();
+        assert_eq!(
+            c.observe(0.05),
+            RatioChange::Unchanged,
+            "25 % against 5 % loss is fifteen times the measurement; nothing to buy"
+        );
+
+        // Raised to where it covers, and then held.
+        let mut c = controller();
+        assert!(c.observe(0.20).changed()); // 25 < 60 %, so it raises
+        let covered = c.fraction();
+        assert!(covered >= 0.50, "the ceiling is 0.5, and 60 % is past it");
+        assert_eq!(c.observe(0.20), RatioChange::Unchanged);
+        assert_eq!(c.fraction(), covered);
+    }
+
+    #[test]
+    fn a_session_starts_protected_and_earns_a_cheaper_ratio() {
+        // Frame loss is not recoverable and bandwidth is. The first second of a session is where a
+        // link proves itself, and it is not where frames should be spent finding out.
+        let mut c = controller();
+        assert!(
+            c.fraction() >= 0.20,
+            "a session must open protected: {} is not",
+            c.fraction()
+        );
+
+        for _ in 0..(8 * 30) {
+            c.observe(0.0);
+        }
+        assert!(
+            c.fraction() < 0.10,
+            "thirty clean windows must have bought a cheaper ratio: {}",
+            c.fraction()
+        );
     }
 
     #[test]

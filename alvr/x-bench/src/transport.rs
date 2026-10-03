@@ -34,11 +34,7 @@
 //! * **No clock skew, no glass.** These are media-plane numbers; the glass-to-glass
 //!   instrument does not exist yet (ROADMAP "known coverage gaps").
 
-use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
-    time::Duration,
-};
+use std::{cmp::Reverse, collections::BinaryHeap, time::Duration};
 
 use x_transport::{
     DatagramSink, Feedback, FeedbackOutcome, FeedbackReceiver, FeedbackSender, KeySchedule,
@@ -97,6 +93,14 @@ pub struct TransportScenario {
     /// Frames that arrived but were too late to be the frame for their own period. Also zero, for
     /// the same reason: a frame shown late is a frame the latency budget already spent.
     pub max_late_pct: f64,
+    /// The same missing figure over the **second half** of the run, for a scenario whose sender is
+    /// adapting. A controller may open at the wrong ratio — that is the cost of not knowing the
+    /// link — but it has to stop losing frames once it has measured it.
+    pub max_missing_tail_pct: f64,
+    /// Repair overhead on the wire, as a percentage of datagrams sent. Per scenario, because parity
+    /// is *bought* against loss: a fixed ceiling would make a lossy link's protection look like a
+    /// defect when it is the mechanism working.
+    pub max_fec_overhead_pct: f64,
 }
 
 impl TransportScenario {
@@ -171,8 +175,16 @@ pub struct TransportMetrics {
     pub max_media_latency_p95_ms: f64,
     pub max_missing_pct: f64,
     pub max_late_pct: f64,
+    pub max_missing_tail_pct: f64,
+    pub max_fec_overhead_pct: f64,
+    /// The ratio the sender was running at when the run ended.
+    pub final_fec_fraction: f32,
     /// Frames the client never got at all — no payload ever reached the display path.
     pub frames_missing: u64,
+    /// The same, over the **second half** of the run. For a sender whose FEC ratio adapts, this is
+    /// the number that says whether it settled: a transient at the start is the cost of not knowing
+    /// the link, and a tail that is still losing frames is the controller not working.
+    pub frames_missing_tail: u64,
     /// What the sender did: repairs answered, repairs refused and why, keyframes asked for.
     pub sender: SenderStats,
     /// Feedback the client sent, and how much of it the sender acted on.
@@ -334,76 +346,29 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
 
     let mut datagrams_offered = 0u64;
     let mut datagrams_lost = 0u64;
-    let mut first_send: HashMap<u64, Duration> = HashMap::new();
 
-    // -- send every frame, through the real sender ------------------------------------------
-    let mut send_clock = Duration::ZERO;
-    let mut in_stall_until: Option<Duration> = None;
-
-    for frame_index in 1..=scenario.frames as u64 {
-        if let Some(period) = stall_period
-            && frame_index.is_multiple_of(period as u64)
-        {
-            in_stall_until = Some(send_clock + stall_duration);
-        }
-        first_send.insert(frame_index, send_clock);
-
-        let meta = FrameMeta {
-            frame_index,
-            target_timestamp_us: (frame_index as f64 * frame_interval.as_secs_f64() * 1e6) as u64,
-            // A keyframe every 30 frames, which is what a real encoder does between requested
-            // IDRs. The flag is one bit and adds no bytes, so it changes no scenario's delivery —
-            // it is here so the path that carries it is exercised end to end.
-            is_keyframe: frame_index == 1 || frame_index.is_multiple_of(30),
-            key_epoch: 0,
-        };
-
-        let mut net = Net {
-            queue: &mut queue,
-            payloads: &mut payloads,
-            seq: &mut event_seq,
-            rng: &mut rng,
-            profile: &scenario.profile,
-            send_at: send_clock,
-            stall_until: in_stall_until,
-            offered: 0,
-            lost: 0,
-        };
-        sender.send_frame(&mut net, meta, &payload, send_clock);
-        datagrams_offered += net.offered;
-        datagrams_lost += net.lost;
-
-        send_clock += frame_interval;
-    }
-
-    // -- deliver, and answer the client's repair requests -----------------------------------
+    // -- one timeline: send, deliver, ask, release --------------------------------------------
     //
-    // A NACK is sent one round trip after the frame's *own* datagrams were handed to the network,
-    // which is the earliest moment the receiver could know what is missing, and it takes another
-    // round trip to arrive. Whether that is early enough is not assumed: on a 25 ms link the repair
-    // lands three frame intervals after the reorder window has already given the frame up, the
-    // sender refuses it, and the count of refusals is the evidence rather than an opinion.
-    // When the client asks: as soon as its straggler window has closed and the hole is therefore
-    // real. Not `first_send + rtt`, which is what this used to be and which delayed the ask by a
-    // whole round trip for no reason — long enough, on a wired link, that the frame had already
-    // been released by the time the request was built.
-    //
-    // And it asks **again** while the frame is still held, because one round on a lossy link is one
-    // round of 8 % loss applied to the repair itself: the fragments that were re-sent can be lost
-    // too, and the only thing that converts "mostly repaired" into "repaired" is asking again while
-    // there is still time. That is a real client behaviour, not a bench convenience — the feedback
-    // module names the interval (`nack_retry_interval`).
+    // **Interleaved, and that is not a detail.** This used to send every frame and only then start
+    // delivering them, which worked with a hand-rolled sender holding an unbounded `HashMap` of
+    // everything it had ever sent — and is not how a session works. The real sender keeps a bounded
+    // cache, so by the time delivery began it held only the last sixteen frames and every repair
+    // request for an earlier one was refused as unknown. A live session interleaves; so does this.
+    let one_way = Duration::from_secs_f64(scenario.profile.one_way_latency_ms / 1000.0);
     let ask_at = release_policy.straggler_delay;
     let retry = x_transport::nack_retry_interval(rtt);
-    let one_way = Duration::from_secs_f64(scenario.profile.one_way_latency_ms / 1000.0);
-    let mut ask_schedule: BinaryHeap<Reverse<(u128, u64)>> = first_send
-        .iter()
-        .map(|(frame_index, sent_at)| {
-            Reverse(((*sent_at + one_way + ask_at).as_nanos(), *frame_index))
-        })
-        .collect();
 
-    let mut released: Vec<(u64, Duration)> = Vec::new();
+    let mut next_frame: u64 = 1;
+    let mut send_clock = Duration::ZERO;
+    let mut in_stall_until: Option<Duration> = None;
+    // Filled as frames are sent, because an ask cannot be scheduled before the frame it is about.
+    let mut ask_schedule: BinaryHeap<Reverse<(u128, u64)>> = BinaryHeap::new();
+
+    // `(frame_index, when, usable)`. The third field is what makes `frames_missing` and its
+    // tail-window counterpart computable from one pass: a frame that was released without a payload
+    // is a frame the client never got, and one released *late* in the run is the one that says
+    // whether an adapting sender settled.
+    let mut released: Vec<(u64, Duration, bool)> = Vec::new();
     let mut displayed_but_unreconstructable = 0u64;
     let mut nacks_sent = 0u64;
     let mut nacks_answered = 0u64;
@@ -411,13 +376,6 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
     let mut keyframe_requests = 0u64;
     let mut last_now = Duration::ZERO;
 
-    // The client's NACK timer is on its **own** clock, and this loop is the correction for that.
-    //
-    // It used to fire only when the next datagram happened to arrive, which on a clean link is one
-    // frame interval later — by which point the frame had been released and `nack()` returned
-    // nothing. The retransmit path was therefore never exercised at all on the lossy scenarios, and
-    // the metrics read "no repairs needed" when the truth was "no repair was ever asked for". A real
-    // client has a timer; so does this one now.
     loop {
         let next_arrival = queue
             .peek()
@@ -425,26 +383,66 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
         let next_action = ask_schedule
             .peek()
             .map(|Reverse((nanos, _))| Duration::from_nanos(*nanos as u64));
+        let next_send = (next_frame <= scenario.frames as u64).then_some(send_clock);
 
-        let now = match (next_arrival, next_action) {
-            (None, None) => break,
-            (Some(arrival), None) => arrival,
-            (None, Some(action)) => action,
-            (Some(arrival), Some(action)) => arrival.min(action),
+        let candidates = [next_arrival, next_action, next_send];
+        let Some(now) = candidates.into_iter().flatten().min() else {
+            break;
         };
         last_now = last_now.max(now);
 
-        // Whatever this event is, take the opportunity the clock has given us.
-        for frame in receiver.release(now) {
-            if frame.is_displayable() && frame.payload().is_none() {
-                // A displayable frame without a payload is the exact contradiction ADR-0011
-                // forbids, and the only way this counter can be non-zero.
-                displayed_but_unreconstructable += 1;
+        // 1. The frame that is due. Sent first so its datagrams can land in this same instant.
+        if next_send == Some(now) {
+            if let Some(period) = stall_period
+                && next_frame.is_multiple_of(period as u64)
+            {
+                in_stall_until = Some(now + stall_duration);
             }
-            released.push((frame.frame_index, now));
+
+            let meta = FrameMeta {
+                frame_index: next_frame,
+                target_timestamp_us: (next_frame as f64 * frame_interval.as_secs_f64() * 1e6)
+                    as u64,
+                // A keyframe every 30 frames, which is what a real encoder does between requested
+                // IDRs. The flag is one bit and adds no bytes, so it changes no scenario's delivery
+                // — it is here so the path that carries it is exercised end to end.
+                is_keyframe: next_frame == 1 || next_frame.is_multiple_of(30),
+                key_epoch: 0,
+            };
+
+            let mut net = Net {
+                queue: &mut queue,
+                payloads: &mut payloads,
+                seq: &mut event_seq,
+                rng: &mut rng,
+                profile: &scenario.profile,
+                send_at: now,
+                stall_until: in_stall_until,
+                offered: 0,
+                lost: 0,
+            };
+            sender.send_frame(&mut net, meta, &payload, now);
+            datagrams_offered += net.offered;
+            datagrams_lost += net.lost;
+
+            // The client's repair timer starts now, not at the frame's first datagram: it can only
+            // know what is missing once it has stopped expecting more.
+            ask_schedule.push(Reverse(((now + one_way + ask_at).as_nanos(), next_frame)));
+
+            next_frame += 1;
+            send_clock += frame_interval;
         }
 
-        // The repair timer, at the instant it actually expires.
+        // 2. Take the datagram that is due.
+        if next_arrival == Some(now) {
+            let Some(Reverse((_, seq))) = queue.pop() else {
+                break;
+            };
+            let datagram = std::mem::take(&mut payloads[seq as usize]);
+            receiver.on_datagram(&datagram, now);
+        }
+
+        // 3. The client's repair timer, at the instant it expires — while the frame is still held.
         while ask_schedule
             .peek()
             .is_some_and(|Reverse((nanos, _))| Duration::from_nanos(*nanos as u64) <= now)
@@ -455,10 +453,12 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
             }
 
             let missing = receiver.nack(frame_index);
-            if !missing.is_empty() {
-                // Still held and still incomplete: ask again inside the window that is left.
-                ask_schedule.push(Reverse(((now + retry).as_nanos(), frame_index)));
+            if missing.is_empty() {
+                continue;
             }
+            // Still held and still incomplete: ask again inside the window that is left. One round
+            // on a lossy link is one round of that same loss applied to the repair itself.
+            ask_schedule.push(Reverse(((now + retry).as_nanos(), frame_index)));
 
             for feedback in Feedback::nack_chunks(frame_index, &missing) {
                 nacks_sent += 1;
@@ -479,10 +479,7 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
 
                 let Some(opened) = opened else { continue };
 
-                // The request takes one hop; the repair takes another. Getting this wrong by a
-                // factor of two is invisible until it puts the repair just past the frame's own
-                // repair window, which is exactly what happened: 379 repairs sent, none of them
-                // in time.
+                // The request takes one hop; the repair takes another.
                 let sender_acts_at = now + one_way;
                 let mut net = Net {
                     queue: &mut queue,
@@ -508,12 +505,13 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
             }
         }
 
-        if next_arrival == Some(now) {
-            let Some(Reverse((_, seq))) = queue.pop() else {
-                break;
-            };
-            let datagram = std::mem::take(&mut payloads[seq as usize]);
-            receiver.on_datagram(&datagram, now);
+        // 4. Release what is ready — last, so an ask for a frame this instant has already been made
+        // while it was still held.
+        for frame in receiver.release(now) {
+            if frame.is_displayable() && frame.payload().is_none() {
+                displayed_but_unreconstructable += 1;
+            }
+            released.push((frame.frame_index, now, frame.is_displayable()));
         }
     }
 
@@ -528,7 +526,7 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
             if frame.is_displayable() && frame.payload().is_none() {
                 displayed_but_unreconstructable += 1;
             }
-            released.push((frame.frame_index, drain_now));
+            released.push((frame.frame_index, drain_now, frame.is_displayable()));
         }
         if receiver.in_flight() == 0 {
             break;
@@ -538,11 +536,27 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
         if frame.is_displayable() && frame.payload().is_none() {
             displayed_but_unreconstructable += 1;
         }
-        released.push((frame.frame_index, drain_now));
+        released.push((frame.frame_index, drain_now, frame.is_displayable()));
     }
 
     let stats = *receiver.stats();
     let sender_stats = *sender.stats();
+
+    // Delivered, as this run counted it. `stats.frames_deliverable()` and this can disagree when a
+    // run ends with frames still in flight, and the run's own count is the one the caller saw.
+    let usable = released.iter().filter(|(_, _, usable)| *usable).count() as u64;
+    let tail_start = scenario.frames as u64 / 2;
+    // `tail_frames - what was delivered`, which counts a frame released without a payload and one
+    // that never came out at all. Counting the former separately double-counted it: a drained frame
+    // with no payload is not delivered either, and the first version of this reported 212 %.
+    let frames_missing_tail = (scenario.frames as u64)
+        .saturating_sub(tail_start)
+        .saturating_sub(
+            released
+                .iter()
+                .filter(|(index, _, usable)| *index >= tail_start && *usable)
+                .count() as u64,
+        );
 
     // -- latency: the media plane's *own* contribution ---------------------------------------
     // Measured from the instant the frame should have arrived rather than the instant it was
@@ -552,7 +566,7 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
     let nominal_arrival_ms = scenario.profile.one_way_latency_ms;
     let mut latencies: Vec<f64> = released
         .iter()
-        .map(|(frame_index, at)| {
+        .map(|(frame_index, at, _)| {
             let target =
                 Duration::from_secs_f64((*frame_index as f64 - 1.0) * frame_interval.as_secs_f64());
             (at.saturating_sub(target).as_secs_f64() * 1000.0 - nominal_arrival_ms).max(0.0)
@@ -574,12 +588,10 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
     let budget_ms = frame_interval.as_secs_f64() * 1000.0;
     let late_frames = latencies.iter().filter(|ms| **ms > budget_ms).count() as u64;
 
-    let data_shards =
-        stats.frames_complete + stats.frames_recovered + stats.frames_unreconstructable;
-    let fec_overhead_pct = if data_shards == 0 {
+    let fec_overhead_pct = if sender_stats.datagrams_sent == 0 {
         0.0
     } else {
-        sender_stats.parity_datagrams as f64 / sender_stats.datagrams_sent.max(1) as f64 * 100.0
+        sender_stats.parity_datagrams as f64 / sender_stats.datagrams_sent as f64 * 100.0
     };
 
     TransportMetrics {
@@ -610,8 +622,15 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
         max_unreconstructable_pct: scenario.max_unreconstructable_pct,
         max_media_latency_p95_ms: scenario.max_media_latency_p95_ms,
         max_missing_pct: scenario.max_missing_pct,
+        max_missing_tail_pct: scenario.max_missing_tail_pct,
         max_late_pct: scenario.max_late_pct,
-        frames_missing: (scenario.frames as u64).saturating_sub(stats.frames_deliverable()),
+        max_fec_overhead_pct: scenario.max_fec_overhead_pct,
+        final_fec_fraction: match sender.parity_policy() {
+            ParityPolicy::Ratio { fraction } => fraction,
+            _ => 0.0,
+        },
+        frames_missing: (scenario.frames as u64).saturating_sub(usable),
+        frames_missing_tail,
         sender: sender_stats,
         nacks_sent,
         nacks_answered,
@@ -655,8 +674,14 @@ pub fn transport_scenarios() -> Vec<TransportScenario> {
             max_unreconstructable_pct: 0.0,
             max_media_latency_p95_ms: window_ms + 10.0,
             // The target, and the mechanisms have to earn it.
+            // **The target, on every scenario.** A frame the client never got is a frame the
+            // reference chain lost, and every P-frame behind it decodes to something plausible and
+            // wrong. The FEC ratio is a property of the link and the sender now measures it, so a
+            // non-zero value here is a mechanism not working rather than a link being unfair.
             max_missing_pct: 0.0,
+            max_missing_tail_pct: 0.0,
             max_late_pct: late_is_inherent(profile_name),
+            max_fec_overhead_pct: 12.0,
         }
     };
 
@@ -692,18 +717,39 @@ pub fn transport_scenarios() -> Vec<TransportScenario> {
                 loss_pct: 8.0,
                 ..profile("ncm_wired").expect("known profile")
             },
+            // **Sized to the link.** 8 % datagram loss needs a code that covers 8 %, and the
+            // controller's own law (`loss × 3`) lands on 24 % for it. A 5 % code here was the old
+            // scenario's way of guaranteeing the repair round had something to do; now that the
+            // repair round works, the honest question is whether a *correctly sized* code loses
+            // anything at all.
+            fec_fraction: 0.25,
+            max_fec_overhead_pct: 30.0,
             // Beyond both mechanisms some frames will be lost, and the scenario says so
             // rather than pretending. Most are recovered; the budget is what is left.
-            // **Deliberately past what a 5 % code plus one repair round can cover**, which is why
-            // the budget is stated rather than the metric excused. The scenario's own comment says
-            // it: the loss rate is above what the code can carry *so that the repair round has
-            // something to do*. The number worth reading is the comparison — 31 % delivered with
-            // the repair round against 0 % without it (`control_wired_fec_only`) — not the budget.
-            // A real session facing this link would raise its FEC ratio, which is what
-            // `MediaSender::observe_loss` is for.
-            max_unreconstructable_pct: 70.0,
-            max_missing_pct: 70.0,
-            max_late_pct: 0.0,
+            max_unreconstructable_pct: 0.0,
+            ..base("x", "ncm_wired")
+        },
+        // The same link, starting from a ratio that does not cover it. This is the scenario that
+        // measures the *controller*: a sender that opens at 5 % on an 8 % link loses frames until
+        // it has measured the link, and the tail figure is what says it stopped. The head is the
+        // cost of not knowing, and it is bounded and visible rather than assumed away.
+        TransportScenario {
+            name: "transport_wired_lossy_adapting".into(),
+            profile: ImpairmentProfile {
+                loss_pct: 8.0,
+                ..profile("ncm_wired").expect("known profile")
+            },
+            fec_fraction: 0.05,
+            // Long enough for the ratio to settle and to measure the settled state, and no longer.
+            // The controller closes its window every eight frames, so the ratio is right by frame
+            // nine; the rest is the settled measurement. (It was 180 frames and the GF(256) encode
+            // made that a two-minute run under emulation, which is a test nobody would keep.)
+            frames: 48,
+            // The head is allowed to lose: it is the whole point of the scenario. The *tail* is not.
+            max_missing_pct: 25.0,
+            max_missing_tail_pct: 0.0,
+            max_unreconstructable_pct: 25.0,
+            max_fec_overhead_pct: 30.0,
             ..base("x", "ncm_wired")
         },
         TransportScenario {
@@ -717,6 +763,7 @@ pub fn transport_scenarios() -> Vec<TransportScenario> {
             // No retransmit and 8 % loss against a 5 % code: this is the arm that shows what the
             // repair round is worth, so its budget is deliberately "anything".
             max_missing_pct: 100.0,
+            max_missing_tail_pct: 100.0,
             max_late_pct: 0.0,
             ..base("x", "ncm_wired")
         },
@@ -728,7 +775,9 @@ pub fn transport_scenarios() -> Vec<TransportScenario> {
             retransmit: false,
             max_unreconstructable_pct: 100.0,
             max_missing_pct: 100.0,
+            max_missing_tail_pct: 100.0,
             max_late_pct: 100.0,
+            max_fec_overhead_pct: 100.0,
             ..base("x", "wifi7_regrace")
         },
         TransportScenario {
@@ -737,7 +786,9 @@ pub fn transport_scenarios() -> Vec<TransportScenario> {
             retransmit: false,
             max_unreconstructable_pct: 100.0,
             max_missing_pct: 100.0,
+            max_missing_tail_pct: 100.0,
             max_late_pct: 100.0,
+            max_fec_overhead_pct: 100.0,
             ..base("x", "cqm_churn")
         },
         TransportScenario {
@@ -813,12 +864,33 @@ pub fn check_transport_gates(m: &TransportMetrics) -> Vec<String> {
         ));
     }
 
-    // Overhead must stay sane; a code that needs 30 % to work is not a code, it is a
-    // smaller frame rate with extra steps.
-    if m.fec_overhead_pct > 12.0 {
+    // The tail of an adapting run, which is the claim a controller makes: it may open at the wrong
+    // ratio, but it must stop losing frames once it has measured the link.
+    let tail_frames = m.frames_sent as u64 / 2;
+    let tail_missing_pct = if tail_frames == 0 {
+        0.0
+    } else {
+        m.frames_missing_tail as f64 / tail_frames as f64 * 100.0
+    };
+    if tail_missing_pct > m.max_missing_tail_pct {
         failures.push(format!(
-            "{}: FEC overhead {:.1}% exceeds 12%",
-            m.scenario, m.fec_overhead_pct
+            "{}: {:.1}% of frames in the second half never arrived ({} of {}, budget {:.1}%) — the              FEC ratio settled at {:.0}% against {:.2}% measured loss",
+            m.scenario,
+            tail_missing_pct,
+            m.frames_missing_tail,
+            tail_frames,
+            m.max_missing_tail_pct,
+            m.final_fec_fraction * 100.0,
+            m.sender.last_loss * 100.0,
+        ));
+    }
+
+    // Overhead is *bought* against loss, so the ceiling is per scenario. A fixed one would make a
+    // lossy link's protection look like a defect, when it is the mechanism working.
+    if m.fec_overhead_pct > m.max_fec_overhead_pct {
+        failures.push(format!(
+            "{}: FEC overhead {:.1}% exceeds its {:.1}% budget",
+            m.scenario, m.fec_overhead_pct, m.max_fec_overhead_pct
         ));
     }
 
@@ -868,6 +940,7 @@ pub fn mandatory_missed_pct(m: &TransportMetrics, fps: u16) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::OnceLock;
 
     /// Every scenario, run once per test binary.

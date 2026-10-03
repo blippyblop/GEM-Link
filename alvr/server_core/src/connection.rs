@@ -25,6 +25,7 @@ use alvr_packets::{
     RealTimeConfig, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
     VIDEO, VideoPacketHeader,
 };
+use alvr_session::BitrateMode;
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile, Settings,
     SocketProtocol, SteamvrHmdInitConfig,
@@ -42,6 +43,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use x_transport::{
+    DatagramSink, DatagramSource, Feedback, FeedbackOutcome, FrameMeta, MediaSender, PacerConfig,
+    ParityPolicy, SenderConfig, SourceEvent, TimebaseOffset,
+};
 
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -49,6 +54,54 @@ pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
+
+/// Where the media plane's FEC ratio starts before it has measured the link.
+///
+/// A *starting point*, not a setting. `MediaSender` measures the loss from the repairs the client
+/// asks for and sizes the code to it, so the only job of this number is to be wrong in the safe
+/// direction on the first frame: loss is unrecoverable and bandwidth is not.
+const MEDIA_STARTING_FEC_FRACTION: f32 = 0.25;
+
+/// What the sender assumes a repair round costs, until a measurement replaces it.
+///
+/// Consumed in exactly one place — refusing a repair that could not arrive before the client gives
+/// up on the frame — so an over-estimate costs a repair that would have worked and an
+/// under-estimate costs bandwidth on a frame that cannot be shown.
+const MEDIA_ROUND_TRIP: Duration = Duration::from_millis(6);
+
+/// The client's release policy for a session at `fps`.
+///
+/// The sender needs the same numbers the client will use, because a repair is only worth sending if
+/// it arrives before the client stops waiting. Written down once and used on both ends: the client's
+/// own is built from the same function.
+fn media_release_policy(fps: f32) -> x_transport::ReleasePolicy {
+    let frame_interval = Duration::from_secs_f32(1.0 / fps.max(1.0));
+    // The link's jitter and its stalls are the client's to measure; what the *server* needs from
+    // this policy is the deadline, and the dominating term in it is the round trip. A generous
+    // straggler window here costs nothing — it only makes the server willing to repair for slightly
+    // longer than the client will wait, and the `WouldArriveLate` check is what actually bounds it.
+    x_transport::ReleasePolicy::for_link(
+        Duration::from_millis(2),
+        Duration::ZERO,
+        MEDIA_ROUND_TRIP,
+        frame_interval,
+    )
+}
+
+/// The bitrate the pacer is sized for.
+///
+/// The pacer does not decide the rate — that is the bitrate controller's job, and a pacer that also
+/// adapted would be two controllers fighting over one actuator. This is the rate the *settings* ask
+/// for, and the frame-level `over_budget` warning is how the settings find out they are wrong.
+fn nominal_bitrate_bps(settings: &alvr_session::Settings) -> u64 {
+    match &settings.video.bitrate.mode {
+        BitrateMode::ConstantMbps(mbps) => *mbps * 1_000_000,
+        BitrateMode::Adaptive {
+            max_throughput_mbps,
+            ..
+        } => *max_throughput_mbps * 1_000_000,
+    }
+}
 
 pub struct VideoPacket {
     pub header: VideoPacketHeader,
@@ -960,7 +1013,42 @@ fn connection_pipeline(
         TrackingManager::new(initial_settings.connection.statistics_history_size);
 
     let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
-    let mut video_sender = socket.request_unreliable_stream(VIDEO);
+
+    // ---------------------------------------------------------------------------------------
+    // Video goes on the media plane, and there is no alternative path.
+    //
+    // It used to go through the multiplexed stream socket as stream `VIDEO`, and that path had no
+    // error correction, no retransmission, no frame identity on the wire and **no counter for the
+    // datagrams it discarded**. Measured: the client's own reader threw away 1.5 % of everything it
+    // read, silently, and it looked like the network's fault for two days (`doc 50 §A10`). A path
+    // that drops frames without recording it is not a fallback, it is a defect with a working-
+    // looking surface.
+    //
+    // The per-frame metadata is *not* lost with the old header: `VideoPacketHeader` — view
+    // parameters, foveation centres, the keyframe flag — is serialised in front of the frame's
+    // bytes, so it travels on the same datagrams, under the same FEC, in the same order. Metadata
+    // on any other channel can arrive out of step with the frame it describes.
+    // ---------------------------------------------------------------------------------------
+    let media_port = alvr_packets::media_port(initial_settings.connection.stream_port);
+    let media_socket = alvr_sockets::media::MediaSocket::connect_to(
+        std::net::SocketAddr::new(client_ip, media_port),
+        initial_settings.connection.dscp,
+    )?;
+    let mut media_receive_socket = media_socket.try_clone()?;
+    let mut video_sender = MediaSender::new(
+        SenderConfig::matching_policy(
+            initial_settings.connection.packet_size as usize,
+            ParityPolicy::Ratio {
+                fraction: MEDIA_STARTING_FEC_FRACTION,
+            },
+            &media_release_policy(fps),
+        ),
+        PacerConfig::for_rate(nominal_bitrate_bps(&initial_settings), frame_interval),
+        frame_interval,
+        None,
+    );
+    video_sender.set_rtt(MEDIA_ROUND_TRIP);
+
     let game_audio_sender: alvr_sockets::StreamSender<()> = socket.request_unreliable_stream(AUDIO);
     let haptics_sender = socket.request_unreliable_stream(HAPTICS);
 
@@ -977,11 +1065,51 @@ fn connection_pipeline(
     *ctx.video_channel_sender.lock() = Some(video_channel_sender);
     *ctx.haptics_sender.lock() = Some(haptics_sender);
 
+    // The sender's clock, and what joins it to the stream's. A frame's target time is in the
+    // driver's epoch; `Instant::elapsed` is in ours, and the two are unrelated numbers.
+    let session_start = Instant::now();
+    let mut timebase = TimebaseOffset::new(Duration::from_secs(1));
+    let mut over_budget_frames = 0u64;
+
     let video_send_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         let client_hostname = client_hostname.clone();
         move || {
+            let mut media_socket = media_socket;
+            let mut feedback_buffer = Vec::with_capacity(2048);
+
             while is_streaming(&client_hostname) {
+                // The client's repair requests, polled here rather than on a thread of their own:
+                // the sender is the thing that must act on them, and this loop runs at the frame
+                // rate, which is the rate a repair is useful at.
+                //
+                // **Unauthenticated, and that is a stated gap rather than an accident.** There is
+                // no session key to seal them with until the control channel is encrypted —
+                // `SecureControlSocket` exists and is not wired into the live path. The sealed
+                // `FeedbackSender`/`FeedbackReceiver` in `x-transport` are built and tested and
+                // waiting for a key source; until then a NACK in the clear is the difference
+                // between a repaired frame and a lost one, and what it exposes is a forged
+                // retransmit.
+                loop {
+                    match media_receive_socket.recv(&mut feedback_buffer, Duration::ZERO) {
+                        SourceEvent::Datagram => {
+                            let Ok(feedback) = Feedback::decode(&feedback_buffer) else {
+                                continue;
+                            };
+                            let now = timebase.from_local(session_start.elapsed());
+                            match video_sender.on_feedback(&mut media_socket, &feedback, now) {
+                                FeedbackOutcome::KeyframeRequired { .. }
+                                | FeedbackOutcome::Resume { .. } => {
+                                    ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
+                                }
+                                _ => {}
+                            }
+                        }
+                        SourceEvent::Timeout => break,
+                        SourceEvent::Closed => return,
+                    }
+                }
+
                 let VideoPacket {
                     mut header,
                     payload,
@@ -996,18 +1124,55 @@ fn connection_pipeline(
                     .read()
                     .unrecenter_view_params(&mut header.global_view_params);
 
-                // todo: use get_buffer and make encoder write to socket buffers directly to avoid copy
-                //
-                // Timed because this is the *only* place the server can block: the socket
-                // write is a plain blocking `send`, so a receiver that stops draining fills
-                // the kernel send buffer and parks this thread here. That is the difference
-                // between the network losing a frame and the receiver being unable to take
-                // one, and the two need different fixes.
+                // The header travels with the frame. bincode rather than a hand-rolled layout
+                // because this struct has a dozen fields and will grow, and it is serialised once
+                // per frame rather than once per datagram — ninety a second is not a hot path.
+                let mut frame_bytes =
+                    match bincode::serde::encode_to_vec(&header, bincode::config::standard()) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            warn!("Could not serialise a video frame header: {e}");
+                            continue;
+                        }
+                    };
+                frame_bytes.extend_from_slice(&payload);
+
+                let target = Duration::from_nanos(header.timestamp.as_nanos() as u64);
+                let arrived = session_start.elapsed();
+                timebase.observe(arrived, target);
+
+                let meta = FrameMeta {
+                    frame_index: header.frame_index,
+                    target_timestamp_us: target.as_micros() as u64,
+                    is_keyframe: header.is_idr,
+                    key_epoch: 0,
+                };
+
+                // Timed because the socket write is the *only* place the server can block: the
+                // kernel send buffer fills when the receiver stops draining, and that is the
+                // difference between the network losing a frame and the receiver being unable to
+                // take one.
                 let write_started = Instant::now();
-                video_sender
-                    .send_header_with_payload(&header, &payload)
-                    .ok();
+                let sent = video_sender.send_frame(
+                    &mut media_socket,
+                    meta,
+                    &frame_bytes,
+                    timebase.from_local(arrived),
+                );
                 crate::send_probe::sent(write_started.elapsed());
+
+                if sent.over_budget {
+                    over_budget_frames += 1;
+                    if over_budget_frames.is_multiple_of(90) {
+                        warn!(
+                            "Video pacing is {:.1} ms behind after {} frame(s): the configured \
+                             bitrate cannot carry this stream, and the bitrate controller is the \
+                             thing that has to hear about it",
+                            sent.paced_wait.as_secs_f64() * 1e3,
+                            over_budget_frames,
+                        );
+                    }
+                }
             }
         }
     });

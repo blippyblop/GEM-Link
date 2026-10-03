@@ -16,9 +16,10 @@ use alvr_common::{
 use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientControlPacket, ClientStatistics, ConnectionAcceptedInfo,
     HAPTICS, Haptics, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VideoPacketHeader, VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
+    VideoPacketHeader, VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
+use alvr_sockets::media::MediaSocket;
 use alvr_sockets::{
     ControlSocketSender, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, PeerType, ProtoControlSocket,
     StreamSender, StreamSocketBuilder,
@@ -30,6 +31,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use x_transport::DatagramSink;
 
 #[cfg(target_os = "android")]
 use crate::audio;
@@ -318,8 +320,7 @@ fn connection_pipeline(
 
     info!("Connected to server");
 
-    let mut video_receiver =
-        stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
+    // Video is not a stream on this socket; it is the media plane, further down.
     let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
     let tracking_sender = stream_socket.request_stream(TRACKING);
     let mut haptics_receiver =
@@ -328,165 +329,203 @@ fn connection_pipeline(
 
     ctx.video_frame_metadata_queue.lock().clear();
 
+    // -------------------------------------------------------------------------------------------
+    // Video arrives on the media plane, and there is no alternative path.
+    //
+    // It used to arrive as stream `VIDEO` on the multiplexed socket, and that path had no error
+    // correction, no retransmission, no frame identity on the wire, and **no counter for the
+    // datagrams it discarded** — measured at 1.5 % of everything read, thrown away silently, and
+    // indistinguishable from the network losing them (`doc 50 §A10`). A path that drops frames
+    // without recording it is not a fallback; it is the defect this project spent two sessions
+    // chasing.
+    //
+    // The per-frame header comes with the frame: the server serialises `VideoPacketHeader` in front
+    // of the NAL, so view parameters, foveation centres and the keyframe flag travel on the same
+    // datagrams, under the same FEC, in the same order. Metadata on another channel can arrive out
+    // of step with the frame it describes, which is a wrong pose for one frame — subtle, and exactly
+    // the kind of thing nobody attributes to the transport.
+    // -------------------------------------------------------------------------------------------
+    let media_port = alvr_packets::media_port(settings.connection.stream_port);
+    let media_socket = MediaSocket::bind_to(media_port, server_ip, settings.connection.dscp)?;
+    let mut media_feedback_socket = media_socket.try_clone()?;
+
+    // The client's release policy, written out rather than derived, because the numbers are a
+    // statement about this device and not about a profile in a bench.
+    //
+    // **It holds no frame longer than one frame period.** A reorder or repair window longer than
+    // that means the frame is released after the display has already moved on, which is late by
+    // definition — the bench measured this link class and the repair round trip alone is 12 ms
+    // against an 11.1 ms period at 90 Hz. So the FEC does the work and the re-send is the safety net
+    // for the frames that fit; a frame that neither can save is held by the display path
+    // (ADR-0011) and the client asks for a keyframe.
+    let frame_interval =
+        Duration::from_secs_f32(1.0 / negotiated_config.refresh_rate_hint.max(1.0));
+    let link_slack = frame_interval / 10;
+    let media_release_policy = x_transport::ReleasePolicy {
+        straggler_delay: Duration::from_millis(3) + link_slack,
+        repair_delay: (Duration::from_millis(3) + Duration::from_millis(6) + link_slack)
+            .min(frame_interval),
+        deadline: frame_interval * 2,
+        jitter_frames: 0,
+    };
+
     let video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
+        let mut plane = crate::media_plane::MediaPlaneReceiver::new(
+            media_socket,
+            media_release_policy,
+            Instant::now(),
+        );
         move || {
-            // ADR-0011's display half. A frame the client cannot reconstruct is never
-            // submitted to the decoder: it keeps showing the last good frame, reprojected by
-            // the compositor. That is the permitted response; showing the grey is not.
-            //
-            // The rule lives in `x_transport::TrustGate` because it was previously two bare
-            // booleans in two places and both were wrong the same way — armed on *datagram*
-            // loss, which a server-side discarded frame does not produce. See the module docs.
-            let mut trust = x_transport::TrustGate::new();
-            // ADR-0011's hold, bounded. The gate says *whether* a frame may be shown; this says
-            // how long we are willing to show nothing before asking, and how long before giving
-            // up on asking and rebuilding. Both rungs come from the reference client for this
-            // device (see `crate::stall`); GemLink had only the first, which is exactly how a
-            // hold with no keyframe behind it became a black screen.
-            let mut stall = crate::stall::StuckDetector::new(Instant::now());
-            let mut frames_seen: u64 = 0;
-            let mut first_report = true;
+            // The latency markers, marked at the boundaries this thread owns. The decode and submit
+            // spans are marked by the render path on the same trace, joined by frame index.
+            let mut trace = crate::latency::LatencyTrace::new(4096);
+            let mut feedback_peer: Option<std::net::SocketAddr> = None;
+            let mut frames_decoded = 0u64;
+            let mut requests = 0u64;
+
             while is_streaming(&ctx) {
-                let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
-                    Ok(data) => data,
-                    Err(ConnectionError::TryAgain(_)) => continue,
-                    Err(ConnectionError::Other(_)) => return,
-                };
-                let Ok((header, nal)) = data.get() else {
+                let (actions, open) =
+                    plane.poll(&mut trace, Instant::now(), Duration::from_millis(20));
+                if !open {
+                    warn!("The video media socket can no longer be read from; ending the stream");
                     return;
-                };
-
-                if let Some(stats) = &mut *ctx.statistics_manager.lock() {
-                    stats.report_video_packet_received(header.timestamp);
                 }
 
-                let had_datagram_loss = data.had_packet_loss();
-                let decision =
-                    trust.may_present(header.frame_index, header.is_idr, had_datagram_loss);
+                for action in actions {
+                    match action {
+                        crate::media_plane::MediaPlaneAction::Decode {
+                            frame_index,
+                            target_timestamp_us,
+                            payload,
+                        } => {
+                            // `decode_from_slice` returns how many bytes it consumed, which is
+                            // exactly the split between the header and the NAL behind it.
+                            let Ok((header, header_len)) =
+                                bincode::serde::decode_from_slice::<VideoPacketHeader, _>(
+                                    &payload,
+                                    bincode::config::standard(),
+                                )
+                            else {
+                                warn!(
+                                    "Video frame {frame_index} arrived with a header that would \
+                                     not decode; it cannot be shown"
+                                );
+                                continue;
+                            };
 
-                // Prove the sequence is actually advancing. Without this, a
-                // frame_index pinned at 0 is indistinguishable from a perfectly
-                // contiguous stream by the gap check alone.
-                if first_report || header.frame_index % 300 == 0 {
-                    first_report = false;
-                    info!(
-                        "video frame_index={} (frames seen {}, missed {})",
-                        header.frame_index,
-                        frames_seen,
-                        trust.missed_frames()
-                    );
-                }
-                frames_seen += 1;
-
-                match decision {
-                    x_transport::FrameTrust::Trusted => {
-                        stall.progress(Instant::now());
-                        // Name the frame before handing it over, so anything the callback
-                        // does — decoding, logging, writing a CSV — can join what it got
-                        // against what the server sent.
-                        *ctx.current_video_frame.write() = Some(CurrentVideoFrame {
-                            frame_index: header.frame_index,
-                            missed_frames: trust.missed_frames(),
-                            had_datagram_loss,
-                        });
-
-                        // Metadata must be available before the decoder can return this frame.
-                        {
-                            let queue_mut = &mut *ctx.video_frame_metadata_queue.lock();
-                            queue_mut.push_back((
-                                header.timestamp,
-                                VideoFrameMetadata {
-                                    view_params: header.global_view_params,
-                                    foveation_center_shifts: header.foveation_center_shifts,
-                                },
-                            ));
-
-                            while queue_mut.len() > VIDEO_FRAME_METADATA_HISTORY_SIZE {
-                                queue_mut.pop_front();
+                            if let Some(stats) = &mut *ctx.statistics_manager.lock() {
+                                stats.report_video_packet_received(header.timestamp);
                             }
-                        }
 
-                        let submitted = ctx
-                            .decoder_callback
-                            .lock()
-                            .as_mut()
-                            .is_some_and(|callback| callback(header.timestamp, nal));
-
-                        trust.on_decoder_result(submitted);
-                        if !submitted {
-                            // The decoder refused it, so we have no frame and the next one's
-                            // reference is broken. Same response as a lost frame: hold, and
-                            // ask for a keyframe.
-                            //
-                            // UNCONDITIONAL. Gating this behind a setting is what turned the
-                            // hold into a permanent black screen: `avoid_video_glitching` is
-                            // stored `false` on the box, so the client held every frame and
-                            // never asked for the one thing that could release the hold. The
-                            // encoder inserts an IDR only when asked.
-                            if let Some(sender) = &mut *ctx.control_sender.lock() {
-                                sender.send(&ClientControlPacket::RequestIdr).ok();
+                            // Metadata must be available before the decoder returns the frame.
+                            {
+                                let queue_mut = &mut *ctx.video_frame_metadata_queue.lock();
+                                queue_mut.push_back((
+                                    header.timestamp,
+                                    VideoFrameMetadata {
+                                        view_params: header.global_view_params,
+                                        foveation_center_shifts: header.foveation_center_shifts,
+                                    },
+                                ));
+                                while queue_mut.len() > VIDEO_FRAME_METADATA_HISTORY_SIZE {
+                                    queue_mut.pop_front();
+                                }
                             }
-                            warn!("Dropped video packet. Reason: Decoder saturation")
-                        }
-                    }
-                    x_transport::FrameTrust::Untrusted { reason, first } => {
-                        // Ask for a keyframe once per recovery, not once per frame. During a
-                        // recovery window this branch runs for every frame that arrives, and a
-                        // reliable control packet per frame — each answered by the sender with a
-                        // keyframe — is a flood with a bitrate spike attached.
-                        //
-                        // The request is UNCONDITIONAL — no setting can disable it — and the
-                        // clock decides when to repeat it, not a frame count: 300 ms of no
-                        // progress asks, 800 ms rebuilds. `avoid_video_glitching` (stored
-                        // `false` on the box) used to gate this, which meant no request at all;
-                        // and `first` used to mean "first time ever" rather than "first of this
-                        // recovery", which meant the second hold never asked. Either one blacks
-                        // the screen for good, because the encoder inserts an IDR only when asked.
-                        let now = Instant::now();
-                        match stall.poll(now) {
-                            crate::stall::StuckAction::AskForKeyframe => {
+
+                            // Name the frame before handing it over, so anything the callback does
+                            // can join what it got against what the server sent.
+                            *ctx.current_video_frame.write() = Some(CurrentVideoFrame {
+                                frame_index: header.frame_index,
+                                missed_frames: plane.stats().frames_abandoned,
+                                // The media plane hands over a frame it could rebuild whole. A
+                                // datagram that went missing inside it was repaired, and if it
+                                // could not be, the frame was never released.
+                                had_datagram_loss: false,
+                            });
+
+                            let submitted =
+                                ctx.decoder_callback
+                                    .lock()
+                                    .as_mut()
+                                    .is_some_and(|callback| {
+                                        callback(header.timestamp, &payload[header_len..])
+                                    });
+
+                            if !submitted {
+                                // UNCONDITIONAL. Gating this behind a setting is what turned a hold
+                                // into a permanent black screen once already.
                                 if let Some(sender) = &mut *ctx.control_sender.lock() {
                                     sender.send(&ClientControlPacket::RequestIdr).ok();
                                 }
-                                warn!(
-                                    "Holding video: no progress for {:.0} ms ({} frames held) — \
-                                     asked the sender for a keyframe",
-                                    stall.stalled_for(now).as_secs_f64() * 1e3,
-                                    trust.untrusted_run(),
-                                );
+                                warn!("Dropped video packet. Reason: Decoder saturation")
+                            } else {
+                                frames_decoded += 1;
+                                let _ = target_timestamp_us;
                             }
-                            crate::stall::StuckAction::Reset => {
-                                // Rung two, and the one GemLink never had. Asking has failed for
-                                // 800 ms; the reference client calls `HardReset` here. We do not
-                                // yet own the decoder's handle from this thread, so this is a
-                                // counted, loud escalation rather than a silent freeze — which is
-                                // the whole difference from the black screen we shipped.
-                                error!(
-                                    "Video stalled for {:.0} ms with no keyframe; the stream needs \
-                                     rebuilding ({} frame(s) held)",
-                                    stall.stalled_for(now).as_secs_f64() * 1e3,
-                                    trust.untrusted_run(),
-                                );
-                            }
-                            crate::stall::StuckAction::Progress => {}
                         }
-                        if first {
+                        crate::media_plane::MediaPlaneAction::AskForKeyframe { stalled_for } => {
+                            requests += 1;
+                            if let Some(sender) = &mut *ctx.control_sender.lock() {
+                                sender.send(&ClientControlPacket::RequestIdr).ok();
+                            }
                             warn!(
-                                "Holding video: frame_index={} is not trustworthy ({reason:?}); \
-                                 {} frame(s) missed so far",
-                                header.frame_index,
-                                trust.missed_frames()
+                                "Holding video: no progress for {:.0} ms — asked the sender for a \
+                                 keyframe",
+                                stalled_for.as_secs_f64() * 1e3
                             );
-                        } else {
-                            debug!(
-                                "Holding video: frame_index={} ({reason:?})",
-                                header.frame_index
+                        }
+                        crate::media_plane::MediaPlaneAction::Reset { stalled_for } => {
+                            error!(
+                                "Video stalled for {:.0} ms with no keyframe; the stream needs \
+                                 rebuilding",
+                                stalled_for.as_secs_f64() * 1e3
                             );
+                            if let Some(sender) = &mut *ctx.control_sender.lock() {
+                                sender.send(&ClientControlPacket::RequestIdr).ok();
+                            }
+                        }
+                        crate::media_plane::MediaPlaneAction::Nack {
+                            frame_index,
+                            fragments,
+                        } => {
+                            // Once per session, learn where "back" is: the server sends from an
+                            // ephemeral port and this is the only place it is visible.
+                            if feedback_peer.is_none() {
+                                feedback_peer = plane.last_sender();
+                                if let Some(peer) = feedback_peer {
+                                    media_feedback_socket.accept_only_from(peer);
+                                }
+                            }
+                            if feedback_peer.is_none() {
+                                continue;
+                            }
+
+                            // **Unauthenticated**, and stated rather than implied: there is no
+                            // session key until the control channel is encrypted, and
+                            // `SecureControlSocket` is not wired into the live path.
+                            // `x-transport`'s sealed `FeedbackSender` is built and tested and waits
+                            // for a key source. What this exposes meanwhile is a forged retransmit.
+                            let feedback = x_transport::Feedback::Nack {
+                                frame_index,
+                                fragments,
+                            };
+                            if media_feedback_socket.send(&feedback.encode()).is_err() {
+                                // Counted by the socket; the frame is lost and the FEC is what is
+                                // left, which the next release decides.
+                            }
                         }
                     }
                 }
             }
+
+            info!(
+                "{}; {} frame(s) decoded, {} keyframe request(s)",
+                plane.stats().summary(),
+                frames_decoded,
+                requests
+            );
+            info!("{}", trace.summary());
         }
     });
 

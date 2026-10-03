@@ -34,7 +34,7 @@ use std::{
 };
 
 use crate::{
-    adaptive::AdaptiveParity,
+    adaptive::{AdaptiveConfig, AdaptiveParity},
     crypto::{KeySchedule, MediaCipher},
     datagram::DatagramSink,
     feedback::Feedback,
@@ -154,7 +154,7 @@ pub enum FeedbackOutcome {
 
 /// Counters. Same rule as everywhere else in this tree: a path that can lose a datagram has a
 /// counter on it, or the loss becomes somebody else's bug report.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SenderStats {
     pub frames_sent: u64,
     pub datagrams_sent: u64,
@@ -174,6 +174,12 @@ pub struct SenderStats {
     pub stream_resets: u64,
     /// Frames whose pacing debt exceeded one frame interval.
     pub over_budget_frames: u64,
+    /// The last loss the controller was told about, as a fraction. Kept here so a summary or a gate
+    /// can say what the ratio was bought against.
+    pub last_loss: f64,
+    /// Times the FEC ratio moved, up and down.
+    pub ratio_raises: u64,
+    pub ratio_lowers: u64,
 }
 
 impl SenderStats {
@@ -211,6 +217,42 @@ impl SenderStats {
             self.stream_resets,
             self.over_budget_frames,
         )
+    }
+}
+
+/// The sender's own loss estimate, from the only loss signal it has: what the client asks to have
+/// re-sent.
+///
+/// This is a **measurement, not an inference**. A NACK names exactly the fragments that did not
+/// arrive, so the fraction of datagrams asked for over a window *is* the loss rate. And it costs
+/// nothing to obtain: the feedback is already flowing for the repair path, so the controller gets
+/// its input from traffic that exists for another reason.
+///
+/// The window is frames rather than time, because this type has no clock — see `AdaptiveParity`,
+/// which takes one number per window and deliberately does not decide how long a window is.
+#[derive(Debug, Default)]
+struct LossWindow {
+    frames: u64,
+    datagrams_sent: u64,
+    fragments_requested: u64,
+}
+
+impl LossWindow {
+    fn loss(&self) -> f64 {
+        if self.datagrams_sent == 0 {
+            0.0
+        } else {
+            // Clamped: a client that asks for the same fragment repeatedly — which a real one does,
+            // see `nack_retry_interval` — would otherwise report a loss above 100 %. Erring high is
+            // the safe direction for a parity estimate, but above 1.0 it is not an estimate at all.
+            (self.fragments_requested as f64 / self.datagrams_sent as f64).min(1.0)
+        }
+    }
+
+    fn reset(&mut self) {
+        self.frames = 0;
+        self.datagrams_sent = 0;
+        self.fragments_requested = 0;
     }
 }
 
@@ -253,6 +295,18 @@ impl SenderCrypto {
     }
 }
 
+/// The ratio a fixed policy stands for, for a controller that has to start somewhere.
+///
+/// `ParityPolicy::Fixed` is a shard *count* rather than a fraction, so it has no fraction to
+/// inherit and the controller's own protected default is used instead.
+fn starting_ratio(policy: ParityPolicy) -> f32 {
+    match policy {
+        ParityPolicy::Ratio { fraction } => fraction,
+        ParityPolicy::Off => 0.0,
+        ParityPolicy::Fixed(_) => AdaptiveConfig::default().initial,
+    }
+}
+
 /// The sending half of a media session.
 pub struct MediaSender {
     config: SenderConfig,
@@ -266,6 +320,12 @@ pub struct MediaSender {
     frame_interval: Duration,
     adaptive: Option<AdaptiveParity>,
     parity: ParityPolicy,
+    /// The window the loss estimate is taken over, in frames.
+    loss_window_frames: u64,
+    loss_window: LossWindow,
+    /// The last loss the controller was told about, for the summary and for a caller that wants to
+    /// know why the ratio moved.
+    observed_loss: f64,
     send_seq: u32,
     /// Set by a keyframe request; the caller takes it and asks the encoder.
     pending_keyframe: Option<u64>,
@@ -289,8 +349,20 @@ impl MediaSender {
             order: VecDeque::new(),
             rtt: Duration::from_millis(4),
             frame_interval,
-            adaptive: None,
+            // **Adaptive by default.** A fixed ratio is a guess about a link, and a guess that is
+            // too low loses frames while one that is too high merely costs bandwidth. The
+            // scenario's own ratio is where the controller starts.
+            adaptive: Some(AdaptiveParity::new(AdaptiveConfig {
+                initial: starting_ratio(config.parity),
+                ..AdaptiveConfig::default()
+            })),
             parity: config.parity,
+            // Eight frames is eighty-nine milliseconds at 90 Hz: fast enough that a link which
+            // starts losing is protected within a tenth of a second, slow enough that one burst on
+            // an otherwise clean link does not move the ratio.
+            loss_window_frames: 8,
+            loss_window: LossWindow::default(),
+            observed_loss: 0.0,
             send_seq: 0,
             pending_keyframe: None,
             resume_from: None,
@@ -298,11 +370,37 @@ impl MediaSender {
         }
     }
 
-    /// Let the FEC ratio follow the measured loss. Off by default: the bench gates a fixed ratio so
-    /// that a change in the gate means a change in the link, not in a controller.
+    /// Let the FEC ratio follow the measured loss, from the NACKs the client sends.
+    ///
+    /// **On by default**, because the alternative is not a preference. A fixed ratio is a guess
+    /// about a link, and a guess that is too low loses frames — which is the one outcome this whole
+    /// plane exists to prevent. A guess that is too high costs bandwidth, which is recoverable.
     pub fn with_adaptive_parity(mut self, adaptive: AdaptiveParity) -> Self {
         self.adaptive = Some(adaptive);
+        self.parity = ParityPolicy::Ratio {
+            fraction: self.adaptive.as_ref().expect("just set").fraction(),
+        };
+        self.packetizer = Packetizer::new(self.config.mtu, self.parity);
         self
+    }
+
+    /// Turn adaptation off, for a caller that wants a fixed ratio — a bench scenario that is
+    /// measuring the ratio itself, and nothing else.
+    pub fn without_adaptive_parity(mut self) -> Self {
+        self.adaptive = None;
+        self.loss_window.reset();
+        self
+    }
+
+    /// How many frames the loss estimate is taken over. Frames, not time: a sender pacing at the
+    /// frame rate has no other clock it can trust.
+    pub fn set_loss_window_frames(&mut self, frames: u64) {
+        self.loss_window_frames = frames.max(1);
+    }
+
+    /// The loss the controller was last told about.
+    pub fn observed_loss(&self) -> f64 {
+        self.observed_loss
     }
 
     pub fn set_rtt(&mut self, rtt: Duration) {
@@ -442,6 +540,10 @@ impl MediaSender {
             self.stats.frames_refused += 1;
         }
 
+        self.loss_window.frames += 1;
+        self.loss_window.datagrams_sent += datagrams.len() as u64;
+        self.adapt_parity();
+
         let paced_wait = self.pacer.next_send().saturating_sub(now);
         let over_budget = paced_wait > self.frame_interval;
         if over_budget {
@@ -467,6 +569,45 @@ impl MediaSender {
             paced_wait,
             over_budget,
             layout,
+        }
+    }
+
+    /// Close the loss window if it is full, and let the controller react.
+    ///
+    /// Called from both places that feed it, so the window closes on whichever comes first — the
+    /// frames going out or the requests coming back. A window that only closed on one of them would
+    /// stall when the other stopped.
+    fn adapt_parity(&mut self) {
+        if self.adaptive.is_none() || self.loss_window.frames < self.loss_window_frames {
+            return;
+        }
+
+        let loss = self.loss_window.loss();
+        self.observed_loss = loss;
+        self.stats.last_loss = loss;
+        self.loss_window.reset();
+
+        let Some(adaptive) = &mut self.adaptive else {
+            return;
+        };
+        let change = adaptive.observe(loss);
+        let ratio = adaptive.fraction();
+        self.parity = ParityPolicy::Ratio { fraction: ratio };
+        self.packetizer = Packetizer::new(self.config.mtu, self.parity);
+
+        match change {
+            crate::adaptive::RatioChange::Raised { .. } => self.stats.ratio_raises += 1,
+            crate::adaptive::RatioChange::Lowered { .. } => self.stats.ratio_lowers += 1,
+            crate::adaptive::RatioChange::Unchanged => {}
+        }
+
+        if change.changed() {
+            log::info!(
+                "media sender: FEC ratio {} at {:.2} % measured loss ({} repair request(s) answered)",
+                ratio,
+                loss * 100.0,
+                self.stats.retransmit_requests,
+            );
         }
     }
 
@@ -497,6 +638,10 @@ impl MediaSender {
                 fragments,
             } => {
                 self.stats.retransmit_requests += 1;
+                // The client has just told us, precisely, which fragments did not arrive. That is
+                // the loss rate — no separate report, no estimation.
+                self.loss_window.fragments_requested += fragments.len() as u64;
+                self.adapt_parity();
                 self.repair(sink, *frame_index, fragments, now)
             }
             Feedback::RequestKeyframe { newest_frame } => {

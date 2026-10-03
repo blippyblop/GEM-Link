@@ -255,6 +255,14 @@ impl MediaPlaneReceiver {
         self.plane.stats()
     }
 
+    /// The address the last datagram came from.
+    ///
+    /// The server sends the media stream from an ephemeral port, so this is the only place the
+    /// client can learn where a repair has to go back to.
+    pub fn last_sender(&self) -> Option<std::net::SocketAddr> {
+        self.source.last_sender()
+    }
+
     /// Datagrams that arrived from a host other than the streamer. Non-zero means something else on
     /// the network is talking to this port — worth knowing before wondering why frames are corrupt.
     pub fn datagrams_from_elsewhere(&self) -> u64 {

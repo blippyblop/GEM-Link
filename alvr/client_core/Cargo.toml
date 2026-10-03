@@ -21,6 +21,9 @@ alvr_packets.workspace = true
 alvr_session.workspace = true
 alvr_sockets.workspace = true
 alvr_system_info.workspace = true
+# The per-frame video header travels in front of the frame's bytes on the media plane, so the two
+# ends must agree on how it is laid out. The same codec `alvr_sockets` uses for its stream headers.
+bincode = { version = "2", features = ["serde"] }
 
 app_dirs2 = "2"
 mdns-sd = "0.19"

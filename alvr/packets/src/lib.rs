@@ -24,6 +24,23 @@ pub const TRACKING: u16 = 0;
 pub const HAPTICS: u16 = 1;
 pub const AUDIO: u16 = 2;
 pub const VIDEO: u16 = 3;
+
+/// The video media plane's port, relative to the stream port.
+///
+/// The media plane is not a stream on the multiplexed socket: it carries its own framing, its own
+/// error correction and its own per-datagram keys, and none of that fits through a 14-byte stream
+/// prefix. So it gets a port of its own, and this is the whole of the negotiation — a constant both
+/// ends apply, rather than a field that can disagree.
+///
+/// Adjacent, deliberately: a session then has exactly two ports and a firewall rule is still one
+/// line. The multiplexed socket keeps audio, haptics and tracking, which are small and low-rate and
+/// have no repair story to tell.
+pub const MEDIA_PORT_OFFSET: u16 = 1;
+
+/// The media plane's port for a session whose stream port is `stream_port`.
+pub const fn media_port(stream_port: u16) -> u16 {
+    stream_port + MEDIA_PORT_OFFSET
+}
 pub const STATISTICS: u16 = 4;
 
 #[derive(Serialize, Deserialize, Clone)]
