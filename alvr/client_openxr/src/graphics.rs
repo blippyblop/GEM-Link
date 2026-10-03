@@ -5,7 +5,7 @@ use openxr as xr;
 use std::ptr;
 
 #[allow(unused)]
-pub fn session_create_info(ctx: &GraphicsContext) -> xr::opengles::SessionCreateInfo {
+pub fn session_create_info(ctx: &GraphicsContext) -> crate::GfxSessionCreateInfo {
     #[cfg(target_os = "android")]
     {
         xr::opengles::SessionCreateInfo::Android {
@@ -15,12 +15,25 @@ pub fn session_create_info(ctx: &GraphicsContext) -> xr::opengles::SessionCreate
         }
     }
     #[cfg(not(target_os = "android"))]
-    unimplemented!()
+    {
+        // A desktop OpenXR session binds through a display server; the Frame runs gamescope/kwin
+        // on Wayland, so `Wayland` is the arm that ships and `Xlib` is for a session pinned to X11.
+        //
+        // This is `unimplemented!()` on purpose. The runtime does not open a display connection for
+        // us — the client must, via libwayland-client — and there is no display server anywhere in
+        // this container to test that against. Guessing the handle plumbing here would be the same
+        // class of unverifiable code as the ioctl layer without its ABI tests. The call is a
+        // ten-line change once the entry point owns a connection; see the client build plan.
+        let _ = ctx;
+        unimplemented!(
+            "a desktop session needs a Wayland (or Xlib) display handle from the entry point"
+        )
+    }
 }
 
 pub fn swapchain_format(
     gfx_ctx: &GraphicsContext,
-    session: &xr::Session<xr::OpenGlEs>,
+    session: &xr::Session<crate::Gfx>,
     enable_hdr: bool,
 ) -> u32 {
     gfx_ctx.make_current();
@@ -31,12 +44,12 @@ pub fn swapchain_format(
 
 #[allow(unused_variables)]
 pub fn create_swapchain(
-    session: &xr::Session<xr::OpenGlEs>,
+    session: &xr::Session<crate::Gfx>,
     gfx_ctx: &GraphicsContext,
     resolution: UVec2,
     format: u32,
     foveation: Option<&xr::FoveationProfileFB>,
-) -> xr::Swapchain<xr::OpenGlEs> {
+) -> xr::Swapchain<crate::Gfx> {
     gfx_ctx.make_current();
 
     let swapchain_info = xr::SwapchainCreateInfo {
@@ -63,7 +76,7 @@ pub struct ProjectionLayerAlphaConfig {
 // value`
 pub struct ProjectionLayerBuilder<'a> {
     reference_space: &'a xr::Space,
-    layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
+    layers: [xr::CompositionLayerProjectionView<'a, crate::Gfx>; 2],
     alpha: Option<ProjectionLayerAlphaConfig>,
     composition_layer_settings: Option<xr::sys::CompositionLayerSettingsFB>,
 }
@@ -71,7 +84,7 @@ pub struct ProjectionLayerBuilder<'a> {
 impl<'a> ProjectionLayerBuilder<'a> {
     pub fn new(
         reference_space: &'a xr::Space,
-        layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
+        layers: [xr::CompositionLayerProjectionView<'a, crate::Gfx>; 2],
         alpha: Option<ProjectionLayerAlphaConfig>,
         clientside_post_processing_config: Option<ClientsidePostProcessingConfig>,
     ) -> Self {
@@ -95,7 +108,7 @@ impl<'a> ProjectionLayerBuilder<'a> {
         }
     }
 
-    pub fn build(&self) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
+    pub fn build(&self) -> xr::CompositionLayerProjection<'_, crate::Gfx> {
         let mut flags = xr::CompositionLayerFlags::EMPTY;
 
         if let Some(alpha) = &self.alpha {

@@ -13,7 +13,7 @@ pub struct PassthroughFB {
 }
 
 impl PassthroughFB {
-    pub fn new(session: &xr::Session<xr::OpenGlEs>, platform: Platform) -> xr::Result<Self> {
+    pub fn new(session: &xr::Session<crate::Gfx>, platform: Platform) -> xr::Result<Self> {
         let ext_fns = session
             .instance()
             .exts()

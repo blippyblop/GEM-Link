@@ -174,7 +174,7 @@ impl InteractionSourcesConfig {
 }
 
 pub struct InteractionContext {
-    xr_session: xr::Session<xr::OpenGlEs>,
+    xr_session: xr::Session<crate::Gfx>,
     xr_system: xr::SystemId,
     extra_extensions: Vec<String>,
     platform: Platform,
@@ -189,7 +189,7 @@ pub struct InteractionContext {
 
 impl InteractionContext {
     pub fn new(
-        xr_session: xr::Session<xr::OpenGlEs>,
+        xr_session: xr::Session<crate::Gfx>,
         extra_extensions: Vec<String>,
         xr_system: xr::SystemId,
         platform: Platform,
@@ -652,7 +652,7 @@ impl InteractionContext {
 }
 
 pub fn get_reference_space(
-    xr_session: &xr::Session<xr::OpenGlEs>,
+    xr_session: &xr::Session<crate::Gfx>,
     ty: xr::ReferenceSpaceType,
 ) -> xr::Space {
     xr_session
@@ -661,7 +661,7 @@ pub fn get_reference_space(
 }
 
 pub fn get_head_data(
-    xr_session: &xr::Session<xr::OpenGlEs>,
+    xr_session: &xr::Session<crate::Gfx>,
     platform: Platform,
     stage_reference_space: &xr::Space,
     view_reference_space: &xr::Space,
@@ -772,7 +772,7 @@ pub fn get_head_data(
 
 #[expect(clippy::too_many_arguments)]
 pub fn get_hand_data(
-    xr_session: &xr::Session<xr::OpenGlEs>,
+    xr_session: &xr::Session<crate::Gfx>,
     platform: Platform,
     reference_space: &xr::Space,
     time: Duration,
@@ -917,7 +917,7 @@ pub fn get_hand_data(
 }
 
 pub fn update_buttons(
-    xr_session: &xr::Session<xr::OpenGlEs>,
+    xr_session: &xr::Session<crate::Gfx>,
     button_actions: &HashMap<u64, ButtonAction>,
 ) -> Vec<ButtonEntry> {
     let mut button_entries = Vec::with_capacity(2);
@@ -957,7 +957,7 @@ pub fn update_buttons(
 // For foveation, the server prefers combined gaze and only derives a common gaze from
 // the social pair when native combined gaze is absent.
 pub fn get_face_data(
-    xr_session: &xr::Session<xr::OpenGlEs>,
+    xr_session: &xr::Session<crate::Gfx>,
     platform: Platform,
     sources: &FaceSources,
     stage_reference_space: &xr::Space,

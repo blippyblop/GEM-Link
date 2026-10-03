@@ -10,11 +10,11 @@ use std::{rc::Rc, sync::Arc, time::Duration};
 
 // todo: add interaction?
 pub struct Lobby {
-    xr_session: xr::Session<xr::OpenGlEs>,
+    xr_session: xr::Session<crate::Gfx>,
     interaction_ctx: Arc<RwLock<InteractionContext>>,
     platform: Platform,
     reference_space: xr::Space,
-    swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
+    swapchains: [xr::Swapchain<crate::Gfx>; 2],
     view_resolution: UVec2,
     reference_space_type: xr::ReferenceSpaceType,
     renderer: LobbyRenderer,
@@ -22,7 +22,7 @@ pub struct Lobby {
 
 impl Lobby {
     pub fn new(
-        xr_session: xr::Session<xr::OpenGlEs>,
+        xr_session: xr::Session<crate::Gfx>,
         gfx_ctx: Rc<GraphicsContext>,
         interaction_ctx: Arc<RwLock<InteractionContext>>,
         platform: Platform,

@@ -11,7 +11,7 @@ pub struct PassthroughLayer<'a> {
 }
 
 impl PassthroughLayer<'_> {
-    pub fn new(session: &xr::Session<xr::OpenGlEs>, platform: Platform) -> Result<Self> {
+    pub fn new(session: &xr::Session<crate::Gfx>, platform: Platform) -> Result<Self> {
         let mut handle_fb = None;
         let mut handle_htc = None;
 
@@ -33,7 +33,7 @@ impl PassthroughLayer<'_> {
 }
 
 impl<'a> Deref for PassthroughLayer<'a> {
-    type Target = xr::CompositionLayerBase<'a, xr::OpenGlEs>;
+    type Target = xr::CompositionLayerBase<'a, crate::Gfx>;
 
     fn deref(&self) -> &Self::Target {
         if let Some(handle) = &self.handle_fb {

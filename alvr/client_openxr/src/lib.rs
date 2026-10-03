@@ -1,6 +1,28 @@
 mod c_api;
 mod extra_extensions;
 mod graphics;
+
+/// The graphics API the client binds its OpenXR session to.
+///
+/// Android provides OpenGL ES; a desktop runtime (the Frame's SteamVR, on gamescope/Wayland) takes
+/// desktop OpenGL. Both are `glow`-compatible and the call sites are identical, so this is one
+/// decision in one place rather than a fork of the client.
+///
+/// Why it matters: `openxr::graphics::opengles::SessionCreateInfo` has **only** an Android variant,
+/// while `openxr::graphics::opengl` has `Wayland` and `Xlib`. So the device port is ES -> desktop
+/// GL, not a rewrite — and `entry_point`'s `assert!(khr_opengl_es_enable)` is precisely the line
+/// that would make a Linux build die at startup with no explanation.
+#[cfg(target_os = "android")]
+pub type Gfx = xr::OpenGlEs;
+#[cfg(not(target_os = "android"))]
+pub type Gfx = xr::OpenGL;
+
+/// The matching session-creation structure. These live in different modules per graphics API, so
+/// they need the same treatment as [`Gfx`].
+#[cfg(target_os = "android")]
+pub type GfxSessionCreateInfo = xr::opengles::SessionCreateInfo;
+#[cfg(not(target_os = "android"))]
+pub type GfxSessionCreateInfo = xr::opengl::SessionCreateInfo;
 mod interaction;
 mod lobby;
 mod passthrough;
@@ -104,7 +126,7 @@ fn to_perf_settings_level(level: PerformanceLevel) -> xr::PerfSettingsLevelEXT {
 
 fn set_performance_level(
     xr_instance: &xr::Instance,
-    xr_session: &xr::Session<xr::OpenGlEs>,
+    xr_session: &xr::Session<crate::Gfx>,
     domain: xr::PerfSettingsDomainEXT,
     level: PerformanceLevel,
 ) {
@@ -145,9 +167,9 @@ fn create_session(
     xr_system: xr::SystemId,
     graphics_context: &GraphicsContext,
 ) -> (
-    xr::Session<xr::OpenGlEs>,
+    xr::Session<crate::Gfx>,
     xr::FrameWaiter,
-    xr::FrameStream<xr::OpenGlEs>,
+    xr::FrameStream<crate::Gfx>,
 ) {
     #[allow(unreachable_code)]
     unsafe {
@@ -193,7 +215,13 @@ pub fn entry_point() {
     );
 
     // todo: switch to vulkan
+    #[cfg(target_os = "android")]
     assert!(available_exts.khr_opengl_es_enable);
+    #[cfg(not(target_os = "android"))]
+    assert!(
+        available_exts.khr_opengl_enable,
+        "the runtime has no desktop OpenGL binding; XR_KHR_opengl_enable is required on this platform"
+    );
 
     let mut selected_exts = xr::ExtensionSet::default();
     selected_exts.bd_body_tracking = true;
@@ -288,7 +316,7 @@ pub fn entry_point() {
 
         // mandatory call
         let _ = xr_instance
-            .graphics_requirements::<xr::OpenGlEs>(xr_system)
+            .graphics_requirements::<crate::Gfx>(xr_system)
             .unwrap();
 
         let (xr_session, mut xr_frame_waiter, mut xr_frame_stream) =
