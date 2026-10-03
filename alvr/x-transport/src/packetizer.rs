@@ -42,6 +42,12 @@ pub struct FrameMeta {
     /// Whether this frame is a keyframe. The client's trust gate cannot recover from a broken
     /// reference chain without it, so it travels on the wire (see [`crate::wire::Flags`]).
     pub is_keyframe: bool,
+    /// Which derived media key seals this frame, from [`crate::KeySchedule::epoch_for`].
+    ///
+    /// Per **frame** and not per datagram: a frame is sealed as one unit, and a receiver that had to
+    /// choose a key per datagram would be choosing it from a field an attacker controls. Epoch `0` is
+    /// the session's first key, and is the only value a caller that never rotates needs.
+    pub key_epoch: u16,
 }
 
 /// How many repair shards to add.
@@ -303,6 +309,7 @@ impl Packetizer {
                 fragment_len: wire_payload_len as u16,
                 send_seq: *send_seq,
                 flags,
+                key_epoch: meta.key_epoch,
             };
             *send_seq = send_seq.wrapping_add(1);
 
@@ -374,6 +381,7 @@ mod tests {
             frame_index: 1,
             target_timestamp_us: 11_111,
             is_keyframe: false,
+            key_epoch: 0,
         }
     }
 

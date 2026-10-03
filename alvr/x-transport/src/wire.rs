@@ -15,9 +15,14 @@
 //! 26..28   fragment_len         payload bytes in *this* datagram
 //! 28..32   send_seq             per-datagram counter, for the receiver's own loss accounting
 //! 32..34   flags
-//! 34..36   reserved             must be zero; rejected if not, so a future version cannot
-//!                               be silently misread by this one
+//! 34..36   key_epoch            which media key sealed this datagram (see `crypto::KeySchedule`)
 //! ```
+//!
+//! The last field was `reserved` and must be zero until this version. It is now the **key epoch**:
+//! it was the only spare authenticated field in the header, it is exactly the right width, and a
+//! receiver that does not know about epochs rejects a non-zero value — which is the correct
+//! fail-closed behaviour for a protocol change and the reason there was nothing to gain by leaving
+//! it unused.
 //!
 //! The header is also the AEAD's associated data ([`crate::crypto`]), so every field above
 //! is authenticated even though it is not encrypted — a replayed or edited frame index
@@ -102,6 +107,9 @@ pub struct FragmentHeader {
     pub fragment_len: u16,
     pub send_seq: u32,
     pub flags: Flags,
+    /// Which derived media key sealed this datagram. Authenticated with the rest of the header, so
+    /// a datagram cannot be relabelled into another epoch — it would fail the tag.
+    pub key_epoch: u16,
 }
 
 /// Why a datagram could not be accepted.
@@ -112,7 +120,7 @@ pub enum WireError {
     /// The declared payload length disagrees with the datagram's actual length.
     LengthMismatch { declared: u16, available: usize },
     /// The header describes something impossible (zero data fragments, a fragment index
-    /// past the end of the frame, a non-zero reserved field, an unknown flag).
+    /// past the end of the frame, an unknown flag).
     Malformed(&'static str),
 }
 
@@ -147,7 +155,7 @@ impl FragmentHeader {
         out[26..28].copy_from_slice(&self.fragment_len.to_le_bytes());
         out[28..32].copy_from_slice(&self.send_seq.to_le_bytes());
         out[32..34].copy_from_slice(&self.flags.0.to_le_bytes());
-        // 34..36 reserved, already zero
+        out[34..36].copy_from_slice(&self.key_epoch.to_le_bytes());
         out
     }
 
@@ -205,11 +213,9 @@ impl FragmentHeader {
             fragment_len: u16_at(26),
             send_seq: u32_at(28),
             flags: Flags(u16_at(32)),
+            key_epoch: u16_at(34),
         };
 
-        if u16_at(34) != 0 {
-            return Err(WireError::Malformed("reserved field is not zero"));
-        }
         if !header.flags.is_valid() {
             return Err(WireError::Malformed("unknown flag bit"));
         }
@@ -268,6 +274,7 @@ mod tests {
             fragment_len: 1364,
             send_seq: 9_999,
             flags: Flags::NONE,
+            key_epoch: 0,
         }
     }
 
@@ -318,17 +325,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_nonzero_reserved_field() {
-        // Forward compatibility: a peer that speaks a later version of this header must
-        // fail loudly here rather than be half-understood.
-        let header = sample();
-        let mut datagram = header.encode().to_vec();
+    fn the_key_epoch_survives_a_round_trip_and_is_authenticated_with_the_rest() {
+        // The field was `reserved` and had to be zero; it now carries which media key sealed the
+        // datagram. It is inside the AEAD's associated data, so relabelling a datagram into another
+        // epoch fails the tag rather than being believed — which is the whole reason a protocol
+        // change could be made here instead of shaping a new header.
+        let header = FragmentHeader {
+            key_epoch: 7,
+            ..sample()
+        };
+        let encoded = header.encode();
+        let mut datagram = encoded.to_vec();
         datagram.resize(HEADER_LEN + 1364, 0);
-        datagram[34] = 1;
-        assert!(matches!(
-            FragmentHeader::decode(&datagram),
-            Err(WireError::Malformed(_))
-        ));
+
+        let (decoded, _) = FragmentHeader::decode(&datagram).unwrap();
+        assert_eq!(decoded.key_epoch, 7);
+        assert_eq!(&encoded[34..36], &7u16.to_le_bytes());
     }
 
     #[test]

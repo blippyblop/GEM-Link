@@ -31,6 +31,20 @@
 //! under the same key, this is broken — so the key is derived per session and the index is
 //! never reset within one.
 //!
+//! ## 3. A key that never rotates is a key whose nonce space is bounded by luck
+//!
+//! The sentence above — "never a key that outlives a frame-index reset" — is a *requirement*, and
+//! until [`KeySchedule`] existed nothing enforced it. A session that ran long enough to run out of
+//! frame index, or a sender that restarted its index after a reconnect without a new key, would
+//! repeat nonces under one key. That is not a theoretical worry: `FrameScheduler` and the trust gate
+//! both expect a reconnecting sender, and the reference client treats key lifetime as an operational
+//! quantity (`SVLDataLink::InitCrypt() With %lu remaining key max` — a budget, not a constant).
+//!
+//! So keys are derived from a session secret and tied to a **key epoch**, which rides on the wire
+//! and is authenticated with everything else. Rotation needs no exchange: both ends derive the same
+//! key from the same secret and the same epoch. See [`KeySchedule`] for why the epoch is what the
+//! sender rotates on and not simply the frame index.
+//!
 //! ## What this does not do
 //!
 //! **It does not stop replay.** A replayed datagram carries a valid nonce and a valid tag,
@@ -43,6 +57,10 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce, Tag,
     aead::{AeadInPlace, KeyInit},
 };
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Key length, bytes.
 pub const KEY_LEN: usize = 32;
@@ -188,6 +206,236 @@ impl MediaCipher {
     }
 }
 
+/// How many frames one derived key covers before the sender moves to the next epoch.
+///
+/// A judgement, stated as one: at 90 Hz this is **one minute of stream per key**, which bounds the
+/// nonce space at 60 * 90 * shards. The nonce carries a 64-bit frame index and a 16-bit fragment
+/// index, so this is nowhere near a collision risk on its own — the reason to rotate at all is that
+/// a *reset* frame index under one key is a repeat, and a minute is short enough that a session which
+/// reconnects repeatedly still changes keys often, and long enough that the derivation is not on any
+/// hot path.
+pub const FRAMES_PER_KEY: u64 = 90 * 60;
+
+/// The domain separator. Distinct per purpose, so a future KDF for something else cannot collide
+/// with this one.
+const KEY_DERIVATION_CONTEXT: &[u8] = b"gemlink/media-key/v1";
+
+/// Derives media keys from one session secret, one per epoch.
+///
+/// # Why an epoch and not the frame index
+///
+/// Deriving a key per frame would work and would be pointless: the derivation would be on the hot
+/// path of every datagram, and a receiver would have to derive a key before it could authenticate
+/// the datagram that tells it which key to use. An **epoch** is the smallest thing that can be
+/// carried in a header and understood without a lookup, it rotates on a schedule the sender alone
+/// decides, and the receiver needs to hold at most the current and the previous key — which is
+/// exactly the tolerance a lossy link needs, because a datagram sealed under the old key may still
+/// be in flight when the new one starts.
+///
+/// # Why HMAC and not a bare hash
+///
+/// `HMAC-SHA256(secret, context ‖ epoch)` is a PRF with a proof, and it is the standard "expand" step
+/// of every KDF in use. A bare `SHA256(secret ‖ epoch)` would also be fine *given* a uniformly
+/// random secret, but it is fine for a reason that has to be argued each time it is read, and the
+/// argument fails the moment someone passes a password. The secret here comes from a Noise
+/// handshake, so it is uniform — but the construction should not depend on knowing that.
+#[derive(Clone)]
+pub struct KeySchedule {
+    secret: [u8; KEY_LEN],
+    frames_per_key: u64,
+}
+
+impl std::fmt::Debug for KeySchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key material, even in a panic message. The test below caught the derived
+        // `Debug` doing exactly that — which is the argument for having the test rather than a
+        // convention.
+        write!(
+            f,
+            "KeySchedule(<secret redacted>, {} frames per key)",
+            self.frames_per_key
+        )
+    }
+}
+
+impl KeySchedule {
+    /// `secret` must be uniformly random. The module docs explain why the whole scheme rests on it.
+    ///
+    /// The secret is not printed by `Debug`, for the same reason [`MediaCipher`] is not.
+    pub fn new(secret: [u8; KEY_LEN]) -> Self {
+        Self {
+            secret,
+            frames_per_key: FRAMES_PER_KEY,
+        }
+    }
+
+    /// A schedule with a non-default rotation cadence. For tests and for a link whose budget is
+    /// short; production uses [`FRAMES_PER_KEY`].
+    pub fn with_frames_per_key(secret: [u8; KEY_LEN], frames_per_key: u64) -> Self {
+        Self {
+            secret,
+            frames_per_key: frames_per_key.max(1),
+        }
+    }
+
+    pub fn frames_per_key(&self) -> u64 {
+        self.frames_per_key
+    }
+
+    /// The epoch a frame index belongs to. Epoch 0 is the first key of the session.
+    ///
+    /// `saturating` rather than wrapping: a frame index that has run past `u16::MAX` epochs is a
+    /// session that has been running for eight years at 90 Hz, and wrapping would silently reuse key
+    /// 0 — the one failure this whole type exists to prevent.
+    pub fn epoch_for(&self, frame_index: u64) -> u16 {
+        (frame_index / self.frames_per_key).min(u16::MAX as u64) as u16
+    }
+
+    /// The key for an epoch. Deterministic on both ends.
+    pub fn key_for(&self, epoch: u16) -> [u8; KEY_LEN] {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.secret)
+            .expect("HMAC accepts a key of any length, including this one");
+        mac.update(KEY_DERIVATION_CONTEXT);
+        mac.update(&epoch.to_be_bytes());
+        let out = mac.finalize().into_bytes();
+
+        let mut key = [0u8; KEY_LEN];
+        key.copy_from_slice(&out);
+        key
+    }
+
+    /// The cipher for an epoch.
+    ///
+    /// Deriving a cipher is not free, so a caller on a hot path should hold the one it is using and
+    /// re-derive only when [`Self::epoch_for`] changes — which is the shape [`KeyRing`] exists to
+    /// express for the receiving side.
+    pub fn cipher_for(&self, epoch: u16) -> MediaCipher {
+        MediaCipher::new(&self.key_for(epoch))
+    }
+}
+
+/// The receiver's view: the current key, and the one before it.
+///
+/// A datagram sealed under the previous key can still be in flight when the sender rotates, and on a
+/// lossy link it can be in flight for a while. Holding one key back is the smallest tolerance that
+/// cannot lose a frame for a reason that is purely about key timing; holding more would be holding
+/// keys that a compromised client could be forced to use.
+#[derive(Debug)]
+pub struct KeyRing {
+    schedule: KeySchedule,
+    current: (u16, MediaCipher),
+    previous: Option<(u16, MediaCipher)>,
+}
+
+impl KeyRing {
+    pub fn new(schedule: KeySchedule) -> Self {
+        let cipher = schedule.cipher_for(0);
+        Self {
+            schedule,
+            current: (0, cipher),
+            previous: None,
+        }
+    }
+
+    pub fn current_epoch(&self) -> u16 {
+        self.current.0
+    }
+
+    /// The cipher for a datagram's epoch, if this ring knows it.
+    ///
+    /// Learning a *newer* epoch advances the ring; learning an older one that is not the previous is
+    /// refused, because a datagram from three epochs ago is either a very old straggler or a replay,
+    /// and neither is worth deriving a key for.
+    pub fn cipher_for(&mut self, epoch: u16) -> Option<&MediaCipher> {
+        let known =
+            epoch == self.current.0 || self.previous.as_ref().is_some_and(|(e, _)| *e == epoch);
+
+        if !known {
+            if epoch <= self.current.0 {
+                // Older than the previous key: either a very old straggler or a replay. Deriving a
+                // key for it would be doing work on behalf of an attacker.
+                return None;
+            }
+            let cipher = self.schedule.cipher_for(epoch);
+            let old = std::mem::replace(&mut self.current, (epoch, cipher));
+            self.previous = Some(old);
+        }
+
+        if epoch == self.current.0 {
+            Some(&self.current.1)
+        } else {
+            self.previous.as_ref().map(|(_, cipher)| cipher)
+        }
+    }
+
+    /// Whether this ring would accept a datagram of this epoch, without changing it.
+    pub fn accepts(&self, epoch: u16) -> bool {
+        epoch == self.current.0
+            || self.previous.as_ref().is_some_and(|(e, _)| *e == epoch)
+            || epoch == self.current.0 + 1
+    }
+}
+
+/// Which key a receiver uses for a datagram, and how that changes.
+///
+/// Two shapes rather than one, because the two callers want genuinely different things: a bench or a
+/// test wants one key and no derivation, and a live session wants a schedule keyed by the epoch on
+/// the wire. Making the fixed case construct a schedule would put a KDF on the bench's hot path to
+/// prove nothing.
+#[derive(Debug)]
+pub enum MediaKeys {
+    /// One key for the whole session.
+    Fixed(MediaCipher),
+    /// A rotating schedule, keyed by the epoch the datagram carries.
+    ///
+    /// The `epoch` argument comes from the datagram header, which is **authenticated with the
+    /// payload** — so a datagram cannot be relabelled into an epoch whose key would open it, because
+    /// the relabelling changes the associated data and the tag then fails. That is what makes it safe
+    /// to let a field an attacker can see choose which key is tried.
+    Ring(KeyRing),
+}
+
+impl MediaKeys {
+    pub fn fixed(cipher: MediaCipher) -> Self {
+        Self::Fixed(cipher)
+    }
+
+    pub fn rotating(schedule: KeySchedule) -> Self {
+        Self::Ring(KeyRing::new(schedule))
+    }
+
+    /// Open one datagram, choosing the key from the epoch it carries.
+    pub fn open(
+        &mut self,
+        epoch: u16,
+        frame_index: u64,
+        fragment_index: u16,
+        associated_data: &[u8],
+        attached: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        match self {
+            MediaKeys::Fixed(cipher) => {
+                cipher.open(frame_index, fragment_index, associated_data, attached)
+            }
+            MediaKeys::Ring(ring) => {
+                let Some(cipher) = ring.cipher_for(epoch) else {
+                    // An epoch the ring does not hold: a very old straggler, or a replay. Reported
+                    // as an authentication failure and not as "unknown epoch", because telling an
+                    // attacker which of the two it was is a gift and we would not use the answer.
+                    return Err(CryptoError::Authentication);
+                };
+                cipher.open(frame_index, fragment_index, associated_data, attached)
+            }
+        }
+    }
+}
+
+impl From<MediaCipher> for MediaKeys {
+    fn from(cipher: MediaCipher) -> Self {
+        Self::Fixed(cipher)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +566,158 @@ mod tests {
         let first = cipher.seal(3, 4, &aad, b"payload").unwrap();
         let again = cipher.seal(3, 4, &aad, b"payload").unwrap();
         assert_eq!(first, again);
+    }
+
+    // -- key rotation -------------------------------------------------------------------------
+
+    fn schedule() -> KeySchedule {
+        KeySchedule::with_frames_per_key(key(20), 100)
+    }
+
+    #[test]
+    fn the_epoch_follows_the_frame_index_and_saturates_rather_than_wrapping() {
+        let schedule = schedule();
+
+        assert_eq!(schedule.epoch_for(0), 0);
+        assert_eq!(schedule.epoch_for(99), 0);
+        assert_eq!(schedule.epoch_for(100), 1);
+        assert_eq!(schedule.epoch_for(250), 2);
+
+        // A frame index that has run past every epoch is a session eight years long. Wrapping would
+        // silently reuse key 0 — the one failure this type exists to prevent — so it saturates.
+        assert_eq!(
+            schedule.epoch_for(u64::MAX),
+            u16::MAX,
+            "the epoch wrapped instead of saturating"
+        );
+    }
+
+    #[test]
+    fn both_ends_derive_the_same_key_from_the_same_secret_and_epoch() {
+        let sender = schedule();
+        let receiver = schedule();
+
+        for epoch in [0u16, 1, 7, u16::MAX] {
+            assert_eq!(sender.key_for(epoch), receiver.key_for(epoch));
+        }
+    }
+
+    #[test]
+    fn a_different_epoch_is_a_different_key_and_a_different_secret_is_a_different_key() {
+        let schedule = schedule();
+
+        assert_ne!(schedule.key_for(0), schedule.key_for(1));
+        assert_ne!(schedule.key_for(1), schedule.key_for(2));
+
+        let other = KeySchedule::with_frames_per_key(key(21), 100);
+        assert_ne!(
+            schedule.key_for(0),
+            other.key_for(0),
+            "two sessions must not derive the same key"
+        );
+    }
+
+    #[test]
+    fn a_datagram_sealed_under_one_epoch_does_not_open_under_another() {
+        let schedule = schedule();
+        let aad = [0u8; crate::wire::HEADER_LEN];
+
+        let sealed = schedule.cipher_for(1).seal(500, 3, &aad, b"frame").unwrap();
+
+        assert!(schedule.cipher_for(1).open(500, 3, &aad, &sealed).is_ok());
+        assert_eq!(
+            schedule.cipher_for(2).open(500, 3, &aad, &sealed),
+            Err(CryptoError::Authentication),
+            "a datagram must not open under the neighbouring epoch's key"
+        );
+    }
+
+    #[test]
+    fn the_ring_keeps_one_key_back_so_a_straggler_still_opens() {
+        let mut ring = KeyRing::new(schedule());
+        let aad = [0u8; crate::wire::HEADER_LEN];
+
+        let old = ring
+            .cipher_for(0)
+            .unwrap()
+            .seal(50, 0, &aad, b"old")
+            .unwrap();
+
+        // The sender rotates; the straggler sealed under epoch 0 is still in flight.
+        let new = ring
+            .cipher_for(1)
+            .unwrap()
+            .seal(150, 0, &aad, b"new")
+            .unwrap();
+        assert_eq!(ring.current_epoch(), 1);
+
+        let mut keys = MediaKeys::Ring(ring);
+        assert_eq!(keys.open(1, 150, 0, &aad, &new).unwrap(), b"new");
+        assert_eq!(
+            keys.open(0, 50, 0, &aad, &old).unwrap(),
+            b"old",
+            "losing a frame purely because the key rotated underneath it is not acceptable on a \
+             lossy link"
+        );
+    }
+
+    #[test]
+    fn the_ring_refuses_a_key_older_than_the_one_it_keeps() {
+        let mut ring = KeyRing::new(schedule());
+        let aad = [0u8; crate::wire::HEADER_LEN];
+
+        // Advance three epochs; only the current and the one before it are held.
+        for epoch in 1..=3u16 {
+            ring.cipher_for(epoch);
+        }
+        assert_eq!(ring.current_epoch(), 3);
+        assert!(ring.accepts(3));
+        assert!(ring.accepts(2));
+        assert!(
+            !ring.accepts(1),
+            "a key from three epochs ago must not be derivable on request"
+        );
+
+        // And the refusal is an authentication failure rather than a distinguishable "unknown
+        // epoch": telling an attacker which of the two it was is a gift we would not use.
+        let sealed = schedule()
+            .cipher_for(1)
+            .seal(10, 0, &aad, b"ancient")
+            .unwrap();
+        let mut keys = MediaKeys::Ring(ring);
+        assert_eq!(
+            keys.open(1, 10, 0, &aad, &sealed),
+            Err(CryptoError::Authentication)
+        );
+    }
+
+    #[test]
+    fn learning_a_newer_epoch_advances_the_ring() {
+        let mut ring = KeyRing::new(schedule());
+        assert_eq!(ring.current_epoch(), 0);
+
+        // A datagram from an epoch we have not seen yet: the sender has rotated and its datagrams
+        // are arriving. The ring follows rather than rejecting.
+        assert!(ring.cipher_for(1).is_some());
+        assert_eq!(ring.current_epoch(), 1);
+
+        // A jump, as a long loss burst would produce.
+        assert!(ring.cipher_for(4).is_some());
+        assert_eq!(ring.current_epoch(), 4);
+        assert!(
+            !ring.accepts(0),
+            "the ring drifted forward and must not still hold the session's first key"
+        );
+    }
+
+    #[test]
+    fn the_schedule_does_not_print_its_secret() {
+        let schedule = schedule();
+        let rendered = format!("{schedule:?}");
+        assert!(
+            !rendered.contains("20"),
+            "the secret must not be rendered: {rendered}"
+        );
     }
 
     #[test]

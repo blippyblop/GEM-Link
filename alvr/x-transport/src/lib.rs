@@ -56,7 +56,7 @@ pub mod trust;
 pub mod wire;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveParity, RatioChange};
-pub use crypto::{KEY_LEN, MediaCipher};
+pub use crypto::{FRAMES_PER_KEY, KEY_LEN, KeyRing, KeySchedule, MediaCipher, MediaKeys};
 pub use fec::{FecError, decode_striped as fec_decode_striped, encode as fec_encode};
 pub use pacer::{Pacer, PacerConfig};
 pub use packetizer::{FrameMeta, Packetizer, ParityPolicy};

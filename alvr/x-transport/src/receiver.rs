@@ -40,7 +40,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use crate::{
-    crypto::{CryptoError, MediaCipher},
+    crypto::{CryptoError, MediaKeys},
     fec,
     wire::{FragmentHeader, WireError},
 };
@@ -247,7 +247,7 @@ impl PartialFrame {
 /// Reassembles frames from datagrams.
 pub struct Receiver {
     policy: ReleasePolicy,
-    cipher: Option<MediaCipher>,
+    keys: Option<MediaKeys>,
     /// Frames still being assembled, ordered so release is a single pass.
     partial: BTreeMap<u64, PartialFrame>,
     /// The highest frame index that has arrived complete — the reorder-reference.
@@ -262,10 +262,10 @@ pub struct Receiver {
 }
 
 impl Receiver {
-    pub fn new(policy: ReleasePolicy, cipher: Option<MediaCipher>) -> Self {
+    pub fn new(policy: ReleasePolicy, keys: Option<MediaKeys>) -> Self {
         Self {
             policy,
-            cipher,
+            keys,
             partial: BTreeMap::new(),
             max_completed: None,
             max_released: None,
@@ -312,8 +312,9 @@ impl Receiver {
 
         // Decrypt before anything else: the plaintext's length is what the shard layout was
         // built from, and an unauthenticated datagram must not influence state at all.
-        let shard = match &self.cipher {
-            Some(cipher) => match cipher.open(
+        let shard = match &mut self.keys {
+            Some(keys) => match keys.open(
+                header.key_epoch,
                 header.frame_index,
                 header.fragment_index,
                 &datagram[..crate::wire::HEADER_LEN],
@@ -525,7 +526,7 @@ impl std::fmt::Debug for Receiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Receiver")
             .field("policy", &self.policy)
-            .field("cipher", &self.cipher)
+            .field("keys", &self.keys)
             .field("in_flight", &self.partial.len())
             .field("stats", &self.stats)
             .finish()
@@ -571,6 +572,7 @@ mod tests {
                     frame_index,
                     target_timestamp_us: 11_111 * frame_index,
                     is_keyframe: false,
+                    key_epoch: 0,
                 },
                 bytes,
                 seq,
@@ -756,6 +758,7 @@ mod tests {
                     frame_index: 1,
                     target_timestamp_us: 1,
                     is_keyframe: true,
+                    key_epoch: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -815,6 +818,7 @@ mod tests {
                     frame_index: 1,
                     target_timestamp_us: 1,
                     is_keyframe: true,
+                    key_epoch: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -849,6 +853,7 @@ mod tests {
                     frame_index: 7,
                     target_timestamp_us: 1,
                     is_keyframe: true,
+                    key_epoch: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -914,6 +919,7 @@ mod tests {
                     frame_index: 1,
                     target_timestamp_us: 1,
                     is_keyframe: true,
+                    key_epoch: 0,
                 },
                 &payload(100),
                 &mut seq,
@@ -991,6 +997,7 @@ mod tests {
                     frame_index: 1,
                     target_timestamp_us: 1,
                     is_keyframe: true,
+                    key_epoch: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1009,13 +1016,70 @@ mod tests {
         assert_eq!(receiver.in_flight(), 0);
     }
 
+    /// A mid-stream key rotation, through the real receiver.
+    ///
+    /// The point is not that two keys decrypt two frames — it is that a rotation the client did not
+    /// negotiate, arriving as a header field, works: the frame sealed under the *next* epoch is
+    /// accepted without any signalling, and the straggler sealed under the previous one still is too.
+    /// That is what makes rotation something the sender can decide alone, which is what the reference
+    /// client treats it as.
+    #[test]
+    fn a_frame_sealed_under_the_next_epoch_is_accepted_without_any_signalling() {
+        use crate::crypto::{KEY_LEN, KeySchedule, MediaKeys};
+
+        // Rotate every 10 frames, so frame 5 is epoch 0 and frame 15 is epoch 1.
+        let schedule = KeySchedule::with_frames_per_key([5u8; KEY_LEN], 10);
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Fixed(1));
+        let bytes = payload(SHARD);
+        let mut receiver = Receiver::new(policy(), Some(MediaKeys::rotating(schedule.clone())));
+        let mut seq = 0;
+
+        for frame_index in [5u64, 15] {
+            let epoch = schedule.epoch_for(frame_index);
+            assert_eq!(epoch, if frame_index == 5 { 0 } else { 1 });
+
+            let cipher = schedule.cipher_for(epoch);
+            let (_, datagrams) = packetizer
+                .fragment(
+                    FrameMeta {
+                        frame_index,
+                        target_timestamp_us: frame_index * 11_111,
+                        is_keyframe: frame_index == 5,
+                        key_epoch: epoch,
+                    },
+                    &bytes,
+                    &mut seq,
+                    Some(&cipher),
+                )
+                .unwrap();
+
+            for datagram in &datagrams {
+                assert!(
+                    !matches!(
+                        receiver.on_datagram(datagram, Duration::ZERO),
+                        RecvEvent::Rejected(_)
+                    ),
+                    "frame {frame_index} (epoch {epoch}) was rejected by the receiver"
+                );
+            }
+        }
+
+        let released = receiver.release(Duration::from_millis(50));
+        assert_eq!(released.len(), 2, "a rotation lost a frame");
+        assert!(
+            released.iter().all(|frame| frame.is_displayable()),
+            "a frame that rotated underneath the receiver came out unusable"
+        );
+        assert_eq!(receiver.stats().datagrams_unauthenticated, 0);
+    }
+
     #[test]
     fn an_unauthenticated_datagram_changes_nothing() {
         use crate::crypto::{KEY_LEN, MediaCipher};
 
         let cipher = MediaCipher::new(&[3u8; KEY_LEN]);
         let packetizer = Packetizer::new(MTU, ParityPolicy::Fixed(1));
-        let mut receiver = Receiver::new(policy(), Some(MediaCipher::new(&[3u8; KEY_LEN])));
+        let mut receiver = Receiver::new(policy(), Some(MediaCipher::new(&[3u8; KEY_LEN]).into()));
         let bytes = payload(SHARD * 2);
         let mut seq = 0;
         let (_, datagrams) = packetizer
@@ -1024,6 +1088,7 @@ mod tests {
                     frame_index: 1,
                     target_timestamp_us: 1,
                     is_keyframe: true,
+                    key_epoch: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1070,6 +1135,7 @@ mod tests {
                     frame_index: 1,
                     target_timestamp_us: 1,
                     is_keyframe: true,
+                    key_epoch: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1111,6 +1177,7 @@ mod tests {
                     frame_index: 1,
                     target_timestamp_us: 1,
                     is_keyframe: true,
+                    key_epoch: 0,
                 },
                 &payload(SHARD * 3),
                 &mut seq,

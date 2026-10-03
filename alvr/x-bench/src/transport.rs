@@ -182,7 +182,10 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
     let packetizer = Packetizer::new(scenario.mtu, scenario.parity());
     let mut receiver = Receiver::new(
         ReleasePolicy::new(scenario.jitter_frames, frame_interval),
-        scenario.encrypted.then(|| MediaCipher::new(&key)),
+        scenario
+            .encrypted
+            .then(|| MediaCipher::new(&key))
+            .map(Into::into),
     );
 
     // Deterministic payload: incompressible-looking, and identical between the two ends of
@@ -263,6 +266,7 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
                     // scenario's delivery — it is here so the path that carries it is exercised
                     // end to end rather than only in unit tests.
                     is_keyframe: frame_index == 1 || frame_index.is_multiple_of(30),
+                    key_epoch: 0,
                 },
                 &payload,
                 &mut 0,
