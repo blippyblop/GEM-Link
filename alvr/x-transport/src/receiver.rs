@@ -93,6 +93,16 @@ impl DeliveredFrame {
         self.payload.as_deref()
     }
 
+    /// Take the frame's bytes.
+    ///
+    /// The receive path has already built this buffer and nothing else needs it, so handing it over
+    /// rather than copying it is the difference between a memcpy per frame and none. At 90 Hz with a
+    /// 48 KB frame that is 4.3 MB/s of pure copying, spent to leave the original in a struct that is
+    /// about to be dropped.
+    pub fn into_payload(self) -> Option<Vec<u8>> {
+        self.payload
+    }
+
     /// Whether this frame may be presented. Equivalent to `payload().is_some()`, and the
     /// only question the display path needs to ask.
     pub const fn is_displayable(&self) -> bool {

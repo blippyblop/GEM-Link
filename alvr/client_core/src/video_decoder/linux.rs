@@ -42,7 +42,11 @@ use alvr_graphics::DmaBufFrame;
 use alvr_session::CodecType;
 use std::{
     collections::VecDeque,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -61,35 +65,80 @@ pub fn fourcc_for(codec: CodecType) -> Option<u32> {
     }
 }
 
-/// Work for the decoder thread.
-enum Request {
-    AccessUnit(Duration, Vec<u8>),
-    /// The renderer is finished with a CAPTURE buffer. Until this arrives the decoder cannot reuse
-    /// it, which is the difference between a client that decodes for the whole session and one that
-    /// decodes until the ring runs dry.
+/// Control messages. Separate from access units because they must **never** be refused: a
+/// `Release` that is dropped because the queue was full is a CAPTURE buffer leaked, which is a
+/// decoder that stops.
+enum Control {
+    /// The renderer is finished with a CAPTURE buffer.
     Release(u32),
     Shutdown,
 }
 
-pub struct VideoDecoderSink {
-    requests: mpsc::Sender<Request>,
-    join_handle: Option<JoinHandle<()>>,
+/// How many access units may be waiting for the decoder.
+///
+/// This is a **latency budget, not a buffer size**, which is the whole point. Before this queue
+/// existed the decoder was called synchronously from the receive loop: a decode that took 36 ms
+/// against a 29.6 ms frame interval fell behind monotonically, the client's own 10-datagram socket
+/// pool ran dry, and the reader discarded 1.5 % of everything it read *without recording it*
+/// (`doc 50 §A10`). A thread and a queue remove that specific failure — but an unbounded queue
+/// would replace "frames silently dropped" with "frames queued, latency unbounded", which is worse
+/// for the metric this project is scored on.
+///
+/// So the queue is bounded by the same knob the setting offers for exactly this trade
+/// (`video.max_buffering_frames`, "Increasing this value will help reduce stutter but it will
+/// increase latency"), and a full queue is **refused and counted**, not queued and not silently
+/// dropped.
+const MAX_QUEUED_ACCESS_UNITS_RANGE: (usize, usize) = (1, 8);
+
+fn queue_capacity(config: &VideoDecoderConfig) -> usize {
+    let frames = config.max_buffering_frames.ceil();
+    if !frames.is_finite() || frames < 1.0 {
+        return 1;
+    }
+    (frames as usize).clamp(
+        MAX_QUEUED_ACCESS_UNITS_RANGE.0,
+        MAX_QUEUED_ACCESS_UNITS_RANGE.1,
+    )
 }
 
-// An mpsc sender is Send; the join handle only ever joins.
+pub struct VideoDecoderSink {
+    units: mpsc::SyncSender<(Duration, Vec<u8>)>,
+    control: mpsc::Sender<Control>,
+    /// Access units refused because the queue was full. Shared with the thread so the session
+    /// summary carries it: a decoder that is behind is a fact about the session, and it belongs
+    /// next to the other counters rather than in a log line nobody greps.
+    refused: Arc<AtomicU64>,
+    join_handle: Option<JoinHandle<()>>,
+    /// Repeated in the warning above so the operator knows the budget without reading the settings.
+    capacity: usize,
+}
+
+// A channel sender is Send; the join handle only ever joins.
 unsafe impl Send for VideoDecoderSink {}
 
 impl VideoDecoderSink {
-    /// Hand one access unit to the decoder thread. `false` means it could not be taken, which the
-    /// receive loop reads as decoder saturation — so this must not return `false` for a frame that
-    /// was queued. See the note on the channel below for why a slow decoder does not lie here.
+    /// Hand one access unit to the decoder thread. `false` means it could not be taken — the queue
+    /// is full, or the thread is gone — which the receive loop already reads as decoder saturation.
+    ///
+    /// It must not return `false` for a frame that *was* queued: the caller answers `false` by
+    /// asking the sender for a keyframe, and doing that for a frame that is about to decode is a
+    /// bitrate spike attached to nothing.
     pub fn push_frame_nal(&mut self, timestamp: Duration, data: &[u8]) -> Result<bool> {
-        match self
-            .requests
-            .send(Request::AccessUnit(timestamp, data.to_vec()))
-        {
+        match self.units.try_send((timestamp, data.to_vec())) {
             Ok(()) => Ok(true),
-            Err(_) => {
+            Err(mpsc::TrySendError::Full(_)) => {
+                let refused = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
+                if refused == 1 || refused.is_multiple_of(120) {
+                    warn!(
+                        "video decoder: {refused} access unit(s) refused — the decoder is more than \
+                         {} frame(s) behind and the queue is full. Dropping the frame keeps the \
+                         latency budget; queueing it would spend latency to hide it.",
+                        self.capacity
+                    );
+                }
+                Ok(false)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
                 error!("video decoder: the decoder thread is gone; no frame can be decoded");
                 Ok(false)
             }
@@ -98,7 +147,7 @@ impl VideoDecoderSink {
 
     /// Stop the decoder thread and wait for it. Called from `Drop`.
     fn shutdown(&mut self) {
-        let _ = self.requests.send(Request::Shutdown);
+        let _ = self.control.send(Control::Shutdown);
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
         }
@@ -113,7 +162,7 @@ impl Drop for VideoDecoderSink {
 
 pub struct VideoDecoderSource {
     frames: mpsc::Receiver<VideoFrame>,
-    requests: mpsc::Sender<Request>,
+    control: mpsc::Sender<Control>,
     /// The buffers handed out and not yet returned. A number that only grows means the renderer is
     /// dropping them, which on a fixed-size CAPTURE ring is a decoder that stops.
     outstanding: VecDeque<u32>,
@@ -138,7 +187,7 @@ impl VideoDecoderSource {
         if let Some(position) = self.outstanding.iter().position(|&b| b == buffer) {
             self.outstanding.remove(position);
         }
-        let _ = self.requests.send(Request::Release(buffer));
+        let _ = self.control.send(Control::Release(buffer));
     }
 }
 
@@ -159,10 +208,14 @@ pub fn video_decoder_split(
 
     let (device, description) = select_device(&config, fourcc);
 
-    let (request_sender, request_receiver) = mpsc::channel();
+    let capacity = queue_capacity(&config);
+    let (unit_sender, unit_receiver) = mpsc::sync_channel(capacity);
+    let (control_sender, control_receiver) = mpsc::channel();
     let (frame_sender, frame_receiver) = mpsc::channel();
+    let refused = Arc::new(AtomicU64::new(0));
+    let refused_in_thread = Arc::clone(&refused);
 
-    info!("video decoder: {description}");
+    info!("video decoder: {description} (input queue: {capacity} frame(s))");
 
     let join_handle = thread::Builder::new()
         .name("alvr-decoder".to_owned())
@@ -170,8 +223,10 @@ pub fn video_decoder_split(
             decoder_thread(
                 device,
                 config,
-                request_receiver,
+                unit_receiver,
+                control_receiver,
                 frame_sender,
+                refused_in_thread,
                 report_frame_decoded,
             )
         })
@@ -179,12 +234,15 @@ pub fn video_decoder_split(
 
     Ok((
         VideoDecoderSink {
-            requests: request_sender.clone(),
+            units: unit_sender,
+            control: control_sender.clone(),
+            refused,
             join_handle: Some(join_handle),
+            capacity,
         },
         VideoDecoderSource {
             frames: frame_receiver,
-            requests: request_sender,
+            control: control_sender,
             outstanding: VecDeque::new(),
         },
     ))
@@ -199,21 +257,26 @@ pub fn video_decoder_split(
 pub fn dead_decoder(reason: &str) -> (VideoDecoderSink, VideoDecoderSource) {
     error!("video decoder: unusable — {reason}");
 
-    let (requests, receiver) = mpsc::channel();
-    let source_requests = requests.clone();
-    // Dropping the receiver is what makes every `send` fail, which is the behaviour above.
-    drop(receiver);
+    let (units, unit_receiver) = mpsc::sync_channel(1);
+    let (control, control_receiver) = mpsc::channel();
+    let source_control = control.clone();
+    // Dropping the receivers is what makes every `send` fail, which is the behaviour above.
+    drop(unit_receiver);
+    drop(control_receiver);
 
     let (_frames, frame_receiver) = mpsc::channel();
 
     (
         VideoDecoderSink {
-            requests,
+            units,
+            control,
+            refused: Arc::new(AtomicU64::new(0)),
             join_handle: None,
+            capacity: 1,
         },
         VideoDecoderSource {
             frames: frame_receiver,
-            requests: source_requests,
+            control: source_control,
             outstanding: VecDeque::new(),
         },
     )
@@ -265,11 +328,14 @@ fn select_device(config: &VideoDecoderConfig, fourcc: u32) -> (Box<dyn V4l2Devic
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decoder_thread(
     mut device: Box<dyn V4l2Device + Send>,
     config: VideoDecoderConfig,
-    requests: mpsc::Receiver<Request>,
+    units: mpsc::Receiver<(Duration, Vec<u8>)>,
+    control: mpsc::Receiver<Control>,
     frames: mpsc::Sender<VideoFrame>,
+    refused: Arc<AtomicU64>,
     report_frame_decoded: Box<dyn Fn(Result<Duration>) + Send + Sync>,
 ) {
     let path = device.path().to_owned();
@@ -313,38 +379,48 @@ fn decoder_thread(
     );
 
     loop {
-        // Drain the queue without blocking the poll below. The timeout is the loop's tick: long
-        // enough that an idle decoder costs nothing, short enough that a decode event is not sat on.
+        // Control first, and drained to empty: a `Release` is a buffer coming back to the device,
+        // and holding one behind a queue of access units is how a decoder starves itself.
         loop {
-            match requests.recv_timeout(Duration::from_millis(2)) {
-                Ok(Request::AccessUnit(timestamp, nal)) => match pipeline.submit(timestamp, &nal) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // Counted by the pipeline. This is a frame the client itself dropped, and
-                        // it must be visible as such rather than as a network loss.
-                        warn!("video decoder: no free OUTPUT buffer; dropped an access unit");
-                    }
-                    Err(e) => {
-                        error!("video decoder: {e}");
-                        report_frame_decoded(Err(anyhow!("{e}")));
-                        return;
-                    }
-                },
-                Ok(Request::Release(index)) => {
+            match control.try_recv() {
+                Ok(Control::Release(index)) => {
                     if let Err(e) = pipeline.release(index) {
                         error!("video decoder: releasing CAPTURE buffer {index}: {e}");
                     }
                 }
-                Ok(Request::Shutdown) => {
-                    let stats = pipeline.stats();
-                    info!("{}", stats.summary());
+                Ok(Control::Shutdown) => {
+                    report_summary(&pipeline, &refused);
                     return;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    info!("{}", pipeline.stats().summary());
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    report_summary(&pipeline, &refused);
                     return;
                 }
+            }
+        }
+
+        // Then one access unit, with a short tick so a decode event is never sat on. The bounded
+        // queue is what makes this a `recv_timeout` rather than a drain: at most `capacity` frames
+        // are ever waiting, and the producer learns immediately when it cannot add one.
+        match units.recv_timeout(Duration::from_millis(2)) {
+            Ok((timestamp, nal)) => match pipeline.submit(timestamp, &nal) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Counted by the pipeline. This is a frame the client itself dropped, and it
+                    // must be visible as such rather than as a network loss.
+                    warn!("video decoder: no free OUTPUT buffer; dropped an access unit");
+                }
+                Err(e) => {
+                    error!("video decoder: {e}");
+                    report_frame_decoded(Err(anyhow!("{e}")));
+                    return;
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                report_summary(&pipeline, &refused);
+                return;
             }
         }
 
@@ -389,7 +465,7 @@ fn decoder_thread(
 
                     // Losing the receiver means the client is shutting down.
                     if frames.send(frame).is_err() {
-                        info!("{}", pipeline.stats().summary());
+                        report_summary(&pipeline, &refused);
                         return;
                     }
 
@@ -421,6 +497,29 @@ fn decoder_thread(
                 }
             }
         }
+    }
+}
+
+/// Print the session's decode accounting.
+///
+/// Two counters, because they are two different failures with the same symptom.
+/// `output_buffer_starved` is the *device* refusing an access unit; `refused` is the *queue* being
+/// full, which means the decoder never even saw it. The first is the decoder being pushed past what
+/// it can do, the second is the client choosing latency over smoothness — and a client that cannot
+/// tell them apart cannot be tuned.
+fn report_summary<D: V4l2Device>(pipeline: &DecoderPipeline<D>, refused: &AtomicU64) {
+    let refused = refused.load(Ordering::Relaxed);
+    info!(
+        "{}; {} access unit(s) refused by the client's own input queue",
+        pipeline.stats().summary(),
+        refused
+    );
+    if refused > 0 {
+        warn!(
+            "the decoder could not keep up and the client dropped {refused} frame(s) rather than \
+             queue them. That is the intended trade — a queued frame is pure added latency — but it \
+             means the negotiated settings do not fit this device."
+        );
     }
 }
 
@@ -550,6 +649,61 @@ impl V4l2Device for LoopbackDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The queue is a latency budget, and the whole reason it is bounded is that the alternative —
+    /// unbounded — trades a dropped frame for an unbounded delay, which is the worse half of the
+    /// bargain on a device scored on latency.
+    #[test]
+    fn the_input_queue_is_a_latency_budget_and_is_bounded_at_both_ends() {
+        fn with_budget(frames: f32) -> usize {
+            queue_capacity(&VideoDecoderConfig {
+                max_buffering_frames: frames,
+                ..Default::default()
+            })
+        }
+
+        // The setting's own range starts at 1.0, but a settings file is not a type: a zero, a NaN
+        // or a 10 000 arrives here eventually, and none of them may become a zero-length or an
+        // unbounded queue.
+        assert_eq!(
+            with_budget(0.0),
+            1,
+            "an unset budget still needs room for a frame"
+        );
+        assert_eq!(with_budget(f32::NAN), 1);
+        assert_eq!(with_budget(-3.0), 1);
+
+        assert_eq!(with_budget(2.0), 2);
+        // `ceil`, not truncation: a budget of 2.1 frames means "more than two", and rounding it
+        // down would deliver less buffering than the operator asked for.
+        assert_eq!(with_budget(2.1), 3);
+
+        assert_eq!(
+            with_budget(10_000.0),
+            MAX_QUEUED_ACCESS_UNITS_RANGE.1,
+            "an unbounded decoder queue is unbounded latency, which is the thing this queue exists \
+             to bound"
+        );
+    }
+
+    /// A decoder that does not exist must refuse frames visibly, not accept them into a hole.
+    #[test]
+    fn a_dead_decoder_refuses_every_frame() {
+        let (mut sink, mut source) = dead_decoder("test");
+
+        assert!(
+            !sink
+                .push_frame_nal(Duration::from_millis(1), &[0, 0, 0, 1])
+                .unwrap(),
+            "a dead decoder must refuse the frame, not accept it into a hole"
+        );
+        assert!(
+            source.dequeue_frame().is_none(),
+            "a dead decoder must not hand out a frame it did not decode"
+        );
+        // Releasing a buffer it never had must be harmless rather than a panic.
+        source.release_frame(3);
+    }
 
     #[test]
     fn only_the_codecs_the_device_decodes_have_a_fourcc() {

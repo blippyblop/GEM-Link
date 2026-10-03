@@ -145,11 +145,228 @@ impl<S: DatagramSource> DatagramSource for LossySource<S> {
     }
 }
 
+/// Datagrams from a UDP socket — the live source.
+///
+/// Everything about it exists to make the client's *own* behaviour visible rather than to add
+/// features. The failure this replaces (`doc 50 §A10`) was not that the socket returned too little;
+/// it was that the reader **discarded what it had already read** and recorded nothing. A socket
+/// source cannot fix that by itself, but it can refuse to be the place where a number goes missing:
+/// a datagram that arrives from somewhere other than the streamer, or that is larger than the wire
+/// MTU can produce, is counted rather than dropped on the floor.
+pub struct UdpDatagramSource {
+    socket: std::net::UdpSocket,
+    /// The one peer whose datagrams are the stream. `None` accepts any sender, which is what a
+    /// handshake-for-less protocol would need; on a LAN the sender is known, so it is set.
+    peer: Option<std::net::SocketAddr>,
+    datagrams_from_elsewhere: u64,
+    oversized: u64,
+}
+
+/// The largest datagram the media plane can be carrying. `x-transport` fragments to the negotiated
+/// MTU; a datagram bigger than this is not a fragment we can parse, and reading a truncated version
+/// of it would turn a routing problem into a mysterious parse error.
+const MAX_DATAGRAM_SIZE: usize = 4096;
+
+impl UdpDatagramSource {
+    pub fn new(socket: std::net::UdpSocket) -> std::io::Result<Self> {
+        // Non-blocking, always: the timeout is applied per read below, and a socket that blocks in
+        // the kernel is a socket whose read cannot be given a deadline by the caller.
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            peer: None,
+            datagrams_from_elsewhere: 0,
+            oversized: 0,
+        })
+    }
+
+    pub fn bound_to(
+        socket: std::net::UdpSocket,
+        peer: std::net::SocketAddr,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            peer: Some(peer),
+            ..Self::new(socket)?
+        })
+    }
+
+    /// Datagrams from a host that is not the streamer. Non-zero means something else on the network
+    /// is talking to this port, which is worth knowing before wondering why frames are corrupt.
+    pub fn datagrams_from_elsewhere(&self) -> u64 {
+        self.datagrams_from_elsewhere
+    }
+
+    pub fn oversized(&self) -> u64 {
+        self.oversized
+    }
+}
+
+impl DatagramSource for UdpDatagramSource {
+    fn recv(&mut self, out: &mut Vec<u8>, timeout: Duration) -> SourceEvent {
+        if !timeout.is_zero() {
+            // A read timeout of zero is rejected by the kernel, so a zero timeout means "poll
+            // once", which the non-blocking socket already gives us.
+            let _ = self.socket.set_read_timeout(Some(timeout));
+        }
+
+        let mut buffer = [0u8; MAX_DATAGRAM_SIZE];
+        match self.socket.recv_from(&mut buffer) {
+            Ok((len, from)) => {
+                if self.peer.is_some_and(|peer| peer != from) {
+                    self.datagrams_from_elsewhere += 1;
+                    // Reported as a timeout rather than as a datagram: it is not a frame, and
+                    // handing it to the receiver would count it as a rejected one — which is a
+                    // different fact about a different problem.
+                    return SourceEvent::Timeout;
+                }
+                if len == buffer.len() {
+                    // The kernel truncates a datagram that does not fit; a full buffer therefore
+                    // cannot be distinguished from an exactly-full one, and treating a truncated
+                    // fragment as a whole one is how a parse error becomes a mystery.
+                    self.oversized += 1;
+                    return SourceEvent::Timeout;
+                }
+                out.clear();
+                out.extend_from_slice(&buffer[..len]);
+                SourceEvent::Datagram
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                SourceEvent::Timeout
+            }
+            // A socket that cannot be read from again will never deliver a datagram, and saying so
+            // lets `pump` stop rather than spin.
+            Err(_) => SourceEvent::Closed,
+        }
+    }
+}
+
+/// What the caller must do after a [`MediaPlaneReceiver::poll`].
+///
+/// Actions rather than symptoms: the plane does not know how to send a control packet or how to
+/// talk to the decoder, and it should not. It decides, the client acts, and every decision is one of
+/// four things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaPlaneAction {
+    /// Hand these bytes to the decoder. `frame_index` is the identity that joins this frame to what
+    /// the server transmitted — the thing that let session 13 tell a server-side discard apart from a
+    /// network loss, and the reason it is carried this far.
+    Decode { frame_index: u64, payload: Vec<u8> },
+    /// Nothing has progressed for [`crate::stall::ASK_FOR_KEYFRAME_AFTER`]. Ask the sender for a
+    /// keyframe. The encoder inserts one only when asked, so this is the only way out of a hold.
+    AskForKeyframe { stalled_for: Duration },
+    /// Ask the sender to re-send these fragments: one round trip, one frame saved, no keyframe.
+    Nack {
+        frame_index: u64,
+        fragments: Vec<u16>,
+    },
+    /// Nothing has progressed for [`crate::stall::HARD_RESET_AFTER`]. Asking has failed.
+    Reset { stalled_for: Duration },
+}
+
+/// The client's video receive path, driven by a socket.
+///
+/// [`VideoPlane`] decides and this feeds it. Deliberately **not** threaded: the client already owns
+/// a receive thread and a timing discipline, and moving the socket read into a second thread is
+/// precisely the change that made the old reader discard 1.5 % of the datagrams it had already read
+/// without recording it (`doc 50 §A10`). One thread, one place where a datagram can be lost, and a
+/// counter for it.
+pub struct MediaPlaneReceiver {
+    source: UdpDatagramSource,
+    plane: VideoPlane,
+}
+
+impl MediaPlaneReceiver {
+    pub fn new(
+        socket: std::net::UdpSocket,
+        policy: ReleasePolicy,
+        now: Instant,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            source: UdpDatagramSource::new(socket)?,
+            plane: VideoPlane::new(policy, now),
+        })
+    }
+
+    /// As [`Self::new`], but only the streamer's datagrams are the stream.
+    pub fn bound_to(
+        socket: std::net::UdpSocket,
+        peer: std::net::SocketAddr,
+        policy: ReleasePolicy,
+        now: Instant,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            source: UdpDatagramSource::bound_to(socket, peer)?,
+            plane: VideoPlane::new(policy, now),
+        })
+    }
+
+    /// Read what has arrived, release what is ready, and report what to do.
+    ///
+    /// Returns `false` once the socket can never deliver again, so the caller stops rather than
+    /// spinning. A quiet socket is not that: it returns an empty action list and `true`.
+    pub fn poll(&mut self, now: Instant, budget: Duration) -> (Vec<MediaPlaneAction>, bool) {
+        let open = self.plane.pump(&mut self.source, now, budget);
+
+        let actions = self
+            .plane
+            .release(now)
+            .into_iter()
+            .filter_map(|event| match event {
+                PlaneEvent::Present {
+                    frame_index,
+                    payload,
+                } => Some(MediaPlaneAction::Decode {
+                    frame_index,
+                    payload,
+                }),
+                // A held frame is a decision, not an action: the previous image stays and the
+                // compositor reprojects it. `PlaneStats` records that it happened, which is what
+                // the old reader did not do.
+                PlaneEvent::Held { .. } => None,
+                PlaneEvent::Nack {
+                    frame_index,
+                    fragments,
+                } => Some(MediaPlaneAction::Nack {
+                    frame_index,
+                    fragments,
+                }),
+                PlaneEvent::AskForKeyframe { stalled_for } => {
+                    Some(MediaPlaneAction::AskForKeyframe { stalled_for })
+                }
+                PlaneEvent::Reset { stalled_for } => Some(MediaPlaneAction::Reset { stalled_for }),
+            })
+            .collect();
+
+        (actions, open)
+    }
+
+    pub fn stats(&self) -> &PlaneStats {
+        self.plane.stats()
+    }
+
+    /// Datagrams that arrived from a host other than the streamer. Non-zero means something else on
+    /// the network is talking to this port — worth knowing before wondering why frames are corrupt.
+    pub fn datagrams_from_elsewhere(&self) -> u64 {
+        self.source.datagrams_from_elsewhere()
+    }
+
+    pub fn oversized_datagrams(&self) -> u64 {
+        self.source.oversized()
+    }
+}
+
 /// What the receive path decided. One of these per frame, plus the ladder's escalations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaneEvent {
-    /// Rebuilt and trustworthy: show it.
-    Present { frame_index: u64, len: usize },
+    /// Rebuilt and trustworthy: show it, and here are its bytes.
+    ///
+    /// The payload is carried, not looked up: the receiver has already assembled it, and a frame
+    /// whose bytes are fetched from somewhere else at display time is a frame that can be fetched
+    /// after it has been recycled.
+    Present { frame_index: u64, payload: Vec<u8> },
     /// Not trustworthy: **hold the last good frame**. ADR-0011 — this is not a failure to show a
     /// frame, it is the permitted response to one that cannot be trusted.
     Held {
@@ -289,9 +506,20 @@ impl VideoPlane {
         let mut presented_this_round = false;
 
         for frame in self.receiver.release(clock) {
-            let event = self.classify(&frame, now);
-            presented_this_round |= matches!(event, PlaneEvent::Present { .. });
-            events.push(event);
+            let frame_index = frame.frame_index;
+            match self.classify(&frame, now) {
+                Decision::Present => {
+                    presented_this_round = true;
+                    events.push(PlaneEvent::Present {
+                        frame_index,
+                        payload: frame.into_payload().unwrap_or_default(),
+                    });
+                }
+                Decision::Held(reason) => events.push(PlaneEvent::Held {
+                    frame_index,
+                    reason,
+                }),
+            }
         }
 
         if presented_this_round {
@@ -330,8 +558,8 @@ impl VideoPlane {
         events
     }
 
-    /// Apply the display rule to one released frame.
-    fn classify(&mut self, frame: &DeliveredFrame, now: Instant) -> PlaneEvent {
+    /// Apply the display rule to one released frame, counting what it decides.
+    fn classify(&mut self, frame: &DeliveredFrame, now: Instant) -> Decision {
         let usable = frame.is_displayable();
         if !usable {
             self.stats.frames_abandoned += 1;
@@ -346,23 +574,24 @@ impl VideoPlane {
             .may_present(frame.frame_index, frame.is_keyframe, !usable)
         {
             FrameTrust::Trusted => {
-                let len = frame.payload().map_or(0, <[u8]>::len);
                 self.stats.frames_presented += 1;
                 self.stall.progress(now);
-                PlaneEvent::Present {
-                    frame_index: frame.frame_index,
-                    len,
-                }
+                Decision::Present
             }
             FrameTrust::Untrusted { reason, .. } => {
                 self.stats.frames_held += 1;
-                PlaneEvent::Held {
-                    frame_index: frame.frame_index,
-                    reason,
-                }
+                Decision::Held(reason)
             }
         }
     }
+}
+
+/// What [`VideoPlane::classify`] decided, before the payload is attached. Separate from
+/// [`PlaneEvent`] because the decision is about the *frame* and the event carries its bytes, and the
+/// bytes can only be moved out once the borrow that decided is over.
+enum Decision {
+    Present,
+    Held(UntrustedReason),
 }
 
 #[cfg(test)]
@@ -480,7 +709,7 @@ mod tests {
         plane.pump(&mut source, now, Duration::ZERO);
         for event in plane.release(now + Duration::from_millis(50)) {
             assert!(
-                !matches!(event, PlaneEvent::Present { len: 0, .. }),
+                !matches!(event, PlaneEvent::Present { payload, .. } if payload.is_empty()),
                 "presented a frame with no payload"
             );
         }
@@ -666,6 +895,138 @@ mod tests {
             Some(vec![0]),
             "the missing fragment was not named for re-request: {events:?}"
         );
+    }
+
+    /// Bind a UDP socket pair, so the source under test is a real kernel socket rather than a
+    /// pretend one. The two failures this class exists to make visible — a datagram from a stranger
+    /// and a datagram too big to be a fragment — are both properties of a real socket.
+    fn socket_pair() -> (std::net::UdpSocket, std::net::UdpSocket) {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        (receiver, sender)
+    }
+
+    #[test]
+    fn a_socket_that_has_nothing_returns_a_timeout_rather_than_blocking() {
+        let (receiver, _sender) = socket_pair();
+        let mut source = UdpDatagramSource::new(receiver).unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(
+            source.recv(&mut out, Duration::from_millis(5)),
+            SourceEvent::Timeout
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_datagram_from_another_host_is_counted_and_not_handed_over() {
+        let (receiver, sender) = socket_pair();
+        let receiver_addr = receiver.local_addr().unwrap();
+        // Deliberately *not* the sender's address: everything the sender sends is a stranger's.
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        let mut source = UdpDatagramSource::bound_to(receiver, peer).unwrap();
+        sender.send_to(b"not the streamer", receiver_addr).unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(
+            source.recv(&mut out, Duration::from_millis(20)),
+            SourceEvent::Timeout,
+            "a datagram from the wrong host must not be handed to the receiver as a fragment"
+        );
+        assert!(out.is_empty());
+
+        // The count is what matters: it is the only record that something else is talking to us.
+        assert_eq!(
+            source.datagrams_from_elsewhere(),
+            1,
+            "the foreign datagram was not counted"
+        );
+    }
+
+    #[test]
+    fn a_datagram_larger_than_the_media_mtu_is_refused_rather_than_truncated_to_fit() {
+        let (receiver, sender) = socket_pair();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let mut source = UdpDatagramSource::new(receiver).unwrap();
+
+        // A datagram exactly as large as the read buffer is indistinguishable from a truncated
+        // one, so it is refused. Treating it as whole is how a routing problem becomes a mystery.
+        let oversized = vec![0u8; MAX_DATAGRAM_SIZE];
+        sender.send_to(&oversized, receiver_addr).unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(
+            source.recv(&mut out, Duration::from_millis(20)),
+            SourceEvent::Timeout
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            source.oversized(),
+            1,
+            "an oversized datagram was not counted"
+        );
+    }
+
+    /// The whole point of the socket-backed receiver: a real datagram, sent over a real socket,
+    /// comes back out as a decoded frame with its identity intact.
+    #[test]
+    fn a_frame_sent_over_a_real_socket_comes_out_as_a_decode_action() {
+        let (receiver, sender) = socket_pair();
+        let peer = receiver.local_addr().unwrap();
+
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
+        let bytes = payload(3);
+        let (_, datagrams) = packetizer
+            .fragment(
+                x_transport::FrameMeta {
+                    frame_index: 7,
+                    target_timestamp_us: 123_456,
+                    is_keyframe: true,
+                },
+                &bytes,
+                &mut 0,
+                None,
+            )
+            .unwrap();
+        for datagram in &datagrams {
+            sender.send_to(datagram, peer).unwrap();
+        }
+
+        let now = Instant::now();
+        // A generous deadline, because the property under test is the opposite one: a **complete**
+        // frame must come out at once, not at its deadline. Waiting for a deadline that is not
+        // telling us anything is latency added for nothing.
+        let policy = ReleasePolicy {
+            jitter_frames: 0,
+            deadline: Duration::from_millis(500),
+        };
+        let mut plane =
+            MediaPlaneReceiver::bound_to(receiver, sender.local_addr().unwrap(), policy, now)
+                .unwrap();
+
+        let (actions, open) = plane.poll(now, Duration::ZERO);
+        assert!(open, "a live socket must report itself open");
+
+        let (frame_index, payload) = actions
+            .iter()
+            .find_map(|action| match action {
+                MediaPlaneAction::Decode {
+                    frame_index,
+                    payload,
+                } => Some((*frame_index, payload.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a complete frame did not come out at once: {actions:?}"));
+
+        assert_eq!(frame_index, 7, "the frame's identity was lost on the way");
+        assert_eq!(
+            payload, bytes,
+            "the payload that reached the decoder is not the payload that was sent"
+        );
+        assert_eq!(plane.stats().frames_presented, 1);
+        assert_eq!(plane.stats().frames_held, 0);
     }
 
     #[test]
