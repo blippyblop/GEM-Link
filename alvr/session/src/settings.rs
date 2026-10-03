@@ -2281,7 +2281,12 @@ pub fn session_settings_default() -> SettingsDefault {
                 client_log_report_level: SwitchDefault {
                     enabled: true,
                     content: LogSeverityDefault {
-                        variant: LogSeverityDefaultVariant::Error,
+                        // `Warning`, not `Error`. This is the level at which the *client* mirrors
+                        // its log back to the server, and at `Error` the server never sees the
+                        // client's warnings — which is where every one of this project's
+                        // interesting failures has been announced. A default that hides them
+                        // makes a healthy run and a client in trouble look the same from the PC.
+                        variant: LogSeverityDefaultVariant::Warning,
                     },
                 },
                 log_to_disk: cfg!(debug_assertions),
