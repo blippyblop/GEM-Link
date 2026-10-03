@@ -51,6 +51,7 @@ pub mod fec;
 pub mod pacer;
 pub mod packetizer;
 pub mod receiver;
+pub mod scheduler;
 pub mod trust;
 pub mod wire;
 
@@ -61,6 +62,9 @@ pub use pacer::{Pacer, PacerConfig};
 pub use packetizer::{FrameMeta, Packetizer, ParityPolicy};
 pub use receiver::{
     DeliveredFrame, FrameOutcome, Receiver, ReceiverStats, RecvEvent, ReleasePolicy,
+};
+pub use scheduler::{
+    Disposition, FrameScheduler, Roll, SchedulerConfig, SchedulerStats, TimebaseOffset,
 };
 pub use trust::{FrameTrust, SendDecision, SendGate, SuppressReason, TrustGate, UntrustedReason};
 pub use wire::{Flags, FragmentHeader, HEADER_LEN};

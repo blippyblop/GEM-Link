@@ -20,6 +20,7 @@ use std::{
 };
 use x_protocol::{ClientCapabilities, ServerCapabilities, SessionPlan, negotiate, samples};
 
+pub mod scheduling;
 pub mod transport;
 
 pub const SCHEMA_VERSION: u32 = 4;

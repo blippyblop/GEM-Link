@@ -253,7 +253,14 @@ pub enum MediaPlaneAction {
     /// Hand these bytes to the decoder. `frame_index` is the identity that joins this frame to what
     /// the server transmitted — the thing that let session 13 tell a server-side discard apart from a
     /// network loss, and the reason it is carried this far.
-    Decode { frame_index: u64, payload: Vec<u8> },
+    Decode {
+        frame_index: u64,
+        /// The server's target display time for this frame, in the server's clock. The caller feeds
+        /// it to `TimebaseOffset` to place it on its own clock and then to `FrameScheduler` to decide
+        /// whether it is still worth showing.
+        target_timestamp_us: u64,
+        payload: Vec<u8>,
+    },
     /// Nothing has progressed for [`crate::stall::ASK_FOR_KEYFRAME_AFTER`]. Ask the sender for a
     /// keyframe. The encoder inserts one only when asked, so this is the only way out of a hold.
     AskForKeyframe { stalled_for: Duration },
@@ -317,9 +324,11 @@ impl MediaPlaneReceiver {
             .filter_map(|event| match event {
                 PlaneEvent::Present {
                     frame_index,
+                    target_timestamp_us,
                     payload,
                 } => Some(MediaPlaneAction::Decode {
                     frame_index,
+                    target_timestamp_us,
                     payload,
                 }),
                 // A held frame is a decision, not an action: the previous image stays and the
@@ -366,7 +375,14 @@ pub enum PlaneEvent {
     /// The payload is carried, not looked up: the receiver has already assembled it, and a frame
     /// whose bytes are fetched from somewhere else at display time is a frame that can be fetched
     /// after it has been recycled.
-    Present { frame_index: u64, payload: Vec<u8> },
+    Present {
+        frame_index: u64,
+        /// The time the server aimed this frame at, in the **server's** clock. This is the input to
+        /// `x_transport::TimebaseOffset` and then to `FrameScheduler`: without it the client can
+        /// decide *what* to show but never *whether showing it now is showing the past*.
+        target_timestamp_us: u64,
+        payload: Vec<u8>,
+    },
     /// Not trustworthy: **hold the last good frame**. ADR-0011 — this is not a failure to show a
     /// frame, it is the permitted response to one that cannot be trusted.
     Held {
@@ -512,6 +528,7 @@ impl VideoPlane {
                     presented_this_round = true;
                     events.push(PlaneEvent::Present {
                         frame_index,
+                        target_timestamp_us: frame.target_timestamp_us,
                         payload: frame.into_payload().unwrap_or_default(),
                     });
                 }
@@ -1015,6 +1032,7 @@ mod tests {
                 MediaPlaneAction::Decode {
                     frame_index,
                     payload,
+                    ..
                 } => Some((*frame_index, payload.clone())),
                 _ => None,
             })

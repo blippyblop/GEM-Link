@@ -99,6 +99,35 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 ))
             }
         }
+        "scheduling" => {
+            // The frame-phase surface: where in the display period frames arrive, and how the
+            // present/hold/skip decision answers each display period. This is the client-side half
+            // of what `vrlink` calls `frmDeadline` plus `CR Roll Norm/Double/Skip`, and the half of
+            // it that needs no hardware to measure.
+            println!(
+                "{:26} {:>6} {:>6} {:>6} {:>6} {:>9} {:>9} {:>8}",
+                "scenario", "norm", "double", "skip", "idle", "phase+us", "spread+us", "window‰"
+            );
+            for scenario in x_bench::scheduling::scheduling_scenarios() {
+                let m = x_bench::scheduling::run_scheduling(&scenario, 42);
+                println!(
+                    "{:26} {:>6} {:>6} {:>6} {:>6} {:>9} {:>9} {:>8}",
+                    scenario.name,
+                    m.stats.norm,
+                    m.stats.double,
+                    m.stats.skip,
+                    m.stats.idle,
+                    m.stats
+                        .phase_mean_us()
+                        .map_or("n/a".to_string(), |mean| format!("{mean:.0}")),
+                    m.stats.phase_spread_us(),
+                    m.inside_window_pct_x10 / 10,
+                );
+            }
+            println!();
+            println!("a positive phase is late: it is measured after the client's own clock estimate");
+            Ok(())
+        }
         "scenarios" => {
             for s in scenarios() {
                 println!(
