@@ -35,21 +35,10 @@ use crate::{
     stall::{StuckAction, StuckDetector},
 };
 
-/// One read from wherever datagrams come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceEvent {
-    /// `out` holds one datagram.
-    Datagram,
-    /// Nothing was ready within the timeout.
-    Timeout,
-    /// The source is finished. A replay that has run out, or a socket that will never deliver.
-    Closed,
-}
-
-/// Where datagrams come from. Implemented for a socket, a recording, and a lossy wrapper.
-pub trait DatagramSource {
-    fn recv(&mut self, out: &mut Vec<u8>, timeout: Duration) -> SourceEvent;
-}
+// The datagram vocabulary is `x-transport`'s, and the client used to have its own copy of it — two
+// traits with the same shape, which is how the sending half came to have no binding at all. There is
+// one trait now, one `SourceEvent`, and one implementation per medium.
+pub use x_transport::{DatagramSource, SinkError, SourceEvent};
 
 /// A recorded stream, replayed. Deterministic by construction: no clock, no network, no loss
 /// except the loss that is in the recording.
@@ -148,107 +137,12 @@ impl<S: DatagramSource> DatagramSource for LossySource<S> {
     }
 }
 
-/// Datagrams from a UDP socket — the live source.
-///
-/// Everything about it exists to make the client's *own* behaviour visible rather than to add
-/// features. The failure this replaces (`doc 50 §A10`) was not that the socket returned too little;
-/// it was that the reader **discarded what it had already read** and recorded nothing. A socket
-/// source cannot fix that by itself, but it can refuse to be the place where a number goes missing:
-/// a datagram that arrives from somewhere other than the streamer, or that is larger than the wire
-/// MTU can produce, is counted rather than dropped on the floor.
-pub struct UdpDatagramSource {
-    socket: std::net::UdpSocket,
-    /// The one peer whose datagrams are the stream. `None` accepts any sender, which is what a
-    /// handshake-for-less protocol would need; on a LAN the sender is known, so it is set.
-    peer: Option<std::net::SocketAddr>,
-    datagrams_from_elsewhere: u64,
-    oversized: u64,
-}
-
-/// The largest datagram the media plane can be carrying. `x-transport` fragments to the negotiated
-/// MTU; a datagram bigger than this is not a fragment we can parse, and reading a truncated version
-/// of it would turn a routing problem into a mysterious parse error.
-const MAX_DATAGRAM_SIZE: usize = 4096;
-
-impl UdpDatagramSource {
-    pub fn new(socket: std::net::UdpSocket) -> std::io::Result<Self> {
-        // Non-blocking, always: the timeout is applied per read below, and a socket that blocks in
-        // the kernel is a socket whose read cannot be given a deadline by the caller.
-        socket.set_nonblocking(true)?;
-        Ok(Self {
-            socket,
-            peer: None,
-            datagrams_from_elsewhere: 0,
-            oversized: 0,
-        })
-    }
-
-    pub fn bound_to(
-        socket: std::net::UdpSocket,
-        peer: std::net::SocketAddr,
-    ) -> std::io::Result<Self> {
-        Ok(Self {
-            peer: Some(peer),
-            ..Self::new(socket)?
-        })
-    }
-
-    /// Datagrams from a host that is not the streamer. Non-zero means something else on the network
-    /// is talking to this port, which is worth knowing before wondering why frames are corrupt.
-    pub fn datagrams_from_elsewhere(&self) -> u64 {
-        self.datagrams_from_elsewhere
-    }
-
-    pub fn oversized(&self) -> u64 {
-        self.oversized
-    }
-}
-
-impl DatagramSource for UdpDatagramSource {
-    fn recv(&mut self, out: &mut Vec<u8>, timeout: Duration) -> SourceEvent {
-        if !timeout.is_zero() {
-            // A read timeout of zero is rejected by the kernel, so a zero timeout means "poll
-            // once", which the non-blocking socket already gives us.
-            let _ = self.socket.set_read_timeout(Some(timeout));
-        }
-
-        let mut buffer = [0u8; MAX_DATAGRAM_SIZE];
-        match self.socket.recv_from(&mut buffer) {
-            Ok((len, from)) => {
-                if self.peer.is_some_and(|peer| peer != from) {
-                    self.datagrams_from_elsewhere += 1;
-                    // Reported as a timeout rather than as a datagram: it is not a frame, and
-                    // handing it to the receiver would count it as a rejected one — which is a
-                    // different fact about a different problem.
-                    return SourceEvent::Timeout;
-                }
-                if len == buffer.len() {
-                    // The kernel truncates a datagram that does not fit; a full buffer therefore
-                    // cannot be distinguished from an exactly-full one, and treating a truncated
-                    // fragment as a whole one is how a parse error becomes a mystery.
-                    self.oversized += 1;
-                    return SourceEvent::Timeout;
-                }
-                out.clear();
-                out.extend_from_slice(&buffer[..len]);
-                SourceEvent::Datagram
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                SourceEvent::Timeout
-            }
-            // A socket that cannot be read from again will never deliver a datagram, and saying so
-            // lets `pump` stop rather than spin.
-            Err(_) => SourceEvent::Closed,
-        }
-    }
-}
-
-/// Re-exported so a caller does not have to depend on `latency` to mark a boundary.
-pub use crate::latency::Stage as LatencyStage;
-
+// The UDP source used to live here, and it had a defect that nothing caught: it set the socket
+// non-blocking once and then applied a read timeout per call, which on Linux is a no-op — so it
+// answered "nothing there" for a socket with a datagram waiting on it, forever. It now lives in
+// `alvr_sockets::media` next to the sending half, where both ends use one implementation and the
+// test that would have caught it exists. See that module's docs.
+pub use alvr_sockets::media::MediaSocket;
 /// What the caller must do after a [`MediaPlaneReceiver::poll`].
 ///
 /// Actions rather than symptoms: the plane does not know how to send a control packet or how to
@@ -287,33 +181,18 @@ pub enum MediaPlaneAction {
 /// without recording it (`doc 50 §A10`). One thread, one place where a datagram can be lost, and a
 /// counter for it.
 pub struct MediaPlaneReceiver {
-    source: UdpDatagramSource,
+    source: MediaSocket,
     plane: VideoPlane,
 }
 
 impl MediaPlaneReceiver {
-    pub fn new(
-        socket: std::net::UdpSocket,
-        policy: ReleasePolicy,
-        now: Instant,
-    ) -> std::io::Result<Self> {
-        Ok(Self {
-            source: UdpDatagramSource::new(socket)?,
+    /// `socket` is the caller's: the port and the QoS marking come from the session, and a media
+    /// plane that bound its own would be a second source of truth for both.
+    pub fn new(socket: MediaSocket, policy: ReleasePolicy, now: Instant) -> Self {
+        Self {
+            source: socket,
             plane: VideoPlane::new(policy, now),
-        })
-    }
-
-    /// As [`Self::new`], but only the streamer's datagrams are the stream.
-    pub fn bound_to(
-        socket: std::net::UdpSocket,
-        peer: std::net::SocketAddr,
-        policy: ReleasePolicy,
-        now: Instant,
-    ) -> std::io::Result<Self> {
-        Ok(Self {
-            source: UdpDatagramSource::bound_to(socket, peer)?,
-            plane: VideoPlane::new(policy, now),
-        })
+        }
     }
 
     /// Read what has arrived, release what is ready, and report what to do.
@@ -383,7 +262,7 @@ impl MediaPlaneReceiver {
     }
 
     pub fn oversized_datagrams(&self) -> u64 {
-        self.source.oversized()
+        self.source.datagrams_oversized()
     }
 }
 
@@ -951,6 +830,14 @@ mod tests {
     /// Bind a UDP socket pair, so the source under test is a real kernel socket rather than a
     /// pretend one. The two failures this class exists to make visible — a datagram from a stranger
     /// and a datagram too big to be a fragment — are both properties of a real socket.
+    /// `ConnectionError` is not `Debug`, so a helper rather than `unwrap`.
+    fn socket_from(socket: std::net::UdpSocket) -> MediaSocket {
+        match MediaSocket::from_std(socket) {
+            Ok(socket) => socket,
+            Err(e) => panic!("wrapping a bound socket: {e}"),
+        }
+    }
+
     fn socket_pair() -> (std::net::UdpSocket, std::net::UdpSocket) {
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -960,7 +847,7 @@ mod tests {
     #[test]
     fn a_socket_that_has_nothing_returns_a_timeout_rather_than_blocking() {
         let (receiver, _sender) = socket_pair();
-        let mut source = UdpDatagramSource::new(receiver).unwrap();
+        let mut source = socket_from(receiver);
 
         let mut out = Vec::new();
         assert_eq!(
@@ -977,7 +864,9 @@ mod tests {
         // Deliberately *not* the sender's address: everything the sender sends is a stranger's.
         let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        let mut source = UdpDatagramSource::bound_to(receiver, peer).unwrap();
+        let mut socket = socket_from(receiver);
+        socket.accept_only_from(peer);
+        let mut source = socket;
         sender.send_to(b"not the streamer", receiver_addr).unwrap();
 
         let mut out = Vec::new();
@@ -1000,11 +889,12 @@ mod tests {
     fn a_datagram_larger_than_the_media_mtu_is_refused_rather_than_truncated_to_fit() {
         let (receiver, sender) = socket_pair();
         let receiver_addr = receiver.local_addr().unwrap();
-        let mut source = UdpDatagramSource::new(receiver).unwrap();
+        let mut source = socket_from(receiver);
 
         // A datagram exactly as large as the read buffer is indistinguishable from a truncated
         // one, so it is refused. Treating it as whole is how a routing problem becomes a mystery.
-        let oversized = vec![0u8; MAX_DATAGRAM_SIZE];
+        // The size and the refusal both live in `alvr_sockets::media`, which tests them.
+        let oversized = vec![0u8; 4096];
         sender.send_to(&oversized, receiver_addr).unwrap();
 
         let mut out = Vec::new();
@@ -1014,7 +904,7 @@ mod tests {
         );
         assert!(out.is_empty());
         assert_eq!(
-            source.oversized(),
+            source.datagrams_oversized(),
             1,
             "an oversized datagram was not counted"
         );
@@ -1056,9 +946,9 @@ mod tests {
             jitter_frames: 0,
             deadline: Duration::from_millis(500),
         };
-        let mut plane =
-            MediaPlaneReceiver::bound_to(receiver, sender.local_addr().unwrap(), policy, now)
-                .unwrap();
+        let mut socket = socket_from(receiver);
+        socket.accept_only_from(sender.local_addr().unwrap());
+        let mut plane = MediaPlaneReceiver::new(socket, policy, now);
 
         let mut trace = LatencyTrace::new(64);
         let (actions, open) = plane.poll(&mut trace, now, Duration::ZERO);

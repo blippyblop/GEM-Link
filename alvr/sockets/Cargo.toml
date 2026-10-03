@@ -14,6 +14,9 @@ alvr_common.workspace = true
 alvr_packets.workspace = true
 alvr_session.workspace = true
 x-crypto = { path = "../x-crypto" }
+# The media plane's datagram traits. `x-transport` has no sockets on purpose; this crate owns
+# socket policy, so the binding between them lives here.
+x-transport = { path = "../x-transport" }
 
 bincode = { version = "2", features = ["serde"] }
 profiling = { version = "1", optional = true }

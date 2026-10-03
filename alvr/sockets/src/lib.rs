@@ -1,4 +1,6 @@
 mod control_socket;
+/// The media plane's datagram plumbing — one UDP socket, as `x-transport`'s sink and source.
+pub mod media;
 mod secure_control_socket;
 mod stream_socket;
 
