@@ -191,15 +191,6 @@ pub struct TrustGate {
     untrusted_run: u64,
 }
 
-/// How often, in untrusted frames, the client re-asks for a keyframe while it is holding.
-///
-/// A liveness guard, not a nicety. The client can only leave a hold on a keyframe, and the
-/// encoder inserts an IDR only when asked — so a request that is never sent, or never
-/// answered, leaves the screen black for the rest of the session. On hardware that has
-/// already happened twice. One re-ask per ~1 s at 30 Hz is inaudible next to a black screen
-/// and is 30x below the per-frame flood this gate was written to avoid.
-pub const KEYFRAME_RETRY_FRAMES: u64 = 30;
-
 impl TrustGate {
     pub fn new() -> Self {
         Self {
@@ -276,12 +267,16 @@ impl TrustGate {
 
     /// Should the client spend a control packet asking for a keyframe?
     ///
-    /// True on the transition into untrusted, and then again every
-    /// [`KEYFRAME_RETRY_FRAMES`] untrusted frames, so a request that is never answered cannot
-    /// black the screen for the rest of the session.
-    pub fn should_ask_for_keyframe(&self) -> bool {
-        self.blocked.is_some()
-            && (self.untrusted_run == 1 || self.untrusted_run.is_multiple_of(KEYFRAME_RETRY_FRAMES))
+    /// Consecutive untrusted frames so far. Reset the moment a frame is trusted.
+    ///
+    /// Exposed because *when to ask again* is a timing question, not a trust question, and it
+    /// belongs with a clock. This gate used to answer it with a frame count
+    /// (`KEYFRAME_RETRY_FRAMES`), which made the re-ask interval depend on the frame rate — a
+    /// different real interval at 30 Hz than at 90 Hz — and left the ladder written down twice,
+    /// here and in the decoder. `client_core::stall::StuckDetector` is now the only ladder, and
+    /// this counter is what it needs to see that a hold began and that a recovery ended.
+    pub fn untrusted_run(&self) -> u64 {
+        self.untrusted_run
     }
 
     /// Phase two: the decoder's answer.
@@ -516,33 +511,35 @@ mod tests {
             first(present(&mut gate, 14, false, false)),
             "a second gap did not ask for a keyframe"
         );
-        assert!(gate.should_ask_for_keyframe());
     }
 
     #[test]
-    fn a_long_hold_keeps_asking_at_a_bounded_rate() {
-        // Liveness. If the requested keyframe never arrives the client must not sit black
-        // forever, but it also must not ask once per frame.
+    fn the_untrusted_run_is_visible_so_a_clock_can_watch_it() {
+        // The gate reports the state; it no longer decides the timing. A caller that holds a
+        // `StuckDetector` needs exactly two facts — that a hold began, and that one ended — and
+        // this is both, because the count resets on recovery.
         let mut gate = TrustGate::new();
         assert_eq!(present(&mut gate, 1, true, false), FrameTrust::Trusted);
+        assert_eq!(gate.untrusted_run(), 0);
+
+        // 3 never arrives.
         assert!(matches!(
-            present(&mut gate, 5, false, false),
+            present(&mut gate, 4, false, false),
             FrameTrust::Untrusted { .. }
         ));
-
-        let mut asks = 0;
-        for index in 6..(6 + KEYFRAME_RETRY_FRAMES * 4) {
+        for index in 5..12 {
             let _ = present(&mut gate, index, false, false);
-            if gate.should_ask_for_keyframe() {
-                asks += 1;
-            }
         }
+        assert_eq!(gate.untrusted_run(), 8);
+
+        // The keyframe ends the hold, and the run with it.
+        assert_eq!(present(&mut gate, 12, true, false), FrameTrust::Trusted);
         assert_eq!(
-            asks, 4,
-            "expected exactly one re-ask per {KEYFRAME_RETRY_FRAMES} frames"
+            gate.untrusted_run(),
+            0,
+            "the run did not reset, so a clock would never re-arm"
         );
     }
-
     #[test]
     fn a_keyframe_that_arrives_damaged_does_not_restore_trust() {
         // A keyframe with a hole in it is not a keyframe.

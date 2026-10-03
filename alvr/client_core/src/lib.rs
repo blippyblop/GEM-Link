@@ -10,6 +10,9 @@ mod connection;
 mod logging_backend;
 mod sockets;
 mod statistics;
+/// The stall ladder: one place where "how long do we wait, and what then" is decided. Shared by
+/// the decoder and the receive loop, because they are the same question.
+pub mod stall;
 mod storage;
 
 #[cfg(target_os = "android")]

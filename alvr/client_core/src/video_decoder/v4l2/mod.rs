@@ -26,96 +26,12 @@ pub mod abi;
 pub mod device;
 pub mod pipeline;
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
 
-/// The two stall thresholds, taken from the reference client:
-///
-/// ```text
-/// SVLCodecV4L2::CheckStuck: > 300ms between our last forward progress. Asking remote side for a new IFrame
-/// SVLCodecV4L2::CheckStuck: > 800ms between our last forward progress. Reset.
-/// ```
-///
-/// Two rungs, not one. GemLink's client has the first (hold the last good frame and ask for a
-/// keyframe — ADR-0011) but no upper bound: a client whose keyframe never arrives holds forever,
-/// which is exactly the black screen we shipped and had to fix in `x_transport::TrustGate`. The
-/// reference client does not have that failure mode because it stops waiting and rebuilds.
-pub const ASK_FOR_KEYFRAME_AFTER: Duration = Duration::from_millis(300);
-pub const HARD_RESET_AFTER: Duration = Duration::from_millis(800);
-
-/// What the decoder decided to do about the passage of time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StuckAction {
-    /// Forward progress is recent enough. Nothing to do.
-    Progress,
-    /// We have made no progress for [`ASK_FOR_KEYFRAME_AFTER`]. Ask the sender for a keyframe.
-    /// This is ADR-0011's recovery, and the request must be made once per stall event, not once
-    /// per poll.
-    AskForKeyframe,
-    /// We have made no progress for [`HARD_RESET_AFTER`]. The stream is not recoverable by asking;
-    /// tear the decode session down and rebuild it. The reference client calls this
-    /// `SVLCodecV4L2::HardReset`.
-    Reset,
-}
-
-/// Watches for a stall in the decode pipeline.
-///
-/// "Forward progress" is any owned buffer coming back: a decoded frame released to the renderer,
-/// or an OUTPUT buffer returned by the kernel. If neither has happened for
-/// [`ASK_FOR_KEYFRAME_AFTER`], something is wrong — and it is not the decoder's job to guess
-/// whether the cause was a lost frame, a lost parameter set or a wedged VPU.
-///
-/// Each rung fires **once per stall**, which is the whole point: a per-poll decision would emit a
-/// keyframe request every frame the stall lasted, which on a 90 Hz link is the control-plane flood
-/// that `x_transport::TrustGate` was written to avoid.
-#[derive(Debug, Clone)]
-pub struct StuckDetector {
-    last_progress: Instant,
-    asked: bool,
-    reset: bool,
-}
-
-impl StuckDetector {
-    pub fn new(now: Instant) -> Self {
-        Self {
-            last_progress: now,
-            asked: false,
-            reset: false,
-        }
-    }
-
-    /// Call on any forward progress. Re-arms both rungs.
-    pub fn progress(&mut self, now: Instant) {
-        self.last_progress = now;
-        self.asked = false;
-        self.reset = false;
-    }
-
-    /// Call every poll. Returns at most one action per rung per stall.
-    pub fn poll(&mut self, now: Instant) -> StuckAction {
-        let stalled = now.saturating_duration_since(self.last_progress);
-
-        if stalled >= HARD_RESET_AFTER && !self.reset {
-            self.reset = true;
-            // The ask may not have fired if the stall jumped past both thresholds between polls.
-            self.asked = true;
-            return StuckAction::Reset;
-        }
-        if stalled >= ASK_FOR_KEYFRAME_AFTER && !self.asked {
-            self.asked = true;
-            return StuckAction::AskForKeyframe;
-        }
-
-        StuckAction::Progress
-    }
-
-    /// Time since the last forward progress, for logging.
-    pub fn stalled_for(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(self.last_progress)
-    }
-}
+// The stall ladder used to live here. It is not a V4L2 idea — the receive loop needs the same
+// two rungs for the same reason — so it moved to `crate::stall`, which is now the only place the
+// 300 ms / 800 ms thresholds are written down. Re-exported so this module keeps its vocabulary.
+pub use crate::stall::{ASK_FOR_KEYFRAME_AFTER, HARD_RESET_AFTER, StuckAction, StuckDetector};
 
 /// A fixed pool of buffers handed out to the kernel and back.
 ///
@@ -265,80 +181,6 @@ pub mod ioctls {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn t0() -> Instant {
-        Instant::now()
-    }
-
-    #[test]
-    fn a_stall_asks_for_a_keyframe_once_and_then_resets() {
-        // The two rungs, from the reference client's own log lines.
-        let start = t0();
-        let mut stuck = StuckDetector::new(start);
-
-        assert_eq!(stuck.poll(start), StuckAction::Progress);
-        assert_eq!(
-            stuck.poll(start + Duration::from_millis(299)),
-            StuckAction::Progress,
-            "asked before the 300 ms rung"
-        );
-        assert_eq!(
-            stuck.poll(start + Duration::from_millis(300)),
-            StuckAction::AskForKeyframe
-        );
-        // Everything between the rungs is silent. This is the property that keeps a stall from
-        // becoming a control-plane flood.
-        for ms in 301..800 {
-            assert_eq!(
-                stuck.poll(start + Duration::from_millis(ms)),
-                StuckAction::Progress,
-                "re-asked at {ms} ms"
-            );
-        }
-        assert_eq!(
-            stuck.poll(start + Duration::from_millis(800)),
-            StuckAction::Reset
-        );
-        // And it does not reset in a loop either.
-        for ms in 801..2000 {
-            assert_eq!(
-                stuck.poll(start + Duration::from_millis(ms)),
-                StuckAction::Progress,
-                "re-reset at {ms} ms"
-            );
-        }
-    }
-
-    #[test]
-    fn progress_rearms_both_rungs() {
-        let start = t0();
-        let mut stuck = StuckDetector::new(start);
-
-        let keyframe = start + ASK_FOR_KEYFRAME_AFTER;
-        assert_eq!(stuck.poll(keyframe), StuckAction::AskForKeyframe);
-        // A decoded frame arrives: the stall is over.
-        stuck.progress(keyframe);
-        assert_eq!(stuck.poll(keyframe), StuckAction::Progress);
-        // A later, unrelated stall must ask again — not stay silent because it asked once.
-        let second = keyframe + Duration::from_millis(1);
-        assert_eq!(
-            stuck.poll(second + ASK_FOR_KEYFRAME_AFTER),
-            StuckAction::AskForKeyframe,
-            "a second stall did not ask for a keyframe"
-        );
-    }
-
-    #[test]
-    fn a_stall_that_jumps_both_thresholds_resets_rather_than_asking() {
-        // A poll interval longer than 800 ms must not emit an ask that is already too late.
-        let start = t0();
-        let mut stuck = StuckDetector::new(start);
-        assert_eq!(
-            stuck.poll(start + Duration::from_secs(5)),
-            StuckAction::Reset
-        );
-        assert_eq!(stuck.poll(start + Duration::from_secs(6)), StuckAction::Progress);
-    }
 
     #[test]
     fn an_exhausted_pool_says_so_instead_of_pretending() {

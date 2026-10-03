@@ -339,6 +339,12 @@ fn connection_pipeline(
             // booleans in two places and both were wrong the same way — armed on *datagram*
             // loss, which a server-side discarded frame does not produce. See the module docs.
             let mut trust = x_transport::TrustGate::new();
+            // ADR-0011's hold, bounded. The gate says *whether* a frame may be shown; this says
+            // how long we are willing to show nothing before asking, and how long before giving
+            // up on asking and rebuilding. Both rungs come from the reference client for this
+            // device (see `crate::stall`); GemLink had only the first, which is exactly how a
+            // hold with no keyframe behind it became a black screen.
+            let mut stall = crate::stall::StuckDetector::new(Instant::now());
             let mut frames_seen: u64 = 0;
             let mut first_report = true;
             while is_streaming(&ctx) {
@@ -375,6 +381,7 @@ fn connection_pipeline(
 
                 match decision {
                     x_transport::FrameTrust::Trusted => {
+                        stall.progress(Instant::now());
                         // Name the frame before handing it over, so anything the callback
                         // does — decoding, logging, writing a CSV — can join what it got
                         // against what the server sent.
@@ -429,17 +436,40 @@ fn connection_pipeline(
                         // reliable control packet per frame — each answered by the sender with a
                         // keyframe — is a flood with a bitrate spike attached.
                         //
-                        // The request is UNCONDITIONAL (no setting can disable it) and it is
-                        // re-issued for every recovery, then every `KEYFRAME_RETRY_FRAMES` while
-                        // the hold lasts. Both halves are corrections to what shipped: gating it
-                        // behind `avoid_video_glitching` (stored `false` on the box) meant no
-                        // request at all, and `first` meaning "first time ever" meant the second
-                        // hold never asked. Either one blacks the screen for good, because the
-                        // encoder inserts an IDR only when asked.
-                        if trust.should_ask_for_keyframe()
-                            && let Some(sender) = &mut *ctx.control_sender.lock()
-                        {
-                            sender.send(&ClientControlPacket::RequestIdr).ok();
+                        // The request is UNCONDITIONAL — no setting can disable it — and the
+                        // clock decides when to repeat it, not a frame count: 300 ms of no
+                        // progress asks, 800 ms rebuilds. `avoid_video_glitching` (stored
+                        // `false` on the box) used to gate this, which meant no request at all;
+                        // and `first` used to mean "first time ever" rather than "first of this
+                        // recovery", which meant the second hold never asked. Either one blacks
+                        // the screen for good, because the encoder inserts an IDR only when asked.
+                        let now = Instant::now();
+                        match stall.poll(now) {
+                            crate::stall::StuckAction::AskForKeyframe => {
+                                if let Some(sender) = &mut *ctx.control_sender.lock() {
+                                    sender.send(&ClientControlPacket::RequestIdr).ok();
+                                }
+                                warn!(
+                                    "Holding video: no progress for {:.0} ms ({} frames held) — \
+                                     asked the sender for a keyframe",
+                                    stall.stalled_for(now).as_secs_f64() * 1e3,
+                                    trust.untrusted_run(),
+                                );
+                            }
+                            crate::stall::StuckAction::Reset => {
+                                // Rung two, and the one GemLink never had. Asking has failed for
+                                // 800 ms; the reference client calls `HardReset` here. We do not
+                                // yet own the decoder's handle from this thread, so this is a
+                                // counted, loud escalation rather than a silent freeze — which is
+                                // the whole difference from the black screen we shipped.
+                                error!(
+                                    "Video stalled for {:.0} ms with no keyframe; the stream needs \
+                                     rebuilding ({} frame(s) held)",
+                                    stall.stalled_for(now).as_secs_f64() * 1e3,
+                                    trust.untrusted_run(),
+                                );
+                            }
+                            crate::stall::StuckAction::Progress => {}
                         }
                         if first {
                             warn!(
