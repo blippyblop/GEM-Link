@@ -1,10 +1,10 @@
-use super::{GraphicsContext, MAX_PUSH_CONSTANTS_SIZE, staging::StagingRenderer};
+use super::{GraphicsContext, MAX_PUSH_CONSTANTS_SIZE, NativeFrame, staging::StagingRenderer};
 use alvr_common::{
     AlvrFoveatedEncodingParams, ViewParams,
     glam::{Mat4, UVec2, Vec2, Vec3, Vec4},
 };
 use alvr_session::{PassthroughMode, UpscalingConfig};
-use std::{cell::Cell, ffi::c_void, iter, mem, rc::Rc};
+use std::{cell::Cell, iter, mem, rc::Rc};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
@@ -287,18 +287,18 @@ impl StreamRenderer {
 
     /// Runtime foveation centers must already be encoder-aligned. `None` uses the negotiated centers.
     ///
-    /// # Safety
-    /// `hardware_buffer` must be a valid pointer to a ANativeWindowBuffer.
+    /// `frame` is whatever the platform's decoder produced; [`NativeFrame::None`] means "nothing
+    /// new this frame", and the staging texture keeps whatever it holds.
     pub fn render(
         &self,
-        hardware_buffer: *mut c_void,
+        frame: NativeFrame,
         view_params: [StreamViewParams; 2],
         passthrough: Option<&PassthroughMode>,
         foveation_center_shifts: Option<[Vec2; 2]>,
     ) {
-        // if hardware_buffer is available copy stream to staging texture
-        if !hardware_buffer.is_null() {
-            self.staging_renderer.render(hardware_buffer);
+        // If a frame has been decoded, copy the stream to the staging texture.
+        if !matches!(frame, NativeFrame::None) {
+            self.staging_renderer.render(frame);
         }
 
         if let Some(config) = &self.foveated_encoding

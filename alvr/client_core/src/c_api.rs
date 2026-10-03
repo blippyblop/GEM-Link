@@ -793,7 +793,10 @@ pub extern "C" fn alvr_render_stream_opengl(
             let left_params = unsafe { &*view_params };
             let right_params = unsafe { &*view_params.offset(1) };
             renderer.render(
-                hardware_buffer,
+                // This entry point is Android's and its handle is an `AHardwareBuffer *`; the
+                // Linux decoder's frames reach the renderer through the Rust API instead, where the
+                // buffer identity is known and can be returned.
+                alvr_graphics::NativeFrame::HardwareBuffer(hardware_buffer as usize),
                 [
                     StreamViewParams {
                         swapchain_index: left_params.swapchain_index,
@@ -888,6 +891,9 @@ pub extern "C" fn alvr_create_decoder(config: AlvrDecoderConfig) {
         force_software_decoder: config.force_software_decoder,
         max_buffering_frames: config.max_buffering_frames,
         buffering_history_weight: config.buffering_history_weight,
+        // The JNI caller does not know the coded size, and on Android it does not need it. The
+        // Linux decoder treats it as a hint, and `None` is the honest value here.
+        coded_size: None,
         options: if !config.options.is_null() {
             let options =
                 unsafe { slice::from_raw_parts(config.options, config.options_count as usize) };
@@ -952,18 +958,30 @@ pub extern "C" fn alvr_destroy_decoder() {
     *DECODER_SOURCE.lock() = None;
 }
 
-// Returns true if the timestamp and buffer has been written to
+// Returns true if the timestamp and buffer has been written to.
+//
+// This entry point is Android's, and the Android decoder releases its buffers through the
+// `ImageReader` that produced them — `AHardwareBuffer`s are reference-counted and the frame is
+// finished with when the graphics API is. The Linux decoder works the other way round: its frames
+// live in a V4L2 CAPTURE ring that the client must *return*, and there is no room in this signature
+// to name the buffer to return. Rather than add a C entry point nothing in this tree calls, the
+// Frame client uses the Rust API in `client_openxr::stream`, which does carry the buffer identity
+// and does return it. See `video_decoder::VideoFrame` and `VideoDecoderSource::release_frame`.
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_get_frame(
     out_timestamp_ns: *mut u64,
     out_buffer_ptr: *mut *mut c_void,
 ) -> bool {
     if let Some(source) = &mut *DECODER_SOURCE.lock()
-        && let Some((timestamp, buffer_ptr)) = source.get_frame()
+        && let Some(frame) = source.get_frame()
     {
         unsafe {
-            *out_timestamp_ns = timestamp.as_nanos() as u64;
-            *out_buffer_ptr = buffer_ptr;
+            *out_timestamp_ns = frame.timestamp.as_nanos() as u64;
+            *out_buffer_ptr = match frame.frame {
+                alvr_graphics::NativeFrame::HardwareBuffer(address) => address as *mut c_void,
+                // This entry point is Android's; a Linux frame has no single address to hand over.
+                _ => std::ptr::null_mut(),
+            };
         }
 
         true

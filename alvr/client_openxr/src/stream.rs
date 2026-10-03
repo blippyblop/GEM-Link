@@ -14,7 +14,7 @@ use alvr_common::{
     glam::{UVec2, Vec2},
     parking_lot::RwLock,
 };
-use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
+use alvr_graphics::{GraphicsContext, NativeFrame, StreamRenderer, StreamViewParams};
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
@@ -23,7 +23,6 @@ use alvr_session::{
 use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
-    ptr,
     rc::Rc,
     sync::Arc,
     thread::{self, JoinHandle},
@@ -31,6 +30,29 @@ use std::{
 };
 
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+
+/// What the renderer has to draw for a decoded frame.
+///
+/// The only thing that can still go wrong here is a decoder output format this renderer has no
+/// dma-buf import path for. Drawing it anyway with a guessed layout produces a sheared picture; the
+/// alternative is a held frame, which is a symptom the user can see and the client can count.
+fn native_frame_for(frame: &video_decoder::VideoFrame) -> NativeFrame {
+    if let NativeFrame::DmaBuf(dma_buf) = frame.frame
+        && alvr_graphics::drm_fourcc_from_v4l2(dma_buf.drm_fourcc).is_none()
+    {
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            error!(
+                "the decoder produced format {:#x}, which this renderer has no dma-buf import \
+                 path for; the picture will be static",
+                dma_buf.drm_fourcc
+            );
+        }
+        return NativeFrame::None;
+    }
+
+    frame.frame
+}
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -307,6 +329,13 @@ impl StreamContext {
             buffering_history_weight: self.config.buffering_history_weight,
             options: self.config.decoder_options.clone(),
             config_buffer: config_nal,
+            // Deliberately unknown. A stateful decoder derives its geometry from the bitstream, and
+            // the negotiated `view_resolution` is *not* the coded size: with foveated encoding the
+            // encoder packs a smaller-than-view image (the 1024x1024 view streams as 1216x544), so
+            // any number computed here would be a guess dressed as a hint. If a device turns out to
+            // reject `S_FMT` at size zero, the right fix is to parse the SPS in `config_nal`, not
+            // to interpolate from the view.
+            coded_size: None,
         };
 
         let maybe_config = if let Some((config, _)) = &self.decoder {
@@ -354,26 +383,37 @@ impl StreamContext {
             }
         }
 
-        let (timestamp, frame_metadata, buffer_ptr) =
-            if let Some((timestamp, buffer_ptr)) = frame_result {
-                if let Some(metadata) = self.core_context.report_compositor_start(timestamp) {
-                    self.last_good_video_frame_metadata = VideoFrameMetadata {
-                        foveation_center_shifts: metadata
-                            .foveation_center_shifts
-                            .or(self.last_good_video_frame_metadata.foveation_center_shifts),
-                        ..metadata
-                    };
-                }
+        // The decoder's buffer has to go back to it once the renderer is done, and the renderer
+        // is three statements down — so the identity is carried, not re-derived. A frame whose
+        // buffer is never returned is a CAPTURE ring that drains and a decoder that stops, which
+        // is the failure mode `doc 50 §A10` is made of.
+        let mut release_buffer = None;
 
-                // Keep displaying new images even when their metadata is unavailable.
-                (timestamp, self.last_good_video_frame_metadata, buffer_ptr)
-            } else {
-                (
-                    vsync_time,
-                    self.last_good_video_frame_metadata,
-                    ptr::null_mut(),
-                )
-            };
+        let (timestamp, frame_metadata, native_frame) = if let Some(frame) = frame_result {
+            if let Some(metadata) = self.core_context.report_compositor_start(frame.timestamp) {
+                self.last_good_video_frame_metadata = VideoFrameMetadata {
+                    foveation_center_shifts: metadata
+                        .foveation_center_shifts
+                        .or(self.last_good_video_frame_metadata.foveation_center_shifts),
+                    ..metadata
+                };
+            }
+
+            release_buffer = Some(frame.buffer);
+
+            // Keep displaying new images even when their metadata is unavailable.
+            (
+                frame.timestamp,
+                self.last_good_video_frame_metadata,
+                native_frame_for(&frame),
+            )
+        } else {
+            (
+                vsync_time,
+                self.last_good_video_frame_metadata,
+                NativeFrame::None,
+            )
+        };
         let view_params = frame_metadata.view_params;
 
         let left_swapchain_idx = self.swapchains[0].acquire_image().unwrap();
@@ -430,8 +470,10 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
+        let had_frame = !matches!(native_frame, NativeFrame::None);
+
         self.renderer.render(
-            buffer_ptr,
+            native_frame,
             [
                 StreamViewParams {
                     swapchain_index: left_swapchain_idx,
@@ -453,9 +495,14 @@ impl StreamContext {
         self.swapchains[0].release_image().unwrap();
         self.swapchains[1].release_image().unwrap();
 
-        if !buffer_ptr.is_null()
-            && let Some(xr_now) = crate::xr_runtime_now(self.xr_session.instance())
+        // Hand the decoder's buffer back only now that nothing is reading it any more.
+        if let Some(buffer) = release_buffer
+            && let Some((_, source)) = &mut self.decoder
         {
+            source.release_frame(buffer);
+        }
+
+        if had_frame && let Some(xr_now) = crate::xr_runtime_now(self.xr_session.instance()) {
             self.core_context.report_submit(
                 timestamp,
                 vsync_time.saturating_sub(Duration::from_nanos(xr_now.as_nanos() as u64)),

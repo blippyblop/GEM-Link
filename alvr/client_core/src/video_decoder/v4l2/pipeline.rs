@@ -19,6 +19,7 @@
 use std::time::{Duration, Instant};
 
 use super::{BufferPool, StuckAction, StuckDetector};
+use alvr_graphics::DmaBufFrame;
 
 /// Something the kernel told us, drained from the device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,9 +140,58 @@ pub trait V4l2Device {
     fn submit(&mut self, timestamp: Duration, nal: &[u8]) -> Result<SubmitStatus, V4l2Error>;
     fn poll_events(&mut self, out: &mut Vec<DeviceEvent>) -> Result<(), V4l2Error>;
     fn release_capture(&mut self, index: u32) -> Result<(), V4l2Error>;
+    /// Export a CAPTURE plane as a **dma-buf** and return the fd, which the caller owns.
+    ///
+    /// This is the renderer half of the handoff, and it is the one place the two platforms differ
+    /// in kind rather than in detail: Android hands over an `AHardwareBuffer *`, which describes
+    /// itself, while Linux hands over an fd that means nothing without the layout in
+    /// [`Self::capture_geometry`]. A device that cannot export one is a device whose frames cannot
+    /// be displayed, so this returns an error rather than an empty handle.
+    fn export_capture(&self, index: u32, plane: u32) -> Result<i32, V4l2Error>;
+    /// How many CAPTURE buffers the device created.
+    fn capture_buffer_count(&self) -> usize;
+    /// The decoded format: size, pixel format, and per-plane stride and offset. `None` before the
+    /// device has answered `VIDIOC_G_FMT`, which is also when it has no buffers to describe.
+    fn capture_geometry(&self) -> Option<DmaBufFrame>;
     fn hard_reset(&mut self) -> Result<(), V4l2Error>;
     /// The device path, for the log line and for the error above.
     fn path(&self) -> &str;
+}
+
+/// A boxed device *is* a device.
+///
+/// Exists so the decoder thread can choose its backend at runtime — a real V4L2 node on the device,
+/// the loopback on a machine without one — without the pipeline having to be generic over an enum.
+/// The pipeline's policy tests drive the trait directly; this is only for the one place a choice is
+/// actually made.
+impl V4l2Device for Box<dyn V4l2Device + Send> {
+    fn open(&mut self) -> Result<(), V4l2Error> {
+        (**self).open()
+    }
+    fn submit(&mut self, timestamp: Duration, nal: &[u8]) -> Result<SubmitStatus, V4l2Error> {
+        (**self).submit(timestamp, nal)
+    }
+    fn poll_events(&mut self, out: &mut Vec<DeviceEvent>) -> Result<(), V4l2Error> {
+        (**self).poll_events(out)
+    }
+    fn release_capture(&mut self, index: u32) -> Result<(), V4l2Error> {
+        (**self).release_capture(index)
+    }
+    fn export_capture(&self, index: u32, plane: u32) -> Result<i32, V4l2Error> {
+        (**self).export_capture(index, plane)
+    }
+    fn capture_buffer_count(&self) -> usize {
+        (**self).capture_buffer_count()
+    }
+    fn capture_geometry(&self) -> Option<DmaBufFrame> {
+        (**self).capture_geometry()
+    }
+    fn hard_reset(&mut self) -> Result<(), V4l2Error> {
+        (**self).hard_reset()
+    }
+    fn path(&self) -> &str {
+        (**self).path()
+    }
 }
 
 /// Ties the device, the stall detector and the accounting together.
@@ -326,6 +376,17 @@ mod tests {
         fn release_capture(&mut self, index: u32) -> Result<(), V4l2Error> {
             self.released.push(index);
             Ok(())
+        }
+        fn export_capture(&self, _index: u32, _plane: u32) -> Result<i32, V4l2Error> {
+            // The mock's frames are not importable, which is a legitimate state for a device that
+            // has no CAPTURE side at all — the policy under test never looks at the handle.
+            Err(V4l2Error::Io("the mock has no buffers to export".into()))
+        }
+        fn capture_buffer_count(&self) -> usize {
+            4
+        }
+        fn capture_geometry(&self) -> Option<DmaBufFrame> {
+            None
         }
         fn hard_reset(&mut self) -> Result<(), V4l2Error> {
             self.resets += 1;

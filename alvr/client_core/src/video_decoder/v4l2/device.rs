@@ -31,12 +31,16 @@ use super::{
     abi::*,
     pipeline::{DeviceEvent, SubmitStatus, V4l2Device, V4l2Error},
 };
+use alvr_graphics::{DmaBufFrame, drm_fourcc_from_v4l2};
 
 /// One mmap'd plane of one buffer.
 #[derive(Debug, Clone, Copy)]
 struct MappedPlane {
     ptr: *mut u8,
     len: usize,
+    /// The plane's offset inside the buffer, as `VIDIOC_QUERYBUF` reported it. A dma-buf import
+    /// needs it: the fd describes the whole buffer, and this says which byte the plane starts at.
+    offset: u32,
 }
 
 /// The buffers of one queue (`OUTPUT` or `CAPTURE`), each with its planes.
@@ -65,6 +69,9 @@ pub struct V4l2M2mDecoder {
     fourcc: u32,
     output: Queue,
     capture: Queue,
+    /// Learned from the device at `open`, not from the session: a decoder pads its output to its
+    /// own alignment and reports the result here.
+    capture_geometry: Option<DmaBufFrame>,
 }
 
 // The fd is a plain kernel handle; the mmaps are owned solely by this type and released on drop.
@@ -82,7 +89,26 @@ impl V4l2M2mDecoder {
             fourcc,
             output: Queue::from_kind(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE),
             capture: Queue::from_kind(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE),
+            capture_geometry: None,
         }
+    }
+
+    pub fn coded(&self) -> (u32, u32) {
+        self.coded
+    }
+
+    pub fn fourcc(&self) -> u32 {
+        self.fourcc
+    }
+
+    /// Where this CAPTURE plane is mapped, for a caller that has to fall back to the pixels when
+    /// the device cannot export a dma-buf. Returns `(address, length)`.
+    pub fn capture_plane_ptr(&self, index: u32, plane: usize) -> Option<(*mut u8, usize)> {
+        self.capture
+            .buffers
+            .get(index as usize)?
+            .get(plane)
+            .map(|mapped| (mapped.ptr, mapped.len))
     }
 
     fn err<T>(&self, what: &str, e: io::Error) -> Result<T, V4l2Error> {
@@ -229,6 +255,7 @@ impl V4l2M2mDecoder {
                 mapped.push(MappedPlane {
                     ptr: addr as *mut u8,
                     len,
+                    offset: plane.data_offset,
                 });
             }
             queue.buffers.push(mapped);
@@ -422,6 +449,35 @@ impl V4l2Device for V4l2M2mDecoder {
         self.queue_all(&self.capture, cap_planes)?;
         self.stream_on(self.capture.kind)?;
 
+        // Recorded from the device rather than from the session: the decoder decides its own
+        // output geometry, and the renderer has to import *that*, stride and all.
+        let offsets = self
+            .capture
+            .buffers
+            .first()
+            .map(|planes| {
+                [
+                    planes.first().map_or(0, |p| p.offset),
+                    planes.get(1).map_or(0, |p| p.offset),
+                ]
+            })
+            .unwrap_or([0, 0]);
+        self.capture_geometry = Some(DmaBufFrame {
+            width: capture_format.width,
+            height: capture_format.height,
+            drm_fourcc: drm_fourcc_from_v4l2(capture_format.pixelformat)
+                .unwrap_or(capture_format.pixelformat),
+            planes: cap_planes,
+            strides: [
+                capture_format.plane_fmt[0].bytesperline,
+                capture_format.plane_fmt[1].bytesperline,
+            ],
+            offsets,
+            // The fds are per-frame exports, not part of the format: the same CAPTURE buffer keeps
+            // the same dma-buf for its whole life, and the frame producer fills these in.
+            fds: [-1, -1],
+        });
+
         Ok(())
     }
 
@@ -500,6 +556,28 @@ impl V4l2Device for V4l2M2mDecoder {
         self.qbuf(self.capture.kind, index, 0, planes)
     }
 
+    fn export_capture(&self, index: u32, plane: u32) -> Result<RawFd, V4l2Error> {
+        let mut export = V4l2ExportBuffer {
+            kind: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            index,
+            plane,
+            ..Default::default()
+        };
+
+        match unsafe { self.ioctl(VIDIOC_EXPBUF, &mut export) } {
+            Ok(_) => Ok(export.fd),
+            Err(e) => self.err("VIDIOC_EXPBUF", e),
+        }
+    }
+
+    fn capture_buffer_count(&self) -> usize {
+        self.capture.buffers.len()
+    }
+
+    fn capture_geometry(&self) -> Option<DmaBufFrame> {
+        self.capture_geometry
+    }
+
     fn hard_reset(&mut self) -> Result<(), V4l2Error> {
         // Stop both queues, close, and rebuild. Best effort by design: a reset that itself fails is
         // reported by the caller's counters, and the alternative — leaving a wedged stream running
@@ -529,6 +607,8 @@ impl V4l2M2mDecoder {
                 }
             }
         }
+        // The geometry described buffers that no longer exist; a reset re-learns it.
+        self.capture_geometry = None;
     }
 }
 
@@ -541,4 +621,149 @@ impl Drop for V4l2M2mDecoder {
             unsafe { libc::close(self.fd) };
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Finding the device
+// ---------------------------------------------------------------------------------------------
+
+/// One `/dev/videoN`, opened, asked its capabilities, and asked whether it will take this codec.
+///
+/// The last step is what makes this a *search* rather than a guess. Capability flags alone cannot
+/// distinguish the HEVC decoder from the H.264 one, and on a device with an ISP, a camera and a
+/// codec all presenting as M2M nodes, guessing is how a client ends up configuring the camera. So
+/// the probe sets the OUTPUT format to the codec the session actually negotiated and keeps the
+/// node only if the kernel accepts it.
+fn probe_node(path: &str, fourcc: u32) -> Result<V4l2Capability, V4l2Error> {
+    let c_path = CString::new(path).map_err(|_| V4l2Error::Open {
+        path: path.to_owned(),
+        reason: "path contains a NUL".into(),
+    })?;
+
+    // SAFETY: `c_path` is a valid C string.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(V4l2Error::Open {
+            path: path.to_owned(),
+            reason: io::Error::last_os_error().to_string(),
+        });
+    }
+
+    // Every return below must close `fd`; a leaked fd per probe across 64 nodes is a real leak.
+    #[inline]
+    fn close(fd: RawFd) {
+        // SAFETY: `fd` came from `open` above and is closed exactly once on each path.
+        unsafe { libc::close(fd) };
+    }
+
+    let ioctl = |fd: RawFd, request: u64, arg: *mut c_void| -> io::Result<i32> {
+        // SAFETY: the caller passes an argument of the layout the request number implies.
+        let rc = unsafe { libc::ioctl(fd, request as libc::c_ulong, arg) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(rc)
+        }
+    };
+
+    let mut capability = V4l2Capability::default();
+    if let Err(e) = ioctl(
+        fd,
+        VIDIOC_QUERYCAP,
+        (&mut capability as *mut V4l2Capability).cast(),
+    ) {
+        close(fd);
+        return Err(V4l2Error::Io(format!("{path}: VIDIOC_QUERYCAP: {e}")));
+    }
+
+    if !capability.is_m2m_codec() {
+        close(fd);
+        return Err(V4l2Error::Io(format!(
+            "{path}: {} ({}) is not a memory-to-memory codec",
+            capability.card_name(),
+            capability.driver_name()
+        )));
+    }
+
+    // Does it take *our* codec? A 2x2 coded size is the smallest thing the kernel will not reject
+    // for being degenerate, and the probe closes the node immediately afterwards.
+    let mut format = V4l2Format {
+        kind: V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+        ..Default::default()
+    };
+    format.pix_mp.width = 2;
+    format.pix_mp.height = 2;
+    format.pix_mp.pixelformat = fourcc;
+    format.pix_mp.num_planes = 1;
+
+    if let Err(e) = ioctl(fd, VIDIOC_S_FMT, (&mut format as *mut V4l2Format).cast()) {
+        close(fd);
+        return Err(V4l2Error::Io(format!(
+            "{path}: {} ({}) refused the codec: {e}",
+            capability.card_name(),
+            capability.driver_name()
+        )));
+    }
+
+    close(fd);
+    Ok(capability)
+}
+
+/// Search `/dev/video*` for the stateful M2M decoder that accepts `fourcc`.
+///
+/// The device node on a Frame is discovered, not fixed: the reference client logs
+/// `Failed to get video device path` for exactly this search coming up empty, and a client that
+/// hard-codes `/dev/video0` configures a camera on any device where that is not true.
+///
+/// Returns the first node that both advertises an M2M codec and accepts the negotiated codec, plus
+/// the identification of every node tried, so a failed search can be reported rather than guessed
+/// at.
+pub fn discover_device(fourcc: u32) -> (Option<String>, Vec<String>) {
+    const MAX_NODES: u32 = 64;
+
+    let override_path = std::env::var("ALVR_V4L2_DEVICE").ok();
+    if let Some(path) = override_path {
+        // An explicit device wins, but it is still probed: believing a setting over the kernel is
+        // how a misconfiguration becomes a mystery.
+        return match probe_node(&path, fourcc) {
+            Ok(capability) => (
+                Some(path.clone()),
+                vec![format!(
+                    "{path}: {} ({}) — forced by ALVR_V4L2_DEVICE",
+                    capability.card_name(),
+                    capability.driver_name()
+                )],
+            ),
+            Err(e) => (
+                None,
+                vec![format!("{path}: {e} — forced by ALVR_V4L2_DEVICE")],
+            ),
+        };
+    }
+
+    let mut tried = Vec::new();
+    for index in 0..MAX_NODES {
+        let path = format!("/dev/video{index}");
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        match probe_node(&path, fourcc) {
+            Ok(capability) => {
+                tried.push(format!(
+                    "{path}: {} ({}) — accepted the codec",
+                    capability.card_name(),
+                    capability.driver_name()
+                ));
+                return (Some(path), tried);
+            }
+            Err(e) => tried.push(e.to_string()),
+        }
+    }
+
+    (None, tried)
 }

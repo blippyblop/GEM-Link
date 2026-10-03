@@ -89,6 +89,40 @@ pub struct V4l2Capability {
     pub reserved: [u32; 3],
 }
 
+impl V4l2Capability {
+    /// Trim one of the kernel's fixed-width, NUL-padded name fields.
+    fn name_field(field: &[u8]) -> String {
+        let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+        String::from_utf8_lossy(&field[..end]).into_owned()
+    }
+
+    pub fn driver_name(&self) -> String {
+        Self::name_field(&self.driver)
+    }
+
+    pub fn card_name(&self) -> String {
+        Self::name_field(&self.card)
+    }
+
+    /// The capabilities **of this node**. A driver that sets `V4L2_CAP_DEVICE_CAPS` reports the
+    /// whole device in `capabilities` and this node's subset in `device_caps`; reading the wrong
+    /// one on a multiplexed device finds a decoder that is not there.
+    pub fn effective_capabilities(&self) -> u32 {
+        if self.capabilities & V4L2_CAP_DEVICE_CAPS != 0 {
+            self.device_caps
+        } else {
+            self.capabilities
+        }
+    }
+
+    /// Whether this node is a stateful memory-to-memory codec. Both the multiplanar and the
+    /// single-planar form count; which one the device wants is settled by `S_FMT`, not here.
+    pub fn is_m2m_codec(&self) -> bool {
+        let caps = self.effective_capabilities();
+        caps & (V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_VIDEO_M2M) != 0
+    }
+}
+
 /// `struct v4l2_plane`. The `m` union is one 8-byte slot however it is read (`mem_offset`,
 /// `userptr` or `fd`), so it is modelled as a single `u64` with accessors rather than as separate
 /// fields that would silently change the layout.
@@ -203,6 +237,20 @@ pub struct V4l2Control {
     pub value: i32,
 }
 
+/// `struct v4l2_exportbuffer` — 64 bytes. `VIDIOC_EXPBUF` is how a decoded CAPTURE plane becomes a
+/// **dma-buf**: an fd the GPU stack can import, which is the Linux counterpart of the
+/// `AHardwareBuffer` the Android path hands the renderer.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct V4l2ExportBuffer {
+    pub kind: u32,
+    pub index: u32,
+    pub plane: u32,
+    pub flags: u32,
+    pub fd: i32,
+    pub reserved: [u32; 11],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct V4l2EventSubscription {
@@ -250,6 +298,16 @@ pub const V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE: u32 = 10;
 /// The M2M type that addresses both queues of a stateful codec at once.
 pub const V4L2_BUF_TYPE_VIDEO_M2M_MPLANE: u32 = 11;
 
+/// Device capabilities. These are how a decoder node is *found* rather than assumed: a device with
+/// a GPU, an ISP and a camera has a dozen `/dev/video*` entries and only one of them is the
+/// stateful memory-to-memory codec. The reference client logs `Failed to get video device path`,
+/// which is what happens when the search comes up empty.
+pub const V4L2_CAP_VIDEO_M2M: u32 = 0x0000_8000;
+pub const V4L2_CAP_VIDEO_M2M_MPLANE: u32 = 0x0000_4000;
+/// When set, `capabilities` describes the *driver* and `device_caps` this node. On a multiplexed
+/// device the two differ, and the node's answer is the one that matters.
+pub const V4L2_CAP_DEVICE_CAPS: u32 = 0x8000_0000;
+
 pub const V4L2_MEMORY_MMAP: u32 = 1;
 pub const V4L2_MEMORY_DMABUF: u32 = 4;
 
@@ -288,6 +346,7 @@ pub const VIDIOC_DQBUF: u64 = iowr::<V4l2Buffer>(17);
 pub const VIDIOC_STREAMON: u64 = iow_int(18);
 pub const VIDIOC_STREAMOFF: u64 = iow_int(19);
 pub const VIDIOC_S_CTRL: u64 = iowr::<V4l2Control>(28);
+pub const VIDIOC_EXPBUF: u64 = iowr::<V4l2ExportBuffer>(16);
 pub const VIDIOC_DQEVENT: u64 = ior::<V4l2Event>(89);
 pub const VIDIOC_SUBSCRIBE_EVENT: u64 = iow::<V4l2EventSubscription>(90);
 pub const VIDIOC_UNSUBSCRIBE_EVENT: u64 = iow::<V4l2EventSubscription>(91);
@@ -312,6 +371,7 @@ mod tests {
         assert_eq!(VIDIOC_STREAMON, 0x4004_5612);
         assert_eq!(VIDIOC_STREAMOFF, 0x4004_5613);
         assert_eq!(VIDIOC_S_CTRL, 0xc008_561c);
+        assert_eq!(VIDIOC_EXPBUF, 0xc040_5610);
         // sizeof(v4l2_event) is 136, not the 56 one might guess from the header's first four
         // fields: an 8-aligned 16-byte timespec and a 64-byte union. The first draft of this file
         // asserted the smaller number and the test rejected it, which is the point.
@@ -328,6 +388,7 @@ mod tests {
         assert_eq!(size_of::<V4l2Capability>(), 104);
         assert_eq!(size_of::<V4l2Buffer>(), 88);
         assert_eq!(size_of::<V4l2Control>(), 8);
+        assert_eq!(size_of::<V4l2ExportBuffer>(), 64);
         assert_eq!(size_of::<V4l2RequestBuffers>(), 20);
         assert_eq!(size_of::<V4l2EventSubscription>(), 32);
         assert_eq!(size_of::<V4l2Event>(), 136);
@@ -343,5 +404,30 @@ mod tests {
         assert_eq!(&V4L2_PIX_FMT_H264.to_le_bytes(), b"H264");
         assert_eq!(&V4L2_PIX_FMT_HEVC.to_le_bytes(), b"HEVC");
         assert_eq!(&V4L2_PIX_FMT_NV12.to_le_bytes(), b"NV12");
+    }
+
+    /// The kernel's name fields are fixed-width and NUL-padded, and `device_caps` overrides
+    /// `capabilities` when the driver says so. Both are quiet ways to search for a decoder node and
+    /// not find it.
+    #[test]
+    fn a_node_reports_its_own_capabilities_not_the_drivers() {
+        let mut capability = V4l2Capability::default();
+        capability.driver[..4].copy_from_slice(b"iris");
+        assert_eq!(capability.driver_name(), "iris");
+        assert_eq!(capability.card_name(), "");
+
+        // No DEVICE_CAPS: `capabilities` is this node's answer.
+        capability.capabilities = V4L2_CAP_VIDEO_M2M_MPLANE;
+        assert!(capability.is_m2m_codec());
+
+        // DEVICE_CAPS set: `capabilities` now describes the whole *driver* (which does contain a
+        // codec) while this particular node is something else. Trusting `capabilities` here picks
+        // a node that will reject every format we set.
+        capability.capabilities = V4L2_CAP_DEVICE_CAPS | V4L2_CAP_VIDEO_M2M_MPLANE;
+        capability.device_caps = 0;
+        assert!(
+            !capability.is_m2m_codec(),
+            "the node's own capabilities must win when DEVICE_CAPS is set"
+        );
     }
 }
