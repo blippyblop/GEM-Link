@@ -804,7 +804,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
-                is_keyframe: true,
+                    is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -838,7 +838,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 7,
                     target_timestamp_us: 1,
-                is_keyframe: true,
+                    is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -903,7 +903,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
-                is_keyframe: true,
+                    is_keyframe: true,
                 },
                 &payload(100),
                 &mut seq,
@@ -980,7 +980,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
-                is_keyframe: true,
+                    is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -1013,7 +1013,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
-                is_keyframe: true,
+                    is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -1059,7 +1059,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
-                is_keyframe: true,
+                    is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -1100,7 +1100,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
-                is_keyframe: true,
+                    is_keyframe: true,
                 },
                 &payload(SHARD * 3),
                 &mut seq,

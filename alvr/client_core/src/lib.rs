@@ -12,10 +12,10 @@ mod logging_backend;
 /// why the receiver, the trust gate and the stall ladder are one type rather than three.
 pub mod media_plane;
 mod sockets;
-mod statistics;
 /// The stall ladder: one place where "how long do we wait, and what then" is decided. Shared by
 /// the decoder and the receive loop, because they are the same question.
 pub mod stall;
+mod statistics;
 mod storage;
 
 #[cfg(target_os = "android")]

@@ -37,6 +37,10 @@ pub enum Platform {
     SamsungGalaxyXR,
     AndroidUnknown,
     VisionOSHeadset,
+    /// The Steam Frame: aarch64 Linux running Valve's SteamVR runtime on gamescope/kwin, wearing
+    /// an Armor XR-class SoC with a stateful M2M V4L2 decoder. Its own client is in the firmware
+    /// we hold (`opt/steamvr/tools/vrlink`), and it is the one device this project tunes for.
+    SteamFrame,
     WindowsPc,
     LinuxPc,
     Macos,
@@ -79,6 +83,13 @@ impl Platform {
     pub const fn is_yvr(&self) -> bool {
         matches!(self, Self::Yvr | Self::PlayForDreamMR)
     }
+
+    /// Whether this is the standalone device the project targets, as opposed to a desktop running
+    /// the same runtime. Decode and display both branch on this, so it is a named question rather
+    /// than a `matches!` at each call site.
+    pub const fn is_steam_frame(&self) -> bool {
+        matches!(self, Self::SteamFrame)
+    }
 }
 
 impl Display for Platform {
@@ -106,6 +117,7 @@ impl Display for Platform {
             Self::SamsungGalaxyXR => "Samsung Galaxy XR",
             Self::AndroidUnknown => "Android (unknown)",
             Self::VisionOSHeadset => "visionOS Headset",
+            Self::SteamFrame => "Steam Frame",
             Self::WindowsPc => "Windows PC",
             Self::LinuxPc => "Linux PC",
             Self::Macos => "macOS",
@@ -115,7 +127,11 @@ impl Display for Platform {
     }
 }
 
-#[cfg_attr(not(target_os = "android"), expect(unused_variables))]
+/// Classify the device from the runtime's reported identity, plus the platform we are running on.
+///
+/// On Android the answer comes from manufacturer/model/device/product. Off Android it comes from
+/// the runtime *name* together with the target architecture — see the `linux` arm.
+#[cfg_attr(not(target_os = "android"), allow(unused_variables))]
 pub fn platform(runtime_name: Option<String>, runtime_version: Option<u64>) -> Platform {
     #[cfg(target_os = "android")]
     {
@@ -166,7 +182,22 @@ pub fn platform(runtime_name: Option<String>, runtime_version: Option<u64>) -> P
         match std::env::consts::OS {
             "visionos" => Platform::VisionOSHeadset,
             "windows" => Platform::WindowsPc,
-            "linux" => Platform::LinuxPc,
+            "linux" => {
+                // The Frame and a Linux desktop can run the *same* runtime — SteamVR — so the
+                // runtime name alone does not separate them. The architecture does: the Frame is
+                // aarch64 (Armor XR SoC), a SteamVR desktop is x86_64. Both facts are needed, and
+                // a runtime that has not answered yet (`None`) must not be read as evidence for
+                // either, so the fallback is the desktop and the caller can re-ask.
+                let is_steamvr = runtime_name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("SteamVR") || name.contains("Valve"));
+
+                if is_steamvr && std::env::consts::ARCH == "aarch64" {
+                    Platform::SteamFrame
+                } else {
+                    Platform::LinuxPc
+                }
+            }
             "macos" => Platform::Macos,
             _ => Platform::Unknown,
         }

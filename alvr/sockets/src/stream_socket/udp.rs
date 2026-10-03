@@ -5,8 +5,8 @@ use crate::LOCAL_IP;
 use alvr_common::{ConResult, HandleTryAgain, ToCon, anyhow::Result};
 use alvr_session::{DscpTos, SocketBufferConfig};
 use socket2::{MaybeUninitSlice, Socket};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::ffi::c_int;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},

@@ -14,8 +14,8 @@
 //! Cost is one full-screen pass plus `GenerateMips` -- small next to NVENC, and
 //! measured separately so it can never hide inside the encode number.
 
-use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::*;
+use windows::core::Interface;
 // windows-rs 0.58 hosts the d3dcompiler bindings (D3DCompile) under Fxc.
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
@@ -134,27 +134,34 @@ impl Foveator {
 
             let mut sampler: Option<ID3D11SamplerState> = None;
             device
-                .CreateSamplerState(&D3D11_SAMPLER_DESC {
-                    Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-                    AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
-                    AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
-                    AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
-                    ComparisonFunc: D3D11_COMPARISON_NEVER,
-                    MaxLOD: f32::MAX,
-                    ..Default::default()
-                }, Some(&mut sampler))
+                .CreateSamplerState(
+                    &D3D11_SAMPLER_DESC {
+                        Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                        AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        ComparisonFunc: D3D11_COMPARISON_NEVER,
+                        MaxLOD: f32::MAX,
+                        ..Default::default()
+                    },
+                    Some(&mut sampler),
+                )
                 .map_err(|e| format!("CreateSamplerState: {e}"))?;
             let sampler = sampler.ok_or("no sampler")?;
 
             let mut params: Option<ID3D11Buffer> = None;
             device
-                .CreateBuffer(&D3D11_BUFFER_DESC {
-                    ByteWidth: 48, // 2+2+2+2 floats + float + pad
-                    Usage: D3D11_USAGE_DYNAMIC,
-                    BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-                    CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-                    ..Default::default()
-                }, None, Some(&mut params))
+                .CreateBuffer(
+                    &D3D11_BUFFER_DESC {
+                        ByteWidth: 48, // 2+2+2+2 floats + float + pad
+                        Usage: D3D11_USAGE_DYNAMIC,
+                        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&mut params),
+                )
                 .map_err(|e| format!("CreateBuffer: {e}"))?;
             let params = params.ok_or("no cbuffer")?;
 
@@ -172,7 +179,8 @@ impl Foveator {
                             Quality: 0,
                         },
                         Usage: D3D11_USAGE_DEFAULT,
-                        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0)
+                            as u32,
                         ..Default::default()
                     },
                     None,
@@ -240,7 +248,13 @@ impl Foveator {
 
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.ctx
-                .Map(&self.params, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .Map(
+                    &self.params,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )
                 .map_err(|e| format!("map params: {e}"))?;
             std::ptr::copy_nonoverlapping(
                 data.as_ptr() as *const u8,
@@ -260,21 +274,22 @@ impl Foveator {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
-            self.ctx.OMSetRenderTargets(Some(&[Some(self.out_rtv.clone())]), None);
+            self.ctx
+                .OMSetRenderTargets(Some(&[Some(self.out_rtv.clone())]), None);
             self.ctx.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
             self.ctx.VSSetShader(&self.vs, None);
             self.ctx.PSSetShader(&self.ps, None);
             self.ctx.PSSetShaderResources(0, Some(&[Some(src.clone())]));
-            self.ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-            self.ctx.PSSetConstantBuffers(0, Some(&[Some(self.params.clone())]));
+            self.ctx
+                .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            self.ctx
+                .PSSetConstantBuffers(0, Some(&[Some(self.params.clone())]));
             self.ctx.Draw(3, 0);
             // Unbind so the target is not still bound as input next frame.
             self.ctx.PSSetShaderResources(0, Some(&[None]));
         }
         Ok(())
     }
-
-
 }

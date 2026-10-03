@@ -7,7 +7,15 @@ authors.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+# The Frame client is a normal Linux process; the Android client is a `cdylib` loaded from Java.
+# Both live in this package because they are the same client: `main.rs` opens a display and calls
+# the same `entry_point` the JNI shim calls. Keeping them together is what stops the two from
+# drifting, and is why the library is an `rlib` as well.
+[[bin]]
+name = "alvr_client_openxr"
+path = "src/main.rs"
 
 [dependencies]
 alvr_common.workspace = true
@@ -26,6 +34,12 @@ openxr = "0.21"
 android-activity = { version = "=0.6.0", features = ["native-activity"] }
 libc = "0.2"
 ndk-context = "0.1"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# `dlopen`/`dlsym`, for the display connection. The aarch64 sysroot has no libwayland-client to
+# link against (nor EGL/GL/Vulkan headers), so the connection is resolved at runtime — see
+# `src/display.rs` for why that is the right shape here rather than a build dependency.
+libc = "0.2"
 
 [package.metadata.android]
 package = "alvr.client.dev"                # Changed for Meta Store

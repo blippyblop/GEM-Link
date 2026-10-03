@@ -125,7 +125,13 @@ impl V4l2M2mDecoder {
         Ok(format!("{driver} / {card} (v{:x})", cap.version))
     }
 
-    fn set_format(&mut self, kind: u32, width: u32, height: u32, fourcc: u32) -> Result<(), V4l2Error> {
+    fn set_format(
+        &mut self,
+        kind: u32,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+    ) -> Result<(), V4l2Error> {
         let mut fmt = V4l2Format {
             kind,
             ..Default::default()
@@ -178,7 +184,12 @@ impl V4l2M2mDecoder {
         }
     }
 
-    fn map_queue(&mut self, kind: u32, count: u32, planes_per_buffer: u32) -> Result<Queue, V4l2Error> {
+    fn map_queue(
+        &mut self,
+        kind: u32,
+        count: u32,
+        planes_per_buffer: u32,
+    ) -> Result<Queue, V4l2Error> {
         let mut queue = Queue::from_kind(kind);
 
         for index in 0..count {
@@ -276,7 +287,11 @@ impl V4l2M2mDecoder {
     }
 
     /// Non-blocking: `Ok(None)` means the kernel had nothing dequeued yet, which is normal.
-    fn dqbuf(&self, kind: u32, planes_per_buffer: u32) -> Result<Option<(u32, u32, i64)>, V4l2Error> {
+    fn dqbuf(
+        &self,
+        kind: u32,
+        planes_per_buffer: u32,
+    ) -> Result<Option<(u32, u32, i64)>, V4l2Error> {
         let mut planes = [V4l2Plane::default(); VIDEO_MAX_PLANES];
         let mut buf = V4l2Buffer {
             kind,
@@ -287,13 +302,23 @@ impl V4l2M2mDecoder {
         };
 
         match unsafe { self.ioctl(VIDIOC_DQBUF, &mut buf) } {
-            Ok(_) => Ok(Some((buf.index, buf.bytesused, buf.tv_sec * 1_000_000_000 + buf.tv_usec * 1000))),
+            Ok(_) => Ok(Some((
+                buf.index,
+                buf.bytesused,
+                buf.tv_sec * 1_000_000_000 + buf.tv_usec * 1000,
+            ))),
             Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(None),
             Err(e) => self.err("VIDIOC_DQBUF", e),
         }
     }
 
-    fn qbuf(&self, kind: u32, index: u32, bytesused: u32, planes_per_buffer: u32) -> Result<(), V4l2Error> {
+    fn qbuf(
+        &self,
+        kind: u32,
+        index: u32,
+        bytesused: u32,
+        planes_per_buffer: u32,
+    ) -> Result<(), V4l2Error> {
         let mut planes = [V4l2Plane::default(); VIDEO_MAX_PLANES];
         planes[0].bytesused = bytesused;
         let mut buf = V4l2Buffer {
@@ -325,8 +350,15 @@ impl V4l2M2mDecoder {
 
     /// Write `data` into the buffer the kernel handed back for INPUT, and requeue it.
     fn write_into(&self, index: u32, data: &[u8]) -> Result<(), V4l2Error> {
-        let Some(mapped) = self.output.buffers.get(index as usize).and_then(|p| p.first()) else {
-            return Err(V4l2Error::Io(format!("OUTPUT buffer {index} is not mapped")));
+        let Some(mapped) = self
+            .output
+            .buffers
+            .get(index as usize)
+            .and_then(|p| p.first())
+        else {
+            return Err(V4l2Error::Io(format!(
+                "OUTPUT buffer {index} is not mapped"
+            )));
         };
         if data.len() > mapped.len {
             return Err(V4l2Error::Io(format!(
@@ -344,15 +376,19 @@ impl V4l2M2mDecoder {
 
 impl V4l2Device for V4l2M2mDecoder {
     fn open(&mut self) -> Result<(), V4l2Error> {
-        let path = CString::new(self.path.clone())
-            .map_err(|_| V4l2Error::Open {
-                path: self.path.clone(),
-                reason: "path contains a NUL".into(),
-            })?;
+        let path = CString::new(self.path.clone()).map_err(|_| V4l2Error::Open {
+            path: self.path.clone(),
+            reason: "path contains a NUL".into(),
+        })?;
 
         // O_NONBLOCK on the fd is what makes every DQBUF in this file non-blocking, which is what
         // lets the client's loop stay in charge of its own timing.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return Err(V4l2Error::Open {
                 path: self.path.clone(),
@@ -390,7 +426,8 @@ impl V4l2Device for V4l2M2mDecoder {
     }
 
     fn submit(&mut self, timestamp: Duration, nal: &[u8]) -> Result<SubmitStatus, V4l2Error> {
-        let Some((index, _bytesused, _ts)) = self.dqbuf(self.output.kind, self.planes_of(self.output.kind))?
+        let Some((index, _bytesused, _ts)) =
+            self.dqbuf(self.output.kind, self.planes_of(self.output.kind))?
         else {
             // Every OUTPUT buffer is with the kernel. This is the reference client's
             // `Could not find a free OUTPUT buffer`, and the caller counts it.
@@ -423,7 +460,9 @@ impl V4l2Device for V4l2M2mDecoder {
                 Ok(_) => {
                     if event.kind == V4L2_EVENT_SOURCE_CHANGE {
                         let change = unsafe {
-                            ptr::read_unaligned(event.u_data.as_ptr() as *const V4l2EventSourceChange)
+                            ptr::read_unaligned(
+                                event.u_data.as_ptr() as *const V4l2EventSourceChange
+                            )
                         };
                         if change.changes & V4L2_EVENT_SRC_CH_RESOLUTION != 0 {
                             // The decoder renegotiates its own CAPTURE format; we only report it.

@@ -22,17 +22,16 @@
 
 use std::time::{Duration, Instant};
 
+use crate::foveation::Foveator;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_MAP_WRITE, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_RESOURCE_MISC_GENERATE_MIPS, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView,
-    ID3D11Texture2D,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_WRITE, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_RESOURCE_MISC_GENERATE_MIPS, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+    ID3D11ShaderResourceView, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::core::Interface;
-use crate::foveation::Foveator;
 use x_dda::Duplicator;
 use x_nvenc::NvEncoder;
 
@@ -132,7 +131,11 @@ impl Feeder {
 
     /// (count, p50_ms, p99_ms, mean_ms) over the encode calls so far.
     pub fn encode_stats(&self) -> (usize, f64, f64, f64) {
-        let mut ms: Vec<f64> = self.encode_times.iter().map(|d| d.as_secs_f64() * 1e3).collect();
+        let mut ms: Vec<f64> = self
+            .encode_times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .collect();
         if ms.is_empty() {
             return (0, 0.0, 0.0, 0.0);
         }
@@ -172,7 +175,10 @@ fn create_pool_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Te
         MipLevels: 0, // full chain, for mip-based peripheral downsampling
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
@@ -187,7 +193,10 @@ fn create_pool_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Te
     tex.ok_or_else(|| "CreateTexture2D(pool) returned no texture".to_string())
 }
 
-fn make_srv(device: &ID3D11Device, t: &ID3D11Texture2D) -> Result<ID3D11ShaderResourceView, String> {
+fn make_srv(
+    device: &ID3D11Device,
+    t: &ID3D11Texture2D,
+) -> Result<ID3D11ShaderResourceView, String> {
     let mut srv: Option<ID3D11ShaderResourceView> = None;
     unsafe {
         device
@@ -222,7 +231,11 @@ fn create_texture(
         } else {
             D3D11_BIND_RENDER_TARGET.0 as u32
         },
-        CPUAccessFlags: if staging { D3D11_CPU_ACCESS_WRITE.0 as u32 } else { 0 },
+        CPUAccessFlags: if staging {
+            D3D11_CPU_ACCESS_WRITE.0 as u32
+        } else {
+            0
+        },
         MiscFlags: 0,
     };
     let mut tex: Option<ID3D11Texture2D> = None;
@@ -262,11 +275,7 @@ fn fill_pattern(
             let g = ((y as u32 * 255) / h) & 0xff;
             let in_by = (y as u32) >= by && (y as u32) < by + BLOCK && by + BLOCK <= h;
             for x in 0..w as usize {
-                let v = if in_by
-                    && (x as u32) >= bx
-                    && (x as u32) < bx + BLOCK
-                    && bx + BLOCK <= w
-                {
+                let v = if in_by && (x as u32) >= bx && (x as u32) < bx + BLOCK && bx + BLOCK <= w {
                     0x00ff_ffff // white block: a big residual for P-frames
                 } else {
                     let b = ((x as u32 * 255) / w) & 0xff;
@@ -325,7 +334,9 @@ impl DdaFeeder {
     pub fn new(adapter_idx: u32, output_idx: u32, fps: u32) -> Result<(Self, u32, u32), String> {
         let dup = Duplicator::new(adapter_idx, output_idx, &[DXGI_FORMAT_B8G8R8A8_UNORM])
             .map_err(|e| format!("duplicator: {e}"))?;
-        let desktop = dup.desktop_desc().map_err(|e| format!("desktop_desc: {e}"))?;
+        let desktop = dup
+            .desktop_desc()
+            .map_err(|e| format!("desktop_desc: {e}"))?;
         let (w, h) = (desktop.width, desktop.height);
 
         // Two slots, same as the pattern feeder: NVENC reads one while the next
@@ -338,7 +349,10 @@ impl DdaFeeder {
             pool_srv.push(make_srv(dup.device(), &t)?);
             pool.push(t);
         }
-        let ctx = dup.context().ok_or("duplicator has no device context")?.clone();
+        let ctx = dup
+            .context()
+            .ok_or("duplicator has no device context")?
+            .clone();
         let fove = Foveator::new(dup.device(), &ctx, w, h)?;
         let encoder = NvEncoder::new(dup.device_ptr(), w, h, fps)
             .map_err(|e| format!("nvenc session: {e}"))?;
@@ -413,11 +427,18 @@ impl DdaFeeder {
     }
 
     pub fn last_encode_ms(&self) -> f64 {
-        self.encode_times.last().map(|d| d.as_secs_f64() * 1e3).unwrap_or(0.0)
+        self.encode_times
+            .last()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .unwrap_or(0.0)
     }
 
     pub fn encode_stats(&self) -> (usize, f64, f64, f64) {
-        let mut ms: Vec<f64> = self.encode_times.iter().map(|d| d.as_secs_f64() * 1e3).collect();
+        let mut ms: Vec<f64> = self
+            .encode_times
+            .iter()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .collect();
         if ms.is_empty() {
             return (0, 0.0, 0.0, 0.0);
         }

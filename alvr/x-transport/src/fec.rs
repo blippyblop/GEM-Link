@@ -893,8 +893,8 @@ mod tests {
         // — **2 %** — so `Ratio { 0.05 }` quietly paid 2 %, and every ratio above 2 % was asking
         // for something the layout could not give. Nothing errored; the overhead just came out
         // lower than requested, which is the worst way for a safety mechanism to be wrong.
-        use crate::packetizer::ParityPolicy;
         use crate::adaptive::AdaptiveConfig;
+        use crate::packetizer::ParityPolicy;
 
         assert!(
             MAX_EXPRESSIBLE_RATIO >= AdaptiveConfig::default().max,

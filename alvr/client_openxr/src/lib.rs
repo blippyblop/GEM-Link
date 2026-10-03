@@ -1,6 +1,9 @@
 mod c_api;
+mod display;
 mod extra_extensions;
 mod graphics;
+
+pub use display::DisplayConnection;
 
 /// The graphics API the client binds its OpenXR session to.
 ///
@@ -166,6 +169,7 @@ fn create_session(
     xr_instance: &xr::Instance,
     xr_system: xr::SystemId,
     graphics_context: &GraphicsContext,
+    display: &DisplayConnection,
 ) -> (
     xr::Session<crate::Gfx>,
     xr::FrameWaiter,
@@ -174,12 +178,26 @@ fn create_session(
     #[allow(unreachable_code)]
     unsafe {
         xr_instance
-            .create_session(xr_system, &graphics::session_create_info(graphics_context))
+            .create_session(
+                xr_system,
+                &graphics::session_create_info(graphics_context, display),
+            )
             .unwrap()
     }
 }
 
-pub fn entry_point() {
+/// Run the client until the runtime says to stop.
+///
+/// `display` is how a desktop session reaches the compositor. On Android it is
+/// [`DisplayConnection::Unavailable`] and unused — the host supplies the display — which is why
+/// this is a parameter rather than a global: the Android entry point passes nothing and the Frame
+/// entry point passes the connection it opened.
+///
+/// # Panics
+///
+/// If the runtime refuses a session, structurally. A missing *display* is not one of those cases
+/// and is reported before this is reached; see `main.rs`.
+pub fn entry_point(display: DisplayConnection) {
     alvr_client_core::init_logging();
 
     const LEGACY_OPENXR_VERSION: xr::Version = xr::Version::new(1, 0, 34);
@@ -197,9 +215,14 @@ pub fn entry_point() {
         p if p.is_yvr() => ("_yvr", LEGACY_OPENXR_VERSION),
         _ => ("", CURRENT_OPENXR_VERSION),
     };
-    let xr_entry = unsafe {
-        xr::Entry::load_from(Path::new(&format!("libopenxr_loader{loader_suffix}.so"))).unwrap()
-    };
+    // Where the loader lives is a deployment fact, not a constant. On the Frame it sits in
+    // `/opt/steamvr/bin/linuxarm64/`, which is not on an arbitrary process's search path — the
+    // upstream client only ever found it because a Java host set it in the ApplicationInfo.
+    // `ALVR_OPENXR_LOADER` makes that an environment variable instead of a rebuild.
+    let loader_name = std::env::var("ALVR_OPENXR_LOADER")
+        .unwrap_or_else(|_| format!("libopenxr_loader{loader_suffix}.so"));
+    let xr_entry = unsafe { xr::Entry::load_from(Path::new(&loader_name)) }
+        .unwrap_or_else(|e| panic!("could not load the OpenXR loader `{loader_name}`: {e}"));
 
     #[cfg(target_os = "android")]
     xr_entry.initialize_android_loader().unwrap();
@@ -250,7 +273,16 @@ pub fn entry_point() {
         selected_exts.khr_android_create_instance = true;
     }
     selected_exts.khr_convert_timespec_time = true;
-    selected_exts.khr_opengl_es_enable = true;
+    // The binding has to match the graphics API the session is created with, or the runtime is
+    // asked for a session it cannot provide: Android is GLES, a desktop runtime takes desktop GL.
+    #[cfg(target_os = "android")]
+    {
+        selected_exts.khr_opengl_es_enable = true;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        selected_exts.khr_opengl_enable = true;
+    }
     selected_exts.meta_body_tracking_full_body = true;
     selected_exts.meta_simultaneous_hands_and_controllers = true;
     selected_exts.meta_detached_controllers = true;
@@ -320,7 +352,7 @@ pub fn entry_point() {
             .unwrap();
 
         let (xr_session, mut xr_frame_waiter, mut xr_frame_stream) =
-            create_session(&xr_instance, xr_system, &graphics_context);
+            create_session(&xr_instance, xr_system, &graphics_context, &display);
 
         let views_config = xr_instance
             .enumerate_view_configuration_views(

@@ -1,3 +1,4 @@
+use crate::display::DisplayConnection;
 use alvr_common::glam::UVec2;
 use alvr_graphics::GraphicsContext;
 use alvr_session::ClientsidePostProcessingConfig;
@@ -5,9 +6,14 @@ use openxr as xr;
 use std::ptr;
 
 #[allow(unused)]
-pub fn session_create_info(ctx: &GraphicsContext) -> crate::GfxSessionCreateInfo {
+pub fn session_create_info(
+    ctx: &GraphicsContext,
+    display: &DisplayConnection,
+) -> crate::GfxSessionCreateInfo {
     #[cfg(target_os = "android")]
     {
+        // The host owns the display; `ctx` carries the EGL handles it gave us.
+        let _ = display;
         xr::opengles::SessionCreateInfo::Android {
             display: ctx.egl_display.as_ptr(),
             config: ctx.egl_config.as_ptr(),
@@ -16,18 +22,21 @@ pub fn session_create_info(ctx: &GraphicsContext) -> crate::GfxSessionCreateInfo
     }
     #[cfg(not(target_os = "android"))]
     {
-        // A desktop OpenXR session binds through a display server; the Frame runs gamescope/kwin
-        // on Wayland, so `Wayland` is the arm that ships and `Xlib` is for a session pinned to X11.
-        //
-        // This is `unimplemented!()` on purpose. The runtime does not open a display connection for
-        // us — the client must, via libwayland-client — and there is no display server anywhere in
-        // this container to test that against. Guessing the handle plumbing here would be the same
-        // class of unverifiable code as the ioctl layer without its ABI tests. The call is a
-        // ten-line change once the entry point owns a connection; see the client build plan.
+        // A desktop OpenXR session binds through a display server, and the client opens that
+        // connection itself — see `crate::display`. The Frame runs gamescope/kwin on Wayland,
+        // so `Wayland` is the arm that ships; the `Xlib` variant of this enum exists for a
+        // session pinned to X11 and is not implemented here.
         let _ = ctx;
-        unimplemented!(
-            "a desktop session needs a Wayland (or Xlib) display handle from the entry point"
-        )
+
+        match display.as_wayland() {
+            Some(display) => xr::opengl::SessionCreateInfo::Wayland { display },
+            None => panic!(
+                "cannot create an OpenXR session without a display: {}",
+                display
+                    .unavailable_reason()
+                    .unwrap_or("the display connection has no handle")
+            ),
+        }
     }
 }
 

@@ -373,7 +373,7 @@ mod tests {
         FrameMeta {
             frame_index: 1,
             target_timestamp_us: 11_111,
-        is_keyframe: false,
+            is_keyframe: false,
         }
     }
 

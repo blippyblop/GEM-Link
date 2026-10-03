@@ -27,7 +27,7 @@
 use std::time::{Duration, Instant};
 
 use x_transport::{
-    DeliveredFrame, FrameTrust, RecvEvent, Receiver, ReleasePolicy, UntrustedReason,
+    DeliveredFrame, FrameTrust, Receiver, RecvEvent, ReleasePolicy, UntrustedReason,
 };
 
 use crate::stall::{StuckAction, StuckDetector};
@@ -368,7 +368,7 @@ impl VideoPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x_transport::{ParityPolicy, Packetizer};
+    use x_transport::{Packetizer, ParityPolicy};
 
     const MTU: usize = 1400;
     const SHARD: usize = MTU - x_transport::HEADER_LEN;
@@ -457,7 +457,8 @@ mod tests {
 
         assert!(source.dropped() > 0, "the test injected no loss");
         assert_eq!(
-            presented, 20,
+            presented,
+            20,
             "{} frames lost to {} dropped datagrams despite 25 % parity",
             plane.stats().frames_abandoned,
             source.dropped()
@@ -550,9 +551,15 @@ mod tests {
         );
 
         // Frame 30 is a keyframe and must come out as presentable, ending the hold.
-        let keyframe_presented = events
-            .iter()
-            .any(|e| matches!(e, PlaneEvent::Present { frame_index: 30, .. }));
+        let keyframe_presented = events.iter().any(|e| {
+            matches!(
+                e,
+                PlaneEvent::Present {
+                    frame_index: 30,
+                    ..
+                }
+            )
+        });
         assert!(
             keyframe_presented,
             "the keyframe did not release the hold — the wire bit or the gate is wrong: {events:?}"
@@ -672,7 +679,10 @@ mod tests {
         };
         let line = stats.summary();
         for needle in ["1000 datagrams in", "15 dropped by source", "4 abandoned"] {
-            assert!(line.contains(needle), "{line:?} does not mention {needle:?}");
+            assert!(
+                line.contains(needle),
+                "{line:?} does not mention {needle:?}"
+            );
         }
     }
 }

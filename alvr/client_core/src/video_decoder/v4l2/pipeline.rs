@@ -111,7 +111,10 @@ impl DecoderStats {
 pub enum V4l2Error {
     /// The device could not be opened. Carries the path, because "there is no decoder" and "the
     /// decoder is busy" are different problems and both happen on a real device.
-    Open { path: String, reason: String },
+    Open {
+        path: String,
+        reason: String,
+    },
     Io(String),
 }
 
@@ -374,7 +377,11 @@ mod tests {
         assert_eq!(pipe.stats().keyframe_requests, 1);
 
         // Still stalled, between the rungs: silent.
-        assert!(pipe.poll(start + Duration::from_millis(500)).unwrap().is_empty());
+        assert!(
+            pipe.poll(start + Duration::from_millis(500))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(pipe.stats().keyframe_requests, 1, "it asked twice");
 
         // 800 ms: the device is rebuilt, and the counter says so.
@@ -449,26 +456,44 @@ mod tests {
         let mut pipe = DecoderPipeline::new(MockDevice::with_events(events), 3, start);
 
         pipe.poll(start).unwrap();
-        assert_eq!(pipe.held_by_renderer(), 3, "the renderer holds three frames");
+        assert_eq!(
+            pipe.held_by_renderer(),
+            3,
+            "the renderer holds three frames"
+        );
 
         // Returning one is a clean release; returning it again is not.
         pipe.release(1).unwrap();
         assert_eq!(pipe.held_by_renderer(), 2);
         pipe.release(1).unwrap();
         assert_eq!(pipe.stats().capture_buffers_released, 1);
-        assert_eq!(pipe.stats().spurious_releases, 1, "a double release went unnoticed");
+        assert_eq!(
+            pipe.stats().spurious_releases,
+            1,
+            "a double release went unnoticed"
+        );
 
         // And a device that names a buffer the renderer already holds is caught, not aliased.
         let mut pipe2 = DecoderPipeline::new(
             MockDevice::with_events([
-                DeviceEvent::Decoded { index: 0, timestamp: Duration::ZERO },
-                DeviceEvent::Decoded { index: 0, timestamp: Duration::ZERO },
+                DeviceEvent::Decoded {
+                    index: 0,
+                    timestamp: Duration::ZERO,
+                },
+                DeviceEvent::Decoded {
+                    index: 0,
+                    timestamp: Duration::ZERO,
+                },
             ]),
             2,
             start,
         );
         pipe2.poll(start).unwrap();
-        assert_eq!(pipe2.stats().duplicate_captures, 1, "an aliased frame went unnoticed");
+        assert_eq!(
+            pipe2.stats().duplicate_captures,
+            1,
+            "an aliased frame went unnoticed"
+        );
     }
 
     #[test]

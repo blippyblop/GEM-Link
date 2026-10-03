@@ -16,7 +16,10 @@
 //!   PCSIM_PAYLOAD=N   bytes per frame payload (default 20000)
 //! Exits 0 on success.
 
-use alvr_common::{AlvrFoveatedEncodingParams, ViewParams, glam::{Quat, UVec2}};
+use alvr_common::{
+    AlvrFoveatedEncodingParams, ViewParams,
+    glam::{Quat, UVec2},
+};
 use alvr_packets::{
     ClientConnectionResult, ClientNegotiatedStreamingConfig, NegotiatedStreamingConfigExt,
     ServerControlPacket, StreamConfigPacket, VIDEO, VideoPacketHeader,
@@ -27,10 +30,10 @@ use alvr_sockets::{
 };
 use std::{
     env,
-    time::Instant as StdInstant,
     net::IpAddr,
     process::exit,
     thread,
+    time::Instant as StdInstant,
     time::{Duration, Instant},
 };
 
@@ -124,16 +127,28 @@ fn make_source(view_w: u32, view_h: u32, payload_len: usize) -> (Source, u32, u3
         // negotiate exactly that (no scaling here; the correct VR-resolution
         // answer is a virtual display, see VD_RE/23 section 8.2).
         if which == "dda" {
-            let adapter: u32 = env::var("PCSIM_DDA_ADAPTER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let output: u32 = env::var("PCSIM_DDA_OUTPUT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let adapter: u32 = env::var("PCSIM_DDA_ADAPTER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let output: u32 = env::var("PCSIM_DDA_OUTPUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             match nvenc::DdaFeeder::new(adapter, output, 90) {
                 Ok((f, w, h)) => {
-                    println!("[pcsim] video source: DDA {w}x{h} on adapter {adapter} output {output}");
-                    println!("[pcsim]   note: a static desktop yields near-empty P-frames -- not a valid bitrate sample");
+                    println!(
+                        "[pcsim] video source: DDA {w}x{h} on adapter {adapter} output {output}"
+                    );
+                    println!(
+                        "[pcsim]   note: a static desktop yields near-empty P-frames -- not a valid bitrate sample"
+                    );
                     return (Source::Dda(f), w, h);
                 }
                 Err(e) => {
-                    eprintln!("[pcsim] DDA unavailable ({e}); falling back to the patterned NVENC source");
+                    eprintln!(
+                        "[pcsim] DDA unavailable ({e}); falling back to the patterned NVENC source"
+                    );
                 }
             }
         }
@@ -163,18 +178,21 @@ fn main() {
         .expect("usage: pcsim <client-ip> [pcsim-frames] [stream-port]")
         .parse()
         .expect("bad client ip");
-    let frames: usize = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(90);
+    let frames: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(90);
     let payload_len: usize = env::var("PCSIM_PAYLOAD")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20_000);
     // Negotiable: render resolution may change, so it is a parameter, not a
     // constant. Defaults to the Frame's per-eye resolution.
-    let view_w: u32 = env::var("PCSIM_VIEW_W").ok().and_then(|s| s.parse().ok()).unwrap_or(2160);
-    let view_h: u32 = env::var("PCSIM_VIEW_H").ok().and_then(|s| s.parse().ok()).unwrap_or(2160);
+    let view_w: u32 = env::var("PCSIM_VIEW_W")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2160);
+    let view_h: u32 = env::var("PCSIM_VIEW_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2160);
 
     println!("[pcsim] dialling headset sim at {ip} (control port 9943)");
 
@@ -305,8 +323,7 @@ fn main() {
     }
 
     // 3. Video path: real unreliable VIDEO stream, same as the production server.
-    let mut video_sender: StreamSender<VideoPacketHeader> =
-        socket.request_unreliable_stream(VIDEO);
+    let mut video_sender: StreamSender<VideoPacketHeader> = socket.request_unreliable_stream(VIDEO);
     let mut control_sender: ControlSocketSender<ServerControlPacket> =
         match socket.request_reliable_stream() {
             Ok(s) => s,
@@ -324,7 +341,10 @@ fn main() {
     // Per-frame trace, joinable with the client's on the header timestamp.
     let mut trace: Vec<(u64, usize, f64, f64)> = Vec::new();
     let _ = FRAME_INTERVAL;
-    println!("[pcsim] streaming {frames} frames over VIDEO (target {} fps)", 1_000_000 / FRAME_INTERVAL_US);
+    println!(
+        "[pcsim] streaming {frames} frames over VIDEO (target {} fps)",
+        1_000_000 / FRAME_INTERVAL_US
+    );
 
     for i in 0..frames {
         // The client drops the session if the control stream goes quiet
@@ -405,12 +425,20 @@ fn main() {
             base = Instant::now() - Duration::from_micros(i as u64 * FRAME_INTERVAL_US);
             deadline = base + Duration::from_micros((i as u64 + 1) * FRAME_INTERVAL_US);
         }
-        send_late_ms.push(Instant::now().saturating_duration_since(deadline).as_secs_f64() * 1e3);
+        send_late_ms.push(
+            Instant::now()
+                .saturating_duration_since(deadline)
+                .as_secs_f64()
+                * 1e3,
+        );
     }
 
     let elapsed = t0.elapsed();
     let secs = elapsed.as_secs_f64();
-    println!("[pcsim] VIDEO OK: sent {frames} frames in {elapsed:?} ({:.1} fps)", frames as f64 / secs);
+    println!(
+        "[pcsim] VIDEO OK: sent {frames} frames in {elapsed:?} ({:.1} fps)",
+        frames as f64 / secs
+    );
     println!(
         "[pcsim]   bitrate {:.1} Mbps, {} bytes total, max frame {} B, mean {:.0} B",
         total_bytes as f64 * 8.0 / secs / 1e6,
@@ -444,7 +472,14 @@ fn main() {
         );
         let mut by_size: Vec<&(u64, usize, f64, f64)> = trace.iter().collect();
         by_size.sort_by_key(|r| std::cmp::Reverse(r.1));
-        println!("[pcsim]   biggest frames (idx by size): {:?}", by_size.iter().take(5).map(|r| (r.1, r.2 as u64)).collect::<Vec<_>>());
+        println!(
+            "[pcsim]   biggest frames (idx by size): {:?}",
+            by_size
+                .iter()
+                .take(5)
+                .map(|r| (r.1, r.2 as u64))
+                .collect::<Vec<_>>()
+        );
         match std::fs::File::create(PCSIM_CSV) {
             Ok(mut f) => {
                 use std::io::Write as _;

@@ -135,7 +135,10 @@ pub mod ioctls {
             "the encoded-input ring. Sized from the same pool accounting as BufferPool, because \
              'Could not find a free OUTPUT buffer' is the reference client's own named failure",
         ),
-        ("VIDIOC_QUERYBUF + mmap (OUTPUT)", "or DMABUF export, to hand the kernel bitstream"),
+        (
+            "VIDIOC_QUERYBUF + mmap (OUTPUT)",
+            "or DMABUF export, to hand the kernel bitstream",
+        ),
         (
             "VIDIOC_STREAMON (OUTPUT)",
             "only after the ring exists; the reference client logs 'Failed to enable output stream'",
@@ -203,7 +206,10 @@ mod tests {
         let mut pool = BufferPool::new(2, [7, 8]);
         assert_eq!(pool.acquire(), Some(7));
         assert!(pool.release(7));
-        assert!(!pool.release(7), "a double release must be refused, not counted twice");
+        assert!(
+            !pool.release(7),
+            "a double release must be refused, not counted twice"
+        );
         assert_eq!(pool.free(), 2, "a double release duplicated a buffer");
 
         let a = pool.acquire().expect("a buffer");

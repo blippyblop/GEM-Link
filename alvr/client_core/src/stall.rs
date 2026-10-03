@@ -163,7 +163,10 @@ mod tests {
     fn a_stall_that_jumps_both_thresholds_resets_rather_than_asking() {
         let start = t0();
         let mut stuck = StuckDetector::new(start);
-        assert_eq!(stuck.poll(start + Duration::from_secs(5)), StuckAction::Reset);
+        assert_eq!(
+            stuck.poll(start + Duration::from_secs(5)),
+            StuckAction::Reset
+        );
         assert_eq!(
             stuck.poll(start + Duration::from_secs(6)),
             StuckAction::Progress
