@@ -45,6 +45,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adaptive;
 pub mod crypto;
 pub mod fec;
 pub mod pacer;
@@ -53,6 +54,7 @@ pub mod receiver;
 pub mod trust;
 pub mod wire;
 
+pub use adaptive::{AdaptiveConfig, AdaptiveParity, RatioChange};
 pub use crypto::{KEY_LEN, MediaCipher};
 pub use fec::{FecError, decode_striped as fec_decode_striped, encode as fec_encode};
 pub use pacer::{Pacer, PacerConfig};

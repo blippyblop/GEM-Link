@@ -111,7 +111,29 @@ pub const MAX_SHARDS: usize = 255;
 /// parity budget to survive it. With `block = index % blocks` the same burst is spread
 /// across every block, so a handful of parity shards per block absorbs it. This is the
 /// classic interleaving that every erasure-coded streaming system does, for the same reason.
-pub const MAX_DATA_PER_BLOCK: usize = 250;
+///
+/// ---
+///
+/// **170, and the number is chosen for the *ratio*, not the frame size.** A block holds
+/// `data + parity <= MAX_SHARDS`, so the largest ratio a block can express is
+/// `(255 - data_per_block) / data_per_block`. At the obvious 250 that is **5 parity slots, i.e.
+/// 2 %** — so a `Ratio { 0.05 }` policy silently pays 2 %, and any adaptive controller above 2 %
+/// is asking for something the layout cannot deliver. Nothing fails; the overhead just comes out
+/// lower than requested, which is the worst way for a safety mechanism to be wrong.
+///
+/// 170 leaves 85 parity slots, a **50 %** ceiling — which is exactly `AdaptiveConfig::max`, so
+/// the ratio our controller can ask for is the ratio the field can express. The cost is more
+/// blocks for the same frame (each with its own parity granularity); the benefit is that
+/// requested and paid are the same number.
+///
+/// This is safe to change because the layout is *derived*, never transmitted: both ends compute
+/// it from `data_count` on the wire and the policy in the session, so a new constant moves both
+/// together. `the_requested_ratio_is_the_ratio_the_field_pays` asserts the arithmetic.
+pub const MAX_DATA_PER_BLOCK: usize = 170;
+
+/// The largest ratio a block of [`MAX_DATA_PER_BLOCK`] data shards can express.
+pub const MAX_EXPRESSIBLE_RATIO: f32 =
+    (MAX_SHARDS - MAX_DATA_PER_BLOCK) as f32 / MAX_DATA_PER_BLOCK as f32;
 
 /// How many FEC blocks a frame of `data_count` data shards is split into.
 ///
@@ -727,11 +749,13 @@ mod tests {
     #[test]
     fn block_layout_is_a_pure_function_of_the_data_count() {
         assert_eq!(blocks_for(1), 1);
-        assert_eq!(blocks_for(250), 1);
-        assert_eq!(blocks_for(251), 2);
+        assert_eq!(blocks_for(170), 1);
+        assert_eq!(blocks_for(171), 2);
         assert_eq!(blocks_for(300), 2);
-        assert_eq!(blocks_for(500), 2);
-        assert_eq!(blocks_for(501), 3);
+        assert_eq!(blocks_for(340), 2);
+        assert_eq!(blocks_for(341), 3);
+        assert_eq!(blocks_for(510), 3);
+        assert_eq!(blocks_for(511), 4);
         // The widest block must still fit the field alongside its parity.
         const { assert!(250 + 5 <= MAX_SHARDS) };
     }
@@ -859,5 +883,36 @@ mod tests {
             *slot = None;
         }
         assert!(decode_striped(&mut all, 300, 8).is_err());
+    }
+
+    #[test]
+    fn the_requested_ratio_is_the_ratio_the_field_pays() {
+        // Guards a silent failure found while building the adaptive controller. A block holds
+        // `data + parity <= MAX_SHARDS`, so its *largest expressible ratio* is
+        // `(255 - data_per_block) / data_per_block`. At the original 250 that was 5 parity slots
+        // — **2 %** — so `Ratio { 0.05 }` quietly paid 2 %, and every ratio above 2 % was asking
+        // for something the layout could not give. Nothing errored; the overhead just came out
+        // lower than requested, which is the worst way for a safety mechanism to be wrong.
+        use crate::packetizer::ParityPolicy;
+        use crate::adaptive::AdaptiveConfig;
+
+        assert!(
+            MAX_EXPRESSIBLE_RATIO >= AdaptiveConfig::default().max,
+            "the block layout ({} %) cannot express the ratio the controller will ask for ({} %)",
+            MAX_EXPRESSIBLE_RATIO * 100.0,
+            AdaptiveConfig::default().max * 100.0,
+        );
+
+        for data in [170usize, 171, 340, 1000, 5000, 20000] {
+            for ratio in [0.02f32, 0.05, 0.1, 0.25, 0.5] {
+                let paid = ParityPolicy::Ratio { fraction: ratio }.overhead(data);
+                // Granularity is one shard per block, and data_per_block rounds up, so the paid
+                // ratio can exceed the requested one — but it must not fall meaningfully short.
+                assert!(
+                    paid >= ratio * 0.9,
+                    "data={data} ratio={ratio}: the field paid {paid}, asked {ratio}"
+                );
+            }
+        }
     }
 }
