@@ -7,6 +7,9 @@
 
 mod c_api;
 mod connection;
+/// The latency markers: where a frame's time goes, on the client. The other half of the
+/// glass-to-glass instrumentation `ROADMAP` lists as blocked.
+pub mod latency;
 mod logging_backend;
 /// The client's video receive path, on the media plane (`x-transport`). See the module docs for
 /// why the receiver, the trust gate and the stall ladder are one type rather than three.

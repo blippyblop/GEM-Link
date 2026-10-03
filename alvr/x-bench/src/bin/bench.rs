@@ -125,7 +125,9 @@ fn real_main(args: &[String]) -> Result<(), String> {
                 );
             }
             println!();
-            println!("a positive phase is late: it is measured after the client's own clock estimate");
+            println!(
+                "a positive phase is late: it is measured after the client's own clock estimate"
+            );
             Ok(())
         }
         "scenarios" => {

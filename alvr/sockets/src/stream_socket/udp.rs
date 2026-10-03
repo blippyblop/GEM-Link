@@ -69,7 +69,9 @@ pub fn bind(
     let socket = UdpSocket::bind((LOCAL_IP, port))?.into();
 
     crate::set_socket_buffers(&socket, buffer_config).ok();
-    crate::set_dscp(&socket, dscp);
+    if let Some(reason) = crate::set_dscp(&socket, dscp) {
+        alvr_common::warn!("{reason}");
+    }
 
     Ok(socket.into())
 }

@@ -104,10 +104,46 @@ fn dscp_to_tos(dscp: DscpTos) -> u8 {
     }
 }
 
-fn set_dscp(socket: &Socket, dscp: Option<DscpTos>) {
-    if let Some(dscp) = dscp {
-        // `set_tos_v4` takes the DS *field*, i.e. the 6-bit DSCP shifted up by two.
-        socket.set_tos_v4((dscp_to_tos(dscp) << 2) as u32).ok();
+/// Apply the QoS marking, and **report** whether it took.
+///
+/// Two independent things are checked, because either can fail on its own and only one of them is
+/// visible to the caller of a setter:
+///
+/// 1. The kernel call. `set_tos_v4` returns an error on a socket that does not accept it.
+/// 2. Whether the value actually **landed**. `set_tos_v4` can return `Ok(())` and the mark still not
+///    be there — a kernel, a container, or a socket family that ignores it. So the value is read
+///    back and compared.
+///
+/// The `.ok()` this replaces discarded the first failure entirely, and nothing checked the second.
+/// A QoS marking that silently does nothing is worse than not asking for one: the settings say the
+/// traffic is prioritised, the switch disagrees, and the only evidence either way is a latency
+/// distribution nobody can attribute. Valve's client says so out loud —
+/// `SVLDataLink::Client QoS Enable: %d`, `Changing tos opt = %d`,
+/// `WARNING: Could not set IP_TOS on data link` — and we should too. See ADR-0014.
+///
+/// Returns `None` when the mark took, or a reason for the caller to log.
+pub fn set_dscp(socket: &Socket, dscp: Option<DscpTos>) -> Option<String> {
+    let dscp = dscp?;
+    // `set_tos_v4` takes the DS *field*, i.e. the 6-bit DSCP shifted up by two.
+    let ds_field = (dscp_to_tos(dscp) << 2) as u32;
+
+    if let Err(e) = socket.set_tos_v4(ds_field) {
+        return Some(format!(
+            "could not mark the socket DSCP {} ({ds_field:#04x}): {e}",
+            dscp_to_tos(dscp)
+        ));
+    }
+
+    match socket.tos_v4() {
+        Ok(observed) if observed == ds_field => None,
+        Ok(observed) => Some(format!(
+            "the kernel accepted the DSCP mark and did not keep it: asked for {ds_field:#04x}, \
+             reads back {observed:#04x}. The traffic is not being prioritised and the settings \
+             say it is."
+        )),
+        Err(e) => Some(format!(
+            "the DSCP mark was set but cannot be read back to check it: {e}"
+        )),
     }
 }
 
@@ -319,6 +355,35 @@ mod tests {
             38,
             "AF43 = 4*8 + 3*2"
         );
+    }
+
+    /// The mark is *verified*, not merely requested.
+    ///
+    /// Two failures used to share one silent path: the kernel refusing the call (whose error the old
+    /// `.ok()` discarded) and the kernel accepting it and not keeping it (which nothing checked). A
+    /// UDP socket on Linux takes a TOS mark, so this asserts the good case — and the assertion is on
+    /// the **read-back**, so it also fails if the setter ever stops landing.
+    #[test]
+    fn a_qos_mark_is_read_back_rather_than_assumed() {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+
+        // Nothing asked for, nothing to report.
+        assert_eq!(set_dscp(&socket, None), None);
+
+        match set_dscp(&socket, Some(DscpTos::ExpeditedForwarding)) {
+            None => assert_eq!(
+                socket.tos_v4().unwrap(),
+                46 << 2,
+                "the call reported success but the DS field is not what was asked for"
+            ),
+            Some(reason) => panic!(
+                "a UDP socket on this platform refused the mark: {reason}. If that is genuinely \
+                 true here, the assertion above is the wrong one for this environment — but the \
+                 point of returning a reason rather than swallowing the error is that the client \
+                 says so at runtime instead of pretending."
+            ),
+        }
     }
 
     #[test]

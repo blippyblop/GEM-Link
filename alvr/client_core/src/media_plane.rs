@@ -30,7 +30,10 @@ use x_transport::{
     DeliveredFrame, FrameTrust, Receiver, RecvEvent, ReleasePolicy, UntrustedReason,
 };
 
-use crate::stall::{StuckAction, StuckDetector};
+use crate::{
+    latency::LatencyTrace,
+    stall::{StuckAction, StuckDetector},
+};
 
 /// One read from wherever datagrams come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +246,9 @@ impl DatagramSource for UdpDatagramSource {
     }
 }
 
+/// Re-exported so a caller does not have to depend on `latency` to mark a boundary.
+pub use crate::latency::Stage as LatencyStage;
+
 /// What the caller must do after a [`MediaPlaneReceiver::poll`].
 ///
 /// Actions rather than symptoms: the plane does not know how to send a control packet or how to
@@ -312,9 +318,18 @@ impl MediaPlaneReceiver {
 
     /// Read what has arrived, release what is ready, and report what to do.
     ///
+    /// The trace is passed in rather than owned so the *other* boundaries — decode, submit, display
+    /// — can be marked by whoever owns them. One trace, one clock, and the join between the two ends
+    /// of the pipeline is the frame index that is already on the wire.
+    ///
     /// Returns `false` once the socket can never deliver again, so the caller stops rather than
     /// spinning. A quiet socket is not that: it returns an empty action list and `true`.
-    pub fn poll(&mut self, now: Instant, budget: Duration) -> (Vec<MediaPlaneAction>, bool) {
+    pub fn poll(
+        &mut self,
+        trace: &mut LatencyTrace,
+        now: Instant,
+        budget: Duration,
+    ) -> (Vec<MediaPlaneAction>, bool) {
         let open = self.plane.pump(&mut self.source, now, budget);
 
         let actions = self
@@ -326,11 +341,16 @@ impl MediaPlaneReceiver {
                     frame_index,
                     target_timestamp_us,
                     payload,
-                } => Some(MediaPlaneAction::Decode {
-                    frame_index,
-                    target_timestamp_us,
-                    payload,
-                }),
+                } => {
+                    // The frame is reconstructed and trustworthy: this is the start of every span
+                    // that matters, and the only mark that creates a record.
+                    trace.frame_received(frame_index, target_timestamp_us, now);
+                    Some(MediaPlaneAction::Decode {
+                        frame_index,
+                        target_timestamp_us,
+                        payload,
+                    })
+                }
                 // A held frame is a decision, not an action: the previous image stays and the
                 // compositor reprojects it. `PlaneStats` records that it happened, which is what
                 // the old reader did not do.
@@ -1023,7 +1043,8 @@ mod tests {
             MediaPlaneReceiver::bound_to(receiver, sender.local_addr().unwrap(), policy, now)
                 .unwrap();
 
-        let (actions, open) = plane.poll(now, Duration::ZERO);
+        let mut trace = LatencyTrace::new(64);
+        let (actions, open) = plane.poll(&mut trace, now, Duration::ZERO);
         assert!(open, "a live socket must report itself open");
 
         let (frame_index, payload) = actions
@@ -1045,6 +1066,10 @@ mod tests {
         );
         assert_eq!(plane.stats().frames_presented, 1);
         assert_eq!(plane.stats().frames_held, 0);
+        // The instrument runs in the real path: the frame that came out is in the trace, under the
+        // same index, with the server's own target time beside it.
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace.frame_index_at(0), Some(7));
     }
 
     #[test]

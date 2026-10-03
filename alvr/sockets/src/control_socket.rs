@@ -45,7 +45,9 @@ pub fn bind(
 
     crate::set_socket_buffers(&socket, buffer_config).ok();
 
-    crate::set_dscp(&socket, dscp);
+    if let Some(reason) = crate::set_dscp(&socket, dscp) {
+        alvr_common::warn!("{reason}");
+    }
 
     socket.set_read_timeout(Some(timeout))?;
 
