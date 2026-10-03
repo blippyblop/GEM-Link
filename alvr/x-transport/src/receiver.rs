@@ -111,27 +111,89 @@ impl DeliveredFrame {
 }
 
 /// When to release a frame.
+///
+/// Three thresholds, because there are three different things a hole can be waiting for, and only
+/// the frame in that state should pay for it:
+///
+/// | state | waits | why |
+/// |---|---|---|
+/// | complete | **nothing** | there is no hole |
+/// | holed, and the FEC can rebuild it from what has arrived | [`Self::straggler_delay`] | the data is here; the stragglers just need to stop arriving |
+/// | holed, and the FEC cannot | [`Self::repair_delay`] | only a re-send can help, and that costs a round trip |
+///
+/// Collapsing those into one number is what the bench caught twice over: first a count of frames,
+/// which made *every* frame wait a whole display period; then a single time, which made every
+/// FEC-recoverable frame pay for a round trip it did not need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReleasePolicy {
-    /// How many later frames must have completed before an incomplete frame is given up on.
-    /// Zero means "release as soon as a later frame completes".
-    pub jitter_frames: u16,
-    /// Hard bound from the first arriving datagram of a frame.
+    /// How long to wait for a frame's own stragglers to finish arriving before believing a hole.
+    /// The spread of a frame's datagrams is a property of the link, so this is a time: expressing
+    /// it as a count of frames made it a property of the *display rate*, which is how a wired link
+    /// with 0.3 ms of jitter came to be charged 11.1 ms.
+    pub straggler_delay: Duration,
+    /// Straggler delay **plus a round trip**: how long a hole the FEC cannot fill is given for a
+    /// re-send to arrive. Only a frame in that state pays it, and the round trip is unavoidable —
+    /// it is the cost of asking.
+    pub repair_delay: Duration,
+    /// Hard bound from the first arriving datagram: after this, whatever is still missing is lost.
     pub deadline: Duration,
+    /// Kept for callers that size the cover in whole frames. [`Self::for_link`] does not use it.
+    pub jitter_frames: u16,
 }
 
 impl ReleasePolicy {
     /// A policy expressed in frames, for a given frame interval.
     ///
-    /// `jitter_frames` of order cover and a deadline of the same length, which is the
-    /// smallest pair that can absorb a reorder without adding more than that much latency.
+    /// The coarse form, and the right one for a test that wants a specific window rather than a
+    /// modelled one. [`Self::for_link`] is what a session should use.
     pub fn new(jitter_frames: u16, frame_interval: Duration) -> Self {
+        let window = frame_interval * jitter_frames as u32;
         Self {
+            straggler_delay: window,
+            repair_delay: window,
+            deadline: window + frame_interval,
             jitter_frames,
-            // One extra frame interval of slack over the reorder window, so the deadline
-            // does not pre-empt a straggler that the reorder window was still waiting for.
-            deadline: frame_interval * (jitter_frames as u32 + 1),
         }
+    }
+
+    /// A policy sized from what the link actually does.
+    ///
+    /// `jitter` is how far apart a frame's own datagrams can be spread; `stall` is how long the link
+    /// can go quiet without dropping them (a channel hop delays rather than loses, so it belongs in
+    /// the spread); `rtt` is what a re-send costs. The tenth-of-a-frame added to each is scheduling
+    /// slack, not a modelling term — without it a repair lands exactly on the threshold that would
+    /// discard it.
+    pub fn for_link(
+        jitter: Duration,
+        stall: Duration,
+        rtt: Duration,
+        frame_interval: Duration,
+    ) -> Self {
+        let slack = frame_interval / 10;
+        let straggler_delay = jitter + stall + slack;
+        let repair_delay = straggler_delay + rtt + jitter + slack;
+        Self {
+            straggler_delay,
+            // The round trip, plus the jitter the *repair itself* will suffer on the way back. The
+            // repair is a datagram like any other and it crosses the same link; leaving its jitter
+            // out made the window exactly the round trip, which the bench showed as repairs landing
+            // a hundredth of a millisecond after the frame that was waiting for them.
+            repair_delay,
+            // The hard bound is one frame interval *past the repair window*, not past the straggler
+            // window. Being derived from the wrong one made the deadline fire before the window it
+            // was supposed to be a backstop for, so a frame was given up on while the repair it had
+            // asked for was still in flight.
+            deadline: repair_delay + frame_interval,
+            jitter_frames: 0,
+        }
+    }
+
+    /// How many whole frames of cover this policy would be, for a log line or a budget.
+    pub fn cover_in_frames(&self, frame_interval: Duration) -> f64 {
+        if frame_interval.is_zero() {
+            return 0.0;
+        }
+        self.straggler_delay.as_secs_f64() / frame_interval.as_secs_f64()
     }
 }
 
@@ -242,6 +304,32 @@ impl PartialFrame {
             .filter(|i| self.shards[*i as usize].is_none())
             .collect()
     }
+
+    /// Whether the FEC could rebuild this frame from what has arrived, without waiting for anything.
+    ///
+    /// Asked *before* releasing rather than discovered at release, because it decides how long the
+    /// frame waits: a hole the code can fill needs only the stragglers to stop arriving, and one it
+    /// cannot needs a round trip. Per block, because the code is striped — a frame can be repairable
+    /// in three blocks and hopeless in the fourth.
+    fn fec_repairable(&self) -> bool {
+        let data_count = self.data_count as usize;
+        if data_count == 0 {
+            return false;
+        }
+        let blocks = fec::blocks_for(data_count);
+        let parity_per_block = self.parity_count as usize / blocks;
+
+        let mut missing_per_block = vec![0usize; blocks];
+        for (index, slot) in self.shards[..data_count].iter().enumerate() {
+            if slot.is_none() {
+                missing_per_block[fec::block_of(index, blocks)] += 1;
+            }
+        }
+
+        missing_per_block
+            .iter()
+            .all(|missing| *missing <= parity_per_block)
+    }
 }
 
 /// Reassembles frames from datagrams.
@@ -250,8 +338,6 @@ pub struct Receiver {
     keys: Option<MediaKeys>,
     /// Frames still being assembled, ordered so release is a single pass.
     partial: BTreeMap<u64, PartialFrame>,
-    /// The highest frame index that has arrived complete — the reorder-reference.
-    max_completed: Option<u64>,
     /// The highest frame index that has been handed out. A datagram at or below this is
     /// late by definition: the display path has already moved past it.
     max_released: Option<u64>,
@@ -267,7 +353,6 @@ impl Receiver {
             policy,
             keys,
             partial: BTreeMap::new(),
-            max_completed: None,
             max_released: None,
             stats: ReceiverStats::default(),
             max_frames_in_flight: 256,
@@ -387,12 +472,6 @@ impl Receiver {
 
         let completed = entry.has_all_data();
         let frame_index = header.frame_index;
-        if completed {
-            self.max_completed = Some(
-                self.max_completed
-                    .map_or(frame_index, |m| m.max(frame_index)),
-            );
-        }
 
         RecvEvent::Accepted {
             frame_index,
@@ -423,24 +502,49 @@ impl Receiver {
             .collect()
     }
 
-    /// Release everything that is ready, oldest frame first.
+    /// Release everything that is ready, oldest frame first, **stopping at the first frame that is
+    /// not** — so what comes out is always in frame order.
     ///
-    /// Ready means: `jitter_frames` later frames have completed, **or** the deadline has
-    /// passed since the frame's first datagram.
+    /// Three ways a frame becomes ready, and the first is the one that matters:
+    ///
+    /// 1. **It is complete.** Nothing is missing, so there is nothing to wait for. This is the
+    ///    change that removed a whole frame interval of latency from every frame: the cover exists
+    ///    to give a *hole* time to be filled by a straggler or a repair, and a frame without one has
+    ///    no use for it. The old rule held every frame until a later one completed, which on a clean
+    ///    stream released each frame at the very end of its own period — late by definition.
+    /// 2. Its straggler window has elapsed **and** the FEC can rebuild it from what has arrived —
+    ///    the data is here, so stop waiting. See [`ReleasePolicy::straggler_delay`].
+    /// 3. Its repair window has elapsed: the code could not fill the hole, a re-send was asked for,
+    ///    and this is how long it was given. See [`ReleasePolicy::repair_delay`].
+    /// 4. Its deadline has passed. The hole is permanent and the frame goes out with whatever the
+    ///    FEC could make of it, or without a payload at all.
+    ///
+    /// The stopping is what keeps ordering: frame `n + 1` may not overtake a held frame `n`, or the
+    /// display path would show the newer picture and then the older one.
     pub fn release(&mut self, now: Duration) -> Vec<DeliveredFrame> {
-        let ready: Vec<u64> = self
-            .partial
-            .iter()
-            .filter(|(index, frame)| {
-                let reorder_ready = self.max_completed.is_some_and(|max| {
-                    index.saturating_add(self.policy.jitter_frames as u64) <= max
-                });
-                let deadline_passed =
-                    now.saturating_sub(frame.first_arrival) >= self.policy.deadline;
-                reorder_ready || deadline_passed
-            })
-            .map(|(index, _)| *index)
-            .collect();
+        let mut ready: Vec<u64> = Vec::new();
+
+        for (index, frame) in self.partial.iter() {
+            let waited = now.saturating_sub(frame.first_arrival);
+            let stragglers_over = waited >= self.policy.straggler_delay;
+            let repair_window_over = waited >= self.policy.repair_delay;
+            let deadline_passed = waited >= self.policy.deadline;
+
+            // Complete: nothing to wait for.
+            // FEC can rebuild it: the data is here, so stop waiting for the stragglers.
+            // Otherwise the repair window, then the deadline.
+            let due = frame.has_all_data()
+                || (stragglers_over && frame.fec_repairable())
+                || repair_window_over
+                || deadline_passed;
+
+            if due {
+                ready.push(*index);
+            } else {
+                // Holding a hole holds everything behind it — for at most one of the windows above.
+                break;
+            }
+        }
 
         let mut out = Vec::with_capacity(ready.len());
         for index in ready {
@@ -552,6 +656,17 @@ mod tests {
         ReleasePolicy::new(1, Duration::from_millis(11))
     }
 
+    /// No cover at all: release the moment a frame is complete. For the tests that are about
+    /// *what* comes out rather than *when*.
+    fn immediate_policy() -> ReleasePolicy {
+        ReleasePolicy {
+            straggler_delay: Duration::ZERO,
+            repair_delay: Duration::ZERO,
+            deadline: Duration::from_millis(11),
+            jitter_frames: 0,
+        }
+    }
+
     fn receiver() -> Receiver {
         Receiver::new(policy(), None)
     }
@@ -597,7 +712,7 @@ mod tests {
     #[test]
     fn a_complete_frame_arrives_intact() {
         let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
-        let mut receiver = receiver();
+        let mut receiver = Receiver::new(immediate_policy(), None);
         let bytes = payload(SHARD * 3 + 5);
         let mut seq = 0;
         send(
@@ -609,7 +724,8 @@ mod tests {
             Duration::ZERO,
             &mut seq,
         );
-        // A second frame must complete (or the deadline pass) before the first is released.
+        // A second frame arrives behind it, so the release path is exercised with more than one
+        // frame in flight.
         send(
             &mut receiver,
             &packetizer,
@@ -621,11 +737,7 @@ mod tests {
         );
 
         let released = receiver.release(Duration::from_millis(1));
-        assert_eq!(
-            released.len(),
-            1,
-            "only frame 1 is due after one later frame"
-        );
+        assert_eq!(released.len(), 2);
         assert_eq!(released[0].frame_index, 1);
         assert_eq!(released[0].outcome, FrameOutcome::Complete);
         assert_eq!(released[0].payload().unwrap(), &bytes[..]);
@@ -934,19 +1046,28 @@ mod tests {
         assert_eq!(receiver.in_flight(), 0);
     }
 
+    /// The cover is a **time**, it is only paid by frames that have a **hole**, and a frame without
+    /// one is released the instant it is whole.
+    ///
+    /// All three parts are corrections the bench forced. The cover used to be a count of frames —
+    /// "release frame 1 once frame 3 has completed" — which held *every* frame for a whole display
+    /// period regardless of the link, so every frame of every scenario came out at the end of its
+    /// own period. That is the definition of late.
     #[test]
-    fn the_jitter_window_holds_frames_back() {
-        // With a two-frame window, frame 1 must not be released until frame 3 completes.
+    fn the_reorder_cover_is_a_time_paid_only_by_frames_with_a_hole() {
         let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
+        // 22 ms of cover, expressed as two frame intervals.
         let mut receiver = Receiver::new(ReleasePolicy::new(2, Duration::from_millis(11)), None);
         let mut seq = 0;
 
+        // Two frames, each missing its first shard — `payload` takes bytes, so this is three
+        // shards with one of them gone.
         send(
             &mut receiver,
             &packetizer,
             1,
-            &payload(100),
-            &[],
+            &payload(SHARD * 3),
+            &[0],
             Duration::ZERO,
             &mut seq,
         );
@@ -954,32 +1075,150 @@ mod tests {
             &mut receiver,
             &packetizer,
             2,
-            &payload(100),
-            &[],
+            &payload(SHARD * 3),
+            &[0],
             Duration::ZERO,
             &mut seq,
         );
+
         assert!(
-            receiver.release(Duration::from_millis(1)).is_empty(),
-            "one later completion is not enough for a two-frame window"
+            receiver.release(Duration::from_millis(21)).is_empty(),
+            "the cover had not elapsed, so waiting is exactly the point"
         );
+
+        let released = receiver.release(Duration::from_millis(22));
+        assert_eq!(released.len(), 2, "the cover elapsed, so both are due");
+        assert_eq!(
+            released[0].frame_index, 1,
+            "release must stay in frame order"
+        );
+        assert_eq!(released[1].frame_index, 2);
+    }
+
+    /// The improvement, stated as a test: a whole frame pays **no** latency for order cover.
+    #[test]
+    fn a_frame_with_no_hole_is_released_at_once() {
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
+        let mut receiver = Receiver::new(ReleasePolicy::new(4, Duration::from_millis(11)), None);
+        let mut seq = 0;
 
         send(
             &mut receiver,
             &packetizer,
-            3,
-            &payload(100),
+            1,
+            &payload(SHARD),
             &[],
             Duration::ZERO,
             &mut seq,
         );
-        let released = receiver.release(Duration::from_millis(1));
+
+        let released = receiver.release(Duration::ZERO);
         assert_eq!(
             released.len(),
             1,
-            "two later completions should release frame 1"
+            "a complete frame has nothing to wait for, and holding it is latency the picture pays"
         );
+        assert_eq!(released[0].outcome, FrameOutcome::Complete);
+    }
+
+    /// And the reason the cover exists at all: a hole held a little longer is a hole the repair can
+    /// still fill. This is the property that makes NACKing possible — with the cover at the jitter
+    /// alone, the frame was gone before a request could be made and the whole path was dead code.
+    #[test]
+    fn a_hole_is_still_open_while_the_repair_round_trip_is_in_flight() {
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Fixed(1));
+        let mut receiver = Receiver::new(
+            ReleasePolicy::for_link(
+                Duration::from_micros(300),
+                Duration::ZERO,
+                Duration::from_millis(4),
+                Duration::from_millis(11),
+            ),
+            None,
+        );
+        let bytes = payload(SHARD * 3);
+        let mut seq = 0;
+
+        let (_, datagrams) = packetizer
+            .fragment(
+                FrameMeta {
+                    frame_index: 1,
+                    target_timestamp_us: 0,
+                    is_keyframe: true,
+                    key_epoch: 0,
+                },
+                &bytes,
+                &mut seq,
+                None,
+            )
+            .unwrap();
+
+        // **Two** data shards are lost, against one parity shard: the code cannot rebuild this, so
+        // the frame is one of the ones that genuinely has to wait for a re-send. (Losing one shard
+        // would be repairable, and a repairable frame is released as soon as the stragglers stop
+        // arriving rather than paying for a round trip.)
+        for (index, datagram) in datagrams.iter().enumerate() {
+            if index == 1 || index == 2 {
+                continue;
+            }
+            receiver.on_datagram(datagram, Duration::ZERO);
+        }
+
+        assert_eq!(
+            receiver.nack(1),
+            vec![1, 2],
+            "the client must be able to name what is missing while the frame is still held"
+        );
+        assert!(
+            receiver.release(Duration::from_millis(2)).is_empty(),
+            "the FEC cannot rebuild this, so waiting for the repair is the only way to keep the \
+             frame — releasing now throws away a frame that a round trip would have saved"
+        );
+
+        // The repair comes back.
+        receiver.on_datagram(&datagrams[1], Duration::from_millis(3));
+        receiver.on_datagram(&datagrams[2], Duration::from_millis(3));
+        let released = receiver.release(Duration::from_millis(3));
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].outcome, FrameOutcome::Complete);
+    }
+
+    /// Ordering is not a coincidence here: a hole holds everything behind it, so a later frame can
+    /// never overtake an earlier one.
+    #[test]
+    fn a_held_hole_holds_the_frames_behind_it() {
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
+        let mut receiver = Receiver::new(ReleasePolicy::new(4, Duration::from_millis(11)), None);
+        let mut seq = 0;
+
+        send(
+            &mut receiver,
+            &packetizer,
+            1,
+            &payload(SHARD * 3),
+            &[0],
+            Duration::ZERO,
+            &mut seq,
+        );
+        send(
+            &mut receiver,
+            &packetizer,
+            2,
+            &payload(SHARD),
+            &[],
+            Duration::ZERO,
+            &mut seq,
+        );
+
+        assert!(
+            receiver.release(Duration::from_millis(5)).is_empty(),
+            "frame 2 is whole, but it may not overtake the hole in frame 1"
+        );
+
+        let released = receiver.release(Duration::from_millis(44));
+        assert_eq!(released.len(), 2);
         assert_eq!(released[0].frame_index, 1);
+        assert_eq!(released[1].frame_index, 2);
     }
 
     #[test]

@@ -63,18 +63,36 @@ pub struct SenderConfig {
 
 impl SenderConfig {
     /// A configuration whose repair window matches the receiver's release policy for the same link.
+    ///
+    /// This is not a detail. A sender that believes it has longer than the client does will spend
+    /// bandwidth on repairs the client throws away; one that believes it has less will refuse
+    /// repairs that would have worked. The window is the client's own deadline, read from the same
+    /// policy object.
+    pub fn matching_policy(
+        mtu: usize,
+        parity: ParityPolicy,
+        release: &crate::ReleasePolicy,
+    ) -> Self {
+        Self {
+            mtu,
+            parity,
+            repair_window: release.deadline,
+            cached_frames: 16,
+        }
+    }
+
+    /// The frame-quantised form, for a caller that sizes the cover in whole frames.
     pub fn matching_receiver(
         mtu: usize,
         parity: ParityPolicy,
         jitter_frames: u16,
         frame_interval: Duration,
     ) -> Self {
-        Self {
+        Self::matching_policy(
             mtu,
             parity,
-            repair_window: frame_interval * (jitter_frames as u32 + 1),
-            cached_frames: 16,
-        }
+            &crate::ReleasePolicy::new(jitter_frames, frame_interval),
+        )
     }
 }
 

@@ -895,7 +895,18 @@ mod tests {
     fn incomplete_frames_are_nacked_rather_than_left_to_die() {
         // The reference client re-requests; so do we. A frame that is one datagram short and gets
         // it back is a frame that never needed a keyframe.
-        let mut plane = VideoPlane::new(policy(), Instant::now());
+        //
+        // A policy with a real hold, because that is the state a NACK exists in: a frame the
+        // receiver is still holding and still missing pieces of. With no hold at all the frame is
+        // released the instant it is not repairable, and there is nothing left to ask for — which
+        // is correct behaviour and simply not this test.
+        let hold = ReleasePolicy {
+            straggler_delay: Duration::from_millis(10),
+            repair_delay: Duration::from_millis(20),
+            deadline: Duration::from_millis(30),
+            jitter_frames: 0,
+        };
+        let mut plane = VideoPlane::new(hold, Instant::now());
         let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
         let bytes = payload(8);
         let mut seq = 0;
@@ -1040,6 +1051,8 @@ mod tests {
         // frame must come out at once, not at its deadline. Waiting for a deadline that is not
         // telling us anything is latency added for nothing.
         let policy = ReleasePolicy {
+            straggler_delay: Duration::ZERO,
+            repair_delay: Duration::ZERO,
             jitter_frames: 0,
             deadline: Duration::from_millis(500),
         };
