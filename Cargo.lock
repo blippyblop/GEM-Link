@@ -254,6 +254,7 @@ dependencies = [
  "android_logger",
  "app_dirs2",
  "env_logger",
+ "libc",
  "mdns-sd",
  "ndk",
  "ndk-context",

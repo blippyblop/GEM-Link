@@ -22,6 +22,10 @@
 //! Nothing in this file has run on hardware. It compiles for `aarch64-unknown-linux-gnu` and its
 //! logic is tested; it has never opened a `/dev/videoN`.
 
+pub mod abi;
+pub mod device;
+pub mod pipeline;
+
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -152,13 +156,27 @@ impl BufferPool {
         Some(index)
     }
 
-    pub fn release(&mut self, index: u32) {
-        // Guard against a double-release, which would hand the same buffer to two holders.
+    /// Take one *specific* buffer, for callers that are handed an index by someone else — a CAPTURE
+    /// buffer named by a device event, say. Returns false if it was not free, which is either a
+    /// double-decode or a device handing out a buffer it never got back. Both are worth counting.
+    pub fn acquire_specific(&mut self, index: u32) -> bool {
+        let Some(pos) = self.free.iter().position(|&i| i == index) else {
+            return false;
+        };
+        self.free.remove(pos);
+        self.in_use += 1;
+        true
+    }
+
+    /// Give a buffer back. Returns whether it was actually held, so a caller can tell a clean
+    /// return from a double-release instead of both looking like success.
+    pub fn release(&mut self, index: u32) -> bool {
         if self.in_use == 0 || self.free.contains(&index) {
-            return;
+            return false;
         }
         self.in_use -= 1;
         self.free.push_back(index);
+        true
     }
 
     pub fn free(&self) -> usize {
@@ -241,17 +259,8 @@ pub mod ioctls {
     ];
 }
 
-/// The kernel-facing half. Implemented next; named now so the seam is explicit and so the policy
-/// above can be tested without a device.
-pub trait V4l2Device {
-    /// Open and configure the device, run the setup sequence, and start both queues.
-    fn open(&mut self) -> Result<(), String>;
-    /// Hand one access unit to the decoder. Returns false if no OUTPUT buffer was free — which the
-    /// caller must count, not ignore.
-    fn submit(&mut self, timestamp: Duration, nal: &[u8]) -> bool;
-    /// Rebuild the pipeline. Called on [`StuckAction::Reset`].
-    fn hard_reset(&mut self);
-}
+// The kernel-facing half lives in `pipeline::V4l2Device`, next to the policy that drives it, so
+// the two cannot drift apart.
 
 #[cfg(test)]
 mod tests {
@@ -342,7 +351,7 @@ mod tests {
         assert_eq!(pool.acquire(), None);
         assert_eq!(pool.in_use(), 3);
 
-        pool.release(1);
+        assert!(pool.release(1), "releasing a held buffer must succeed");
         assert_eq!(pool.acquire(), Some(1));
         assert_eq!(pool.in_use(), 3);
     }
@@ -351,8 +360,8 @@ mod tests {
     fn a_double_release_does_not_hand_one_buffer_to_two_holders() {
         let mut pool = BufferPool::new(2, [7, 8]);
         assert_eq!(pool.acquire(), Some(7));
-        pool.release(7);
-        pool.release(7); // a decoder bug that would otherwise alias a live buffer
+        assert!(pool.release(7));
+        assert!(!pool.release(7), "a double release must be refused, not counted twice");
         assert_eq!(pool.free(), 2, "a double release duplicated a buffer");
 
         let a = pool.acquire().expect("a buffer");
