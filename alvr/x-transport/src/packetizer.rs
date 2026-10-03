@@ -39,6 +39,9 @@ pub struct FrameMeta {
     pub frame_index: u64,
     /// The frame's target display time.
     pub target_timestamp_us: u64,
+    /// Whether this frame is a keyframe. The client's trust gate cannot recover from a broken
+    /// reference chain without it, so it travels on the wire (see [`crate::wire::Flags`]).
+    pub is_keyframe: bool,
 }
 
 /// How many repair shards to add.
@@ -279,11 +282,16 @@ impl Packetizer {
         let mut datagrams = Vec::with_capacity(total);
         for (fragment_index, shard) in shards.iter().enumerate() {
             let is_parity = fragment_index >= data_count;
-            let flags = if is_parity {
+            let mut flags = if is_parity {
                 Flags::NONE.with_parity()
             } else {
                 Flags::NONE
             };
+            // On every shard, parity included: an FEC-repaired frame is completed by whichever
+            // shard arrives last, and that is frequently a parity shard.
+            if meta.is_keyframe {
+                flags = flags.with_keyframe();
+            }
 
             let header = FragmentHeader {
                 frame_index: meta.frame_index,
@@ -365,6 +373,7 @@ mod tests {
         FrameMeta {
             frame_index: 1,
             target_timestamp_us: 11_111,
+        is_keyframe: false,
         }
     }
 

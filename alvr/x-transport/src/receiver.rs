@@ -75,6 +75,11 @@ pub struct DeliveredFrame {
     /// clock and this one share an epoch. Zero when they do not.
     pub released_at: Duration,
     pub outcome: FrameOutcome,
+    /// Whether the sender marked this frame a keyframe.
+    ///
+    /// The display gate needs it and nothing else on the wire could supply it: a hold is released
+    /// by a keyframe, and "keyframe" is a property of the encoder's output, not of the transport.
+    pub is_keyframe: bool,
     payload: Option<Vec<u8>>,
 }
 
@@ -200,6 +205,8 @@ impl std::error::Error for RecvError {}
 struct PartialFrame {
     first_arrival: Duration,
     target_timestamp_us: u64,
+    /// Learned from the first shard that arrives, whichever kind it is.
+    is_keyframe: bool,
     frame_len: u32,
     data_count: u16,
     parity_count: u16,
@@ -334,12 +341,17 @@ impl Receiver {
             .or_insert_with(|| PartialFrame {
                 first_arrival: now,
                 target_timestamp_us: header.target_timestamp_us,
+                is_keyframe: header.flags.is_keyframe(),
                 frame_len: header.frame_len,
                 data_count: header.data_count,
                 parity_count: header.parity_count,
                 shards: vec![None; header.data_count as usize + header.parity_count as usize],
                 received: 0,
             });
+
+        // Every shard carries the keyframe bit, so a frame whose first shard was lost still
+        // learns the truth from any later one.
+        entry.is_keyframe |= header.flags.is_keyframe();
 
         // A datagram that disagrees with the frame's established shape is a bug or an
         // attack; the frame it belongs to is not trustworthy, so the whole frame is.
@@ -482,6 +494,7 @@ impl Receiver {
             target_timestamp_us: frame.target_timestamp_us,
             released_at: now,
             outcome,
+            is_keyframe: frame.is_keyframe,
             payload,
         }
     }
@@ -547,6 +560,7 @@ mod tests {
                 FrameMeta {
                     frame_index,
                     target_timestamp_us: 11_111 * frame_index,
+                    is_keyframe: false,
                 },
                 bytes,
                 seq,
@@ -717,6 +731,69 @@ mod tests {
     }
 
     #[test]
+    fn a_keyframe_is_recognised_even_when_its_first_shard_is_lost() {
+        // The bits travel on *every* shard. If only the first carried it, the client would lose
+        // the one signal that releases its hold (ADR-0011) exactly when the link was bad enough
+        // to drop that shard — which is when it needs it. So: drop the first one and check that a
+        // later shard still tells the truth.
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Ratio { fraction: 0.2 });
+        let mut receiver = receiver();
+        let bytes = payload(SHARD * 4);
+        let mut seq = 0;
+        let (_, datagrams) = packetizer
+            .fragment(
+                FrameMeta {
+                    frame_index: 1,
+                    target_timestamp_us: 1,
+                    is_keyframe: true,
+                },
+                &bytes,
+                &mut seq,
+                None,
+            )
+            .unwrap();
+        assert!(datagrams.len() > 2, "need several shards for this test");
+
+        for datagram in datagrams.iter().skip(1) {
+            let _ = receiver.on_datagram(datagram, Duration::ZERO);
+        }
+
+        // Past the release deadline: `jitter_frames` is 1, so a lone frame is released when its
+        // deadline passes rather than when a later one completes.
+        let released = receiver.release(Duration::from_millis(50));
+        assert_eq!(released.len(), 1, "the frame did not complete");
+        assert!(
+            released[0].is_keyframe,
+            "a keyframe whose first shard was lost stopped being a keyframe"
+        );
+        assert!(released[0].payload().is_some());
+    }
+
+    #[test]
+    fn an_ordinary_frame_does_not_claim_to_be_a_keyframe() {
+        // The flag must mean something. A false positive would release a hold onto a frame whose
+        // reference chain is still broken.
+        let mut receiver = receiver();
+        let mut seq = 0;
+        let bytes = payload(SHARD * 2);
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
+        // `send` returns how many datagrams it was told to drop; nothing is dropped here.
+        let dropped = send(
+            &mut receiver,
+            &packetizer,
+            1,
+            &bytes,
+            &[],
+            Duration::ZERO,
+            &mut seq,
+        );
+        assert_eq!(dropped, 0);
+        let released = receiver.release(Duration::from_millis(50));
+        assert_eq!(released.len(), 1);
+        assert!(!released[0].is_keyframe);
+    }
+
+    #[test]
     fn duplicates_are_counted_not_stored() {
         let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
         let mut receiver = receiver();
@@ -727,6 +804,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
+                is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -760,6 +838,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 7,
                     target_timestamp_us: 1,
+                is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -824,6 +903,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
+                is_keyframe: true,
                 },
                 &payload(100),
                 &mut seq,
@@ -900,6 +980,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
+                is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -932,6 +1013,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
+                is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -977,6 +1059,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
+                is_keyframe: true,
                 },
                 &bytes,
                 &mut seq,
@@ -1017,6 +1100,7 @@ mod tests {
                 FrameMeta {
                     frame_index: 1,
                     target_timestamp_us: 1,
+                is_keyframe: true,
                 },
                 &payload(SHARD * 3),
                 &mut seq,

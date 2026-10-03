@@ -258,6 +258,11 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
                     frame_index,
                     target_timestamp_us: (frame_index as f64 * frame_interval.as_secs_f64() * 1e6)
                         as u64,
+                    // A keyframe every 30 frames, which is what a real encoder does between
+                    // requested IDRs. The flag is one bit and adds no bytes, so it changes no
+                    // scenario's delivery — it is here so the path that carries it is exercised
+                    // end to end rather than only in unit tests.
+                    is_keyframe: frame_index == 1 || frame_index.is_multiple_of(30),
                 },
                 &payload,
                 &mut 0,

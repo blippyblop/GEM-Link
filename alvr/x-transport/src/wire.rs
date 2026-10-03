@@ -38,6 +38,19 @@ impl Flags {
     pub const PARITY: u16 = 1 << 0;
     /// This datagram is a retransmission of one already sent.
     pub const RETRANSMIT: u16 = 1 << 1;
+    /// This datagram belongs to a keyframe.
+    ///
+    /// Carried on **every** shard of the frame, not just the first, because the receiver may
+    /// complete a frame from any subset of its shards — and after an FEC repair the shard that
+    /// arrives first is often a parity shard. A flag that only the first datagram carries is a
+    /// flag the client loses precisely when the link is bad, which is when it needs it.
+    ///
+    /// Why the media plane must carry this at all: ADR-0011's recovery is "hold, and wait for a
+    /// keyframe", and the trust gate has always *taken* an `is_keyframe` argument with nothing on
+    /// the wire to supply it. Without this bit the client cannot tell that the frame which
+    /// releases its hold has arrived, and the hold is a black screen — the failure this project
+    /// already shipped once.
+    pub const KEYFRAME: u16 = 1 << 2;
 
     pub const fn is_parity(self) -> bool {
         self.0 & Self::PARITY != 0
@@ -45,6 +58,15 @@ impl Flags {
 
     pub const fn is_retransmit(self) -> bool {
         self.0 & Self::RETRANSMIT != 0
+    }
+
+    pub const fn is_keyframe(self) -> bool {
+        self.0 & Self::KEYFRAME != 0
+    }
+
+    pub const fn with_keyframe(mut self) -> Self {
+        self.0 |= Self::KEYFRAME;
+        self
     }
 
     pub const fn with_parity(mut self) -> Self {
@@ -60,8 +82,11 @@ impl Flags {
     /// Reject anything this version does not define. An unknown flag means a peer that
     /// knows something we do not, and guessing is how a protocol version skew becomes a
     /// silent misread instead of an error.
+    /// Every bit must be one we define. A datagram with a bit we do not know is a datagram from
+    /// a newer sender being read by an older receiver, or a corrupt one — either way its meaning
+    /// is not something to guess at, so it is rejected rather than ignored.
     pub const fn is_valid(self) -> bool {
-        self.0 & !(Self::PARITY | Self::RETRANSMIT) == 0
+        self.0 & !(Self::PARITY | Self::RETRANSMIT | Self::KEYFRAME) == 0
     }
 }
 
