@@ -5,6 +5,7 @@ use crate::LOCAL_IP;
 use alvr_common::{ConResult, HandleTryAgain, ToCon, anyhow::Result};
 use alvr_session::{DscpTos, SocketBufferConfig};
 use socket2::{MaybeUninitSlice, Socket};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::ffi::c_int;
 use std::{
     cmp::Ordering,
@@ -19,6 +20,29 @@ pub const SHARD_PREFIX_SIZE: usize = mem::size_of::<u16>() // stream ID
     + mem::size_of::<u32>() // packet index
     + mem::size_of::<u32>() // shards count
     + mem::size_of::<u32>(); // shards index
+
+/// Datagrams this reader read out of the socket and then **threw away**, because no receive
+/// buffer was free — the consumer could not keep up, so there was nothing to assemble the
+/// packet into.
+///
+/// This is the client-side discard that every other counter misses. It is not the kernel's: the
+/// datagram was read successfully, so the socket's own drop counter stays zero. It is not the
+/// network's: the bytes arrived. And it is not the server's: the server sent the frame. It is
+/// *ours*, and until it is counted the loss looks like the wire's fault. See
+/// `VD_RE/50-grey-frame-experiments.md` — the server's `try_send` was measured at **0 drops over
+/// 5,296 frames** while this client lost 225, so this branch is where they went.
+static DISCARDED_NO_BUFFER: AtomicU64 = AtomicU64::new(0);
+
+/// Datagrams read off the socket, across every stream multiplexed on it.
+static DATAGRAMS_READ: AtomicU64 = AtomicU64::new(0);
+
+pub fn datagrams_read() -> u64 {
+    DATAGRAMS_READ.load(AtomicOrdering::Relaxed)
+}
+
+pub fn datagrams_discarded_no_buffer() -> u64 {
+    DISCARDED_NO_BUFFER.load(AtomicOrdering::Relaxed)
+}
 
 fn socket_peek(socket: &mut Socket, buffer: &mut [u8]) -> ConResult<usize> {
     #[cfg(windows)]
@@ -127,6 +151,8 @@ impl MultiplexedSocketReader for MultiplexedUdpReader {
 
         let mut prefix_bytes = [0; SHARD_PREFIX_SIZE];
         let peek_size = socket_peek(&mut self.inner, &mut prefix_bytes)?;
+        // A datagram is present and about to be consumed, whatever we then decide to do with it.
+        DATAGRAMS_READ.fetch_add(1, AtomicOrdering::Relaxed);
         if peek_size < SHARD_PREFIX_SIZE {
             return discard_and_try_again(&self.inner);
         }
@@ -174,7 +200,14 @@ impl MultiplexedSocketReader for MultiplexedUdpReader {
                     received_shard_indices: HashSet::with_capacity(maybe_shards_count),
                 })
         } else {
-            // This branch may be hit in case the thread related to the stream hangs for some reason
+            // No free buffer and nothing in progress to recycle: the consumer is far enough
+            // behind that every buffer we own is held by a packet it has not picked up yet. The
+            // datagram we just read is dropped, its frame can never be completed, and downstream
+            // it is indistinguishable from the network losing it. Counted, because it is ours.
+            //
+            // (This comment used to read "may be hit in case the thread related to the stream
+            // hangs for some reason". It is not a may-be-hit. On the rig this is the loss.)
+            DISCARDED_NO_BUFFER.fetch_add(1, AtomicOrdering::Relaxed);
             return discard_and_try_again(&self.inner);
         };
 

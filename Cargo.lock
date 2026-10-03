@@ -8433,6 +8433,7 @@ dependencies = [
  "alvr_common",
  "alvr_packets",
  "alvr_session",
+ "alvr_sockets",
  "alvr_system_info",
  "env_logger",
  "flate2",

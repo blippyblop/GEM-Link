@@ -185,7 +185,20 @@ pub struct TrustGate {
     blocked: Option<UntrustedReason>,
     missed_frames: u64,
     untrusted_frames: u64,
+    /// Consecutive untrusted frames, reset the moment a frame is trusted. This is what makes
+    /// "we just lost trust" distinguishable from "we have been untrusted for a while", which
+    /// is the difference between announcing a loss and re-announcing it forever.
+    untrusted_run: u64,
 }
+
+/// How often, in untrusted frames, the client re-asks for a keyframe while it is holding.
+///
+/// A liveness guard, not a nicety. The client can only leave a hold on a keyframe, and the
+/// encoder inserts an IDR only when asked — so a request that is never sent, or never
+/// answered, leaves the screen black for the rest of the session. On hardware that has
+/// already happened twice. One re-ask per ~1 s at 30 Hz is inaudible next to a black screen
+/// and is 30x below the per-frame flood this gate was written to avoid.
+pub const KEYFRAME_RETRY_FRAMES: u64 = 30;
 
 impl TrustGate {
     pub fn new() -> Self {
@@ -194,6 +207,7 @@ impl TrustGate {
             blocked: Some(UntrustedReason::NoKeyframeYet),
             missed_frames: 0,
             untrusted_frames: 0,
+            untrusted_run: 0,
         }
     }
 
@@ -242,13 +256,32 @@ impl TrustGate {
         // this gate exists to catch, so a clean decode is not evidence of anything.
 
         match self.blocked {
-            None => FrameTrust::Trusted,
+            None => {
+                self.untrusted_run = 0;
+                FrameTrust::Trusted
+            }
             Some(reason) => {
-                let first = self.untrusted_frames == 0;
+                self.untrusted_run += 1;
                 self.untrusted_frames += 1;
+                // `first` is the *transition* into untrusted, not the first time in the
+                // session. It used to be `untrusted_frames == 0`, which is true exactly once
+                // ever — so the second time the chain broke, the client held in silence and
+                // never asked for the keyframe that would release it. On hardware that was
+                // 84 frames decoded and 5,000 held: a permanently black screen.
+                let first = self.untrusted_run == 1;
                 FrameTrust::Untrusted { reason, first }
             }
         }
+    }
+
+    /// Should the client spend a control packet asking for a keyframe?
+    ///
+    /// True on the transition into untrusted, and then again every
+    /// [`KEYFRAME_RETRY_FRAMES`] untrusted frames, so a request that is never answered cannot
+    /// black the screen for the rest of the session.
+    pub fn should_ask_for_keyframe(&self) -> bool {
+        self.blocked.is_some()
+            && (self.untrusted_run == 1 || self.untrusted_run.is_multiple_of(KEYFRAME_RETRY_FRAMES))
     }
 
     /// Phase two: the decoder's answer.
@@ -461,6 +494,53 @@ mod tests {
         }
         // And the counter is right about what was lost: one gap, not fourteen.
         assert_eq!(gate.missed_frames(), 3);
+    }
+
+    #[test]
+    fn a_second_gap_asks_for_a_keyframe_again() {
+        // The bug that shipped to hardware. `first` was `untrusted_frames == 0`, which is true
+        // once per *session*: the first recovery worked, and the second time the chain broke
+        // the client held in silence. 84 frames decoded, 5,000 held, black screen.
+        let mut gate = TrustGate::new();
+        assert_eq!(present(&mut gate, 1, true, false), FrameTrust::Trusted);
+
+        // First loss, announced.
+        assert!(first(present(&mut gate, 5, false, false)));
+
+        // Recovered.
+        assert_eq!(present(&mut gate, 9, true, false), FrameTrust::Trusted);
+        assert_eq!(present(&mut gate, 10, false, false), FrameTrust::Trusted);
+
+        // Second loss: it must ask again.
+        assert!(
+            first(present(&mut gate, 14, false, false)),
+            "a second gap did not ask for a keyframe"
+        );
+        assert!(gate.should_ask_for_keyframe());
+    }
+
+    #[test]
+    fn a_long_hold_keeps_asking_at_a_bounded_rate() {
+        // Liveness. If the requested keyframe never arrives the client must not sit black
+        // forever, but it also must not ask once per frame.
+        let mut gate = TrustGate::new();
+        assert_eq!(present(&mut gate, 1, true, false), FrameTrust::Trusted);
+        assert!(matches!(
+            present(&mut gate, 5, false, false),
+            FrameTrust::Untrusted { .. }
+        ));
+
+        let mut asks = 0;
+        for index in 6..(6 + KEYFRAME_RETRY_FRAMES * 4) {
+            let _ = present(&mut gate, index, false, false);
+            if gate.should_ask_for_keyframe() {
+                asks += 1;
+            }
+        }
+        assert_eq!(
+            asks, 4,
+            "expected exactly one re-ask per {KEYFRAME_RETRY_FRAMES} frames"
+        );
     }
 
     #[test]

@@ -410,10 +410,14 @@ fn connection_pipeline(
                         if !submitted {
                             // The decoder refused it, so we have no frame and the next one's
                             // reference is broken. Same response as a lost frame: hold, and
-                            // optionally ask for a keyframe.
-                            if settings.connection.avoid_video_glitching
-                                && let Some(sender) = &mut *ctx.control_sender.lock()
-                            {
+                            // ask for a keyframe.
+                            //
+                            // UNCONDITIONAL. Gating this behind a setting is what turned the
+                            // hold into a permanent black screen: `avoid_video_glitching` is
+                            // stored `false` on the box, so the client held every frame and
+                            // never asked for the one thing that could release the hold. The
+                            // encoder inserts an IDR only when asked.
+                            if let Some(sender) = &mut *ctx.control_sender.lock() {
                                 sender.send(&ClientControlPacket::RequestIdr).ok();
                             }
                             warn!("Dropped video packet. Reason: Decoder saturation")
@@ -425,17 +429,19 @@ fn connection_pipeline(
                         // reliable control packet per frame — each answered by the sender with a
                         // keyframe — is a flood with a bitrate spike attached.
                         //
-                        // `avoid_video_glitching` now means exactly this and nothing else: it
-                        // used to be the switch for the invariant itself, which is how the
-                        // invariant came to be bypassed by default. It can no longer disable
-                        // holding an untrusted frame; it decides only whether we spend a round
-                        // trip and a keyframe asking to shorten the hold.
+                        // The request is UNCONDITIONAL (no setting can disable it) and it is
+                        // re-issued for every recovery, then every `KEYFRAME_RETRY_FRAMES` while
+                        // the hold lasts. Both halves are corrections to what shipped: gating it
+                        // behind `avoid_video_glitching` (stored `false` on the box) meant no
+                        // request at all, and `first` meaning "first time ever" meant the second
+                        // hold never asked. Either one blacks the screen for good, because the
+                        // encoder inserts an IDR only when asked.
+                        if trust.should_ask_for_keyframe()
+                            && let Some(sender) = &mut *ctx.control_sender.lock()
+                        {
+                            sender.send(&ClientControlPacket::RequestIdr).ok();
+                        }
                         if first {
-                            if settings.connection.avoid_video_glitching
-                                && let Some(sender) = &mut *ctx.control_sender.lock()
-                            {
-                                sender.send(&ClientControlPacket::RequestIdr).ok();
-                            }
                             warn!(
                                 "Holding video: frame_index={} is not trustworthy ({reason:?}); \
                                  {} frame(s) missed so far",

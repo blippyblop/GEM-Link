@@ -1459,9 +1459,7 @@ TCP: Slower than UDP, but more stable. Pick this if you experience video or audi
 
     #[schema(strings(
         display_name = "Ask for a keyframe when the picture is untrusted",
-        help = r#"When the client holds a frame because it cannot be reconstructed — the server discarded a frame, the network lost packets, or the decoder refused it — ask for a keyframe rather than waiting for the next scheduled one.
-
-Holding the last good frame is not optional and this setting does not change it: a frame the client cannot reconstruct is never presented, whatever this is set to (ADR-0011). What it controls is whether we spend a control packet and an encoder keyframe to shorten the hold. Off means longer holds and no bitrate spike."#
+        help = r#"Deprecated; has no effect. The client never presents a frame it cannot reconstruct and it always asks for a keyframe to end a hold — both are unconditional (ADR-0011) and neither can be switched off. It used to gate the keyframe request, and with it off the client held forever with no way back. Kept so existing session files still load."#
     ))]
     pub avoid_video_glitching: bool,
 

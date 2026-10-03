@@ -19,6 +19,10 @@
 mod tcp;
 mod udp;
 
+// The client-side discard counters. Re-exported so the harness (and any future dashboard) can
+// report what the socket layer threw away, which no other counter in the tree records.
+pub use udp::{datagrams_discarded_no_buffer, datagrams_read};
+
 use alvr_common::{
     AnyhowToCon, ConResult, HandleTryAgain, ToCon, anyhow::Result, parking_lot::Mutex,
 };

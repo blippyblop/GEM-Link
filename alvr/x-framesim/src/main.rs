@@ -920,6 +920,11 @@ fn main() {
                 start.elapsed(),
                 frames.load(Ordering::SeqCst)
             );
+            // A timeout is the *normal* end of a fixed-duration capture — the box script
+            // streams for 100 s and then stops — so it must still produce the CSV and the
+            // loss report. It used to print decode stats and exit, which silently threw the
+            // whole capture away: the first instrumented run reported nothing at all.
+            report(&samples, &bytes, &fov, &decode, start);
             decode.print_stats();
             exit(2);
         }
@@ -1029,6 +1034,18 @@ fn report(
             println!(
                 "[framesim]   server-reported cumulative discards at the last frame: {}",
                 s[n - 1].missed_frames
+            );
+
+            // What the *socket layer itself* threw away. This is the counter that decides
+            // between "the wire lost it" and "we did": a datagram discarded here was read out of
+            // the socket successfully, so the kernel's own drop counter stays at zero and the
+            // loss is indistinguishable from the network's.
+            let discarded = alvr_sockets::datagrams_discarded_no_buffer();
+            let read = alvr_sockets::datagrams_read();
+            println!(
+                "[framesim]   socket layer: {read} datagrams read, {discarded} discarded for want \
+                 of a free buffer ({:.2}% of reads)",
+                100.0 * discarded as f64 / read.max(1) as f64
             );
 
             // The client's own per-frame cost. The receive loop calls the decode callback
