@@ -54,6 +54,7 @@ pub mod pacer;
 pub mod packetizer;
 pub mod receiver;
 pub mod scheduler;
+pub mod sender;
 pub mod trust;
 pub mod wire;
 
@@ -75,6 +76,9 @@ pub use receiver::{
 };
 pub use scheduler::{
     Disposition, FrameScheduler, Roll, SchedulerConfig, SchedulerStats, TimebaseOffset,
+};
+pub use sender::{
+    FeedbackOutcome, FrameSend, MediaSender, RepairRefusal, SenderConfig, SenderStats,
 };
 pub use trust::{FrameTrust, SendDecision, SendGate, SuppressReason, TrustGate, UntrustedReason};
 pub use wire::{Flags, FragmentHeader, HEADER_LEN};
