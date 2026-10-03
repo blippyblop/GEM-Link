@@ -220,6 +220,9 @@ pub const FRAMES_PER_KEY: u64 = 90 * 60;
 /// with this one.
 const KEY_DERIVATION_CONTEXT: &[u8] = b"gemlink/media-key/v1";
 
+/// The domain separator for the feedback channel. Distinct from every media key.
+const FEEDBACK_KEY_CONTEXT: &[u8] = b"gemlink/feedback-key/v1";
+
 /// Derives media keys from one session secret, one per epoch.
 ///
 /// # Why an epoch and not the frame index
@@ -311,6 +314,31 @@ impl KeySchedule {
     /// express for the receiving side.
     pub fn cipher_for(&self, epoch: u16) -> MediaCipher {
         MediaCipher::new(&self.key_for(epoch))
+    }
+
+    /// The key for the **feedback channel**, domain-separated from every media key.
+    ///
+    /// It has to be a different key, and not for tidiness. A media datagram's nonce is
+    /// `(frame_index, fragment_index)`; a feedback message carries a frame index but no fragment
+    /// index, and the sending ends are different — so reusing one key would put two different
+    /// messages under one nonce the first time an attacker (or a bug) lined the numbers up, which is
+    /// the one thing ChaCha20-Poly1305 does not survive. The context string is what makes the
+    /// separation a property of the construction rather than of a caller remembering to pass
+    /// different bytes.
+    pub fn feedback_key(&self) -> [u8; KEY_LEN] {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.secret)
+            .expect("HMAC accepts a key of any length, including this one");
+        mac.update(FEEDBACK_KEY_CONTEXT);
+        let out = mac.finalize().into_bytes();
+
+        let mut key = [0u8; KEY_LEN];
+        key.copy_from_slice(&out);
+        key
+    }
+
+    /// A cipher for the feedback channel. See [`Self::feedback_key`].
+    pub fn cipher_for_feedback(&self) -> MediaCipher {
+        MediaCipher::new(&self.feedback_key())
     }
 }
 

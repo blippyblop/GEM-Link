@@ -47,7 +47,9 @@
 
 pub mod adaptive;
 pub mod crypto;
+pub mod datagram;
 pub mod fec;
+pub mod feedback;
 pub mod pacer;
 pub mod packetizer;
 pub mod receiver;
@@ -57,7 +59,15 @@ pub mod wire;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveParity, RatioChange};
 pub use crypto::{FRAMES_PER_KEY, KEY_LEN, KeyRing, KeySchedule, MediaCipher, MediaKeys};
+pub use datagram::{
+    Collector, DatagramSink, DatagramSource, Endpoint, LinkConfig, Queue, SinkError, SourceEvent,
+    in_memory_link,
+};
 pub use fec::{FecError, decode_striped as fec_decode_striped, encode as fec_encode};
+pub use feedback::{
+    Feedback, FeedbackError, FeedbackOpenError, FeedbackReceiver, FeedbackSender,
+    MAX_NACK_FRAGMENTS, nack_retry_interval,
+};
 pub use pacer::{Pacer, PacerConfig};
 pub use packetizer::{FrameMeta, Packetizer, ParityPolicy};
 pub use receiver::{
