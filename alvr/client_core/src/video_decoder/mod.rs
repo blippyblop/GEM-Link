@@ -1,6 +1,12 @@
 #[cfg(target_os = "android")]
 mod android;
 
+// The Steam Frame's decode path. aarch64 Linux decodes through a stateful M2M V4L2 device, which
+// this tree has never had: `video_decoder` was a stub everywhere except Android. Written against
+// Valve's own client for the same device (`SVLCodecV4L2`) — see VD_RE/52-frame-vrlink-client.md.
+#[cfg(target_os = "linux")]
+pub mod v4l2;
+
 use alvr_common::anyhow::Result;
 use alvr_session::{CodecType, MediacodecProperty};
 use std::time::Duration;
