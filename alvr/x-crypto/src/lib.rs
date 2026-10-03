@@ -8,8 +8,11 @@
 
 #![forbid(unsafe_code)]
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// The single supported Noise pattern: XX over 25519, ChaCha20-Poly1305,
 /// SHA256. One pattern, reviewed once, no negotiation surface.
@@ -66,6 +69,37 @@ pub fn fingerprint_of(public: &[u8]) -> String {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// The exporter — a session secret for a channel that is not this one
+//
+// A Noise session gives two ends a shared secret that never crossed the wire. The transport keys
+// are for the noise channel itself; anything *else* that needs a key (the media plane's
+// per-datagram AEAD, the feedback channel's) must derive one from the same session, and this is
+// how. HKDF-shaped, with a context string, because a key derived for one purpose must not be
+// usable for another.
+
+/// The domain separator for every exported key. Distinct per purpose, so a key exported for the
+/// feedback channel cannot open a media datagram.
+const EXPORTER_CONTEXT: &[u8] = b"gemlink/exporter/v1";
+
+/// Derive a 32-byte key from a Noise session, bound to `label`.
+///
+/// HMAC-SHA256 keyed by the handshake hash, over the context string and the label. The handshake
+/// hash is the right root: it is a function of every message of the handshake, so it is a secret
+/// both ends hold and an eavesdropper does not, and it is different for every session even if both
+/// static keys are the same.
+pub(crate) fn export(handshake_hash: &[u8], label: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(handshake_hash)
+        .expect("HMAC accepts a key of any length, including this one");
+    mac.update(EXPORTER_CONTEXT);
+    mac.update(label);
+    let out = mac.finalize().into_bytes();
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&out);
+    key
 }
 
 // ---------------------------------------------------------------------------
@@ -138,14 +172,37 @@ impl Handshake {
             .ok_or_else(|| "remote static not yet known".into())
     }
 
+    /// The session's handshake hash — the root every exported key is derived from.
+    ///
+    /// Only meaningful once [`Self::finished`] is true; before that the hash is incomplete and
+    /// baking it into a key would mean two ends deriving different ones.
+    pub fn session_hash(&self) -> Result<Vec<u8>, String> {
+        if !self.finished() {
+            return Err(
+                "the handshake is not finished, so its hash is not yet a shared secret".into(),
+            );
+        }
+        Ok(self.state.get_handshake_hash().to_vec())
+    }
+
+    /// Derive a key for a **different** channel from this session.
+    ///
+    /// See [`export`] for why the handshake hash is the root. `label` separates purposes: a key for
+    /// the feedback channel must not open a media datagram.
+    pub fn exporter(&self, label: &[u8]) -> Result<[u8; 32], String> {
+        Ok(export(&self.session_hash()?, label))
+    }
+
     /// Convert to the AEAD transport (consumes the handshake state).
     pub fn into_transport(self) -> Result<SecureTransport, String> {
+        let session_hash = self.session_hash()?;
         let transport = self
             .state
             .into_transport_mode()
             .map_err(|e| format!("into transport: {e:?}"))?;
         Ok(SecureTransport {
             state: transport,
+            session_hash,
             seq_in: 0,
             seq_out: 0,
         })
@@ -158,6 +215,7 @@ impl Handshake {
 
 pub struct SecureTransport {
     state: snow::TransportState,
+    session_hash: Vec<u8>,
     seq_in: u64,
     seq_out: u64,
 }
@@ -192,6 +250,14 @@ impl SecureTransport {
         Ok(n)
     }
 
+    /// Derive a key for a **different** channel from the session this transport came from.
+    ///
+    /// The same function as [`Handshake::exporter`], reachable after the conversion — a caller that
+    /// wants an exported key has no reason to keep the handshake state alive.
+    pub fn exporter(&self, label: &[u8]) -> [u8; 32] {
+        export(&self.session_hash, label)
+    }
+
     pub fn messages_sealed(&self) -> u64 {
         self.seq_out
     }
@@ -216,8 +282,8 @@ mod tests {
         let alice = Identity::generate().unwrap();
         let bob = Identity::generate().unwrap();
 
-        let mut init = Handshake::new(HandshakeRole::Initiator, &alice, &bob.public()).unwrap();
-        let mut resp = Handshake::new(HandshakeRole::Responder, &bob, &alice.public()).unwrap();
+        let mut init = Handshake::new(HandshakeRole::Initiator, &alice, bob.public()).unwrap();
+        let mut resp = Handshake::new(HandshakeRole::Responder, &bob, alice.public()).unwrap();
 
         // XX: initiator -> responder -> initiator (three empty-payload turns)
         let mut msg = [0u8; 256];
@@ -259,8 +325,8 @@ mod tests {
     fn tampered_messages_fail_closed() {
         let alice = Identity::generate().unwrap();
         let bob = Identity::generate().unwrap();
-        let mut init = Handshake::new(HandshakeRole::Initiator, &alice, &bob.public()).unwrap();
-        let mut resp = Handshake::new(HandshakeRole::Responder, &bob, &alice.public()).unwrap();
+        let mut init = Handshake::new(HandshakeRole::Initiator, &alice, bob.public()).unwrap();
+        let mut resp = Handshake::new(HandshakeRole::Responder, &bob, alice.public()).unwrap();
 
         let mut msg = [0u8; 256];
         while !init.finished() {
@@ -292,8 +358,8 @@ mod tests {
 
         // Bob paired with Mallory's key but Alice connects: the responder
         // pins Alice's actual key here to simulate the mismatch check.
-        let mut init = Handshake::new(HandshakeRole::Initiator, &alice, &mallory.public()).unwrap();
-        let mut resp = Handshake::new(HandshakeRole::Responder, &bob, &alice.public()).unwrap();
+        let mut init = Handshake::new(HandshakeRole::Initiator, &alice, mallory.public()).unwrap();
+        let mut resp = Handshake::new(HandshakeRole::Responder, &bob, alice.public()).unwrap();
 
         let mut msg = [0u8; 256];
         let n = init.write(&mut msg).unwrap();
@@ -319,5 +385,94 @@ mod tests {
         if !cfg!(feature = "insecure-debug-transport") {
             assert!(encryption_always_on());
         }
+    }
+
+    // -- the exporter ---------------------------------------------------------------------------
+
+    /// Run a full XX handshake between two identities and hand back both states.
+    fn completed_handshake() -> (Handshake, Handshake) {
+        let alice = Identity::generate().unwrap();
+        let bob = Identity::generate().unwrap();
+        let mut init = Handshake::new(HandshakeRole::Initiator, &alice, bob.public()).unwrap();
+        let mut resp = Handshake::new(HandshakeRole::Responder, &bob, alice.public()).unwrap();
+
+        let mut msg = [0u8; 256];
+        let n = init.write(&mut msg).unwrap();
+        resp.read(&msg[..n]).unwrap();
+        let n = resp.write(&mut msg).unwrap();
+        init.read(&msg[..n]).unwrap();
+        let n = init.write(&mut msg).unwrap();
+        resp.read(&msg[..n]).unwrap();
+
+        assert!(init.finished() && resp.finished());
+        (init, resp)
+    }
+
+    #[test]
+    fn both_ends_export_the_same_key_for_the_same_label() {
+        let (init, resp) = completed_handshake();
+
+        assert_eq!(
+            init.exporter(b"gemlink/feedback").unwrap(),
+            resp.exporter(b"gemlink/feedback").unwrap(),
+            "an exported key is shared by construction — it is a function of the handshake, and \
+             nothing about it is transmitted"
+        );
+    }
+
+    #[test]
+    fn a_label_separates_purposes() {
+        let (init, _resp) = completed_handshake();
+
+        assert_ne!(
+            init.exporter(b"gemlink/feedback").unwrap(),
+            init.exporter(b"gemlink/media").unwrap(),
+            "a key derived for one channel must not be usable for another"
+        );
+    }
+
+    #[test]
+    fn a_different_session_exports_a_different_key() {
+        let (first, _) = completed_handshake();
+        let (second, _) = completed_handshake();
+
+        assert_ne!(
+            first.exporter(b"gemlink/feedback").unwrap(),
+            second.exporter(b"gemlink/feedback").unwrap(),
+            "two sessions with different keys must not derive the same channel key; if they did, \
+             the derivation would not be bound to the session"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_handshake_refuses_to_export() {
+        let alice = Identity::generate().unwrap();
+        let bob = Identity::generate().unwrap();
+        let unfinished = Handshake::new(HandshakeRole::Initiator, &alice, bob.public()).unwrap();
+
+        assert!(
+            unfinished.exporter(b"gemlink/feedback").is_err(),
+            "the hash is only a shared secret once every handshake message is in it; baking a \
+             partial one into a key means the two ends derive different keys and neither can tell"
+        );
+    }
+
+    #[test]
+    fn the_exporter_survives_the_conversion_to_transport_mode() {
+        let (init, resp) = completed_handshake();
+        let before = init.exporter(b"gemlink/feedback").unwrap();
+
+        let transport = init.into_transport().unwrap();
+        assert_eq!(
+            transport.exporter(b"gemlink/feedback"),
+            before,
+            "a caller that wants an exported key has no reason to keep the handshake state alive, \
+             and `snow` drops the hash when the state is consumed"
+        );
+
+        assert_eq!(
+            transport.exporter(b"gemlink/feedback"),
+            resp.exporter(b"gemlink/feedback").unwrap()
+        );
     }
 }

@@ -9,7 +9,7 @@ use crate::{
 };
 use alvr_common::{
     ALVR_VERSION, AnyhowToCon, ConResult, ConnectionError, ConnectionState, LifecycleState,
-    dbg_connection, debug, error, info,
+    con_bail, dbg_connection, debug, error, info,
     parking_lot::{Condvar, Mutex, RwLock},
     wait_rwlock, warn,
 };
@@ -20,6 +20,7 @@ use alvr_packets::{
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
 use alvr_sockets::media::MediaSocket;
+use alvr_sockets::media_key::{MediaKeyExchange, MediaKeyRole};
 use alvr_sockets::{
     ControlSocketSender, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, PeerType, ProtoControlSocket,
     StreamSender, StreamSocketBuilder,
@@ -31,7 +32,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use x_crypto::fingerprint_of;
 use x_transport::DatagramSink;
+use x_transport::{FeedbackSender, KeySchedule};
 
 #[cfg(target_os = "android")]
 use crate::audio;
@@ -261,6 +264,72 @@ fn connection_pipeline(
         settings.connection.statistics_history_size,
     ));
 
+    // -----------------------------------------------------------------------------------------
+    // The media key, agreed before a single media datagram exists.
+    //
+    // A Noise-XX exchange on the control socket — reliable, ordered, and already carrying the
+    // stream configuration — from which both ends derive the keys the media plane is built on. The
+    // keys are never transmitted: an eavesdropper on this socket (which is still plaintext today)
+    // cannot read or forge a video datagram or a repair request.
+    //
+    // What it does not do is authenticate the peer. The identities are ephemeral and the peer's key
+    // is not pinned, so an *active* man in the middle can complete the exchange with each end
+    // separately. Closing that is pairing — `MediaKeyExchange::with_pinned_peer` is the whole of
+    // the change — and it is a product decision rather than a cryptographic one.
+    // -----------------------------------------------------------------------------------------
+    let mut media_key = MediaKeyExchange::new(MediaKeyRole::Client).to_con()?;
+    // The client answers; the server opens. `start` returning nothing is not a failure, it is which
+    // end of an XX handshake this is.
+    if let Some(opening) = media_key.start().to_con()? {
+        proto_control_socket
+            .send(&ClientControlPacket::MediaKeyHandshake(opening))
+            .to_con()?;
+    }
+
+    loop {
+        let message =
+            match proto_control_socket.recv::<ServerControlPacket>(HANDSHAKE_ACTION_TIMEOUT)? {
+                ServerControlPacket::MediaKeyHandshake(message) => message,
+                other => {
+                    // Named rather than dumped: `ServerControlPacket` is not `Debug`, and which variant
+                    // arrived is the whole of what matters.
+                    let name = match &other {
+                        ServerControlPacket::StartStream => "StartStream",
+                        ServerControlPacket::DecoderConfig(_) => "DecoderConfig",
+                        ServerControlPacket::Restarting => "Restarting",
+                        ServerControlPacket::KeepAlive => "KeepAlive",
+                        ServerControlPacket::RealTimeConfig(_) => "RealTimeConfig",
+                        ServerControlPacket::MediaKeyHandshake(_) => "MediaKeyHandshake",
+                        _ => "a reserved packet",
+                    };
+                    con_bail!(
+                        "expected a media key handshake message before streaming, got {name}; the \
+                     server and this client disagree about the session's shape"
+                    );
+                }
+            };
+
+        match media_key.advance(&message).to_con()? {
+            Some(reply) => proto_control_socket
+                .send(&ClientControlPacket::MediaKeyHandshake(reply))
+                .to_con()?,
+            None => break,
+        }
+    }
+
+    if !media_key.is_finished() {
+        con_bail!("the media key exchange ended without a key");
+    }
+    let media_key_schedule = KeySchedule::new(media_key.session_secret().to_con()?);
+    let feedback_cipher = media_key_schedule.cipher_for_feedback();
+    // The fingerprint is what a user would compare against the other screen when pairing exists.
+    // Until then it is a log line: an active man in the middle would show up here as a change, and
+    // nothing acts on that yet.
+    info!(
+        "Media plane keyed from the session handshake (peer {})",
+        fingerprint_of(&media_key.remote_static().to_con()?)
+    );
+
     let (mut control_sender, mut control_receiver) = proto_control_socket
         .split(STREAMING_RECV_TIMEOUT)
         .to_con()?;
@@ -348,6 +417,9 @@ fn connection_pipeline(
     let media_port = alvr_packets::media_port(settings.connection.stream_port);
     let media_socket = MediaSocket::bind_to(media_port, server_ip, settings.connection.dscp)?;
     let mut media_feedback_socket = media_socket.try_clone()?;
+    // Sealed, and the same session secret the media datagrams use — with different labels, so a
+    // NACK cannot be opened as a video shard or the reverse.
+    let mut feedback_sender = FeedbackSender::new(feedback_cipher);
 
     // The client's release policy, written out rather than derived, because the numbers are a
     // statement about this device and not about a profile in a bench.
@@ -374,6 +446,7 @@ fn connection_pipeline(
         let mut plane = crate::media_plane::MediaPlaneReceiver::new(
             media_socket,
             media_release_policy,
+            Some(media_key_schedule),
             Instant::now(),
         );
         move || {
@@ -501,16 +574,19 @@ fn connection_pipeline(
                                 continue;
                             }
 
-                            // **Unauthenticated**, and stated rather than implied: there is no
-                            // session key until the control channel is encrypted, and
-                            // `SecureControlSocket` is not wired into the live path.
-                            // `x-transport`'s sealed `FeedbackSender` is built and tested and waits
-                            // for a key source. What this exposes meanwhile is a forged retransmit.
+                            // Sealed under a key that never crossed the wire, carrying a monotonic
+                            // sequence only this end uses — so a captured NACK replayed at the
+                            // server is refused rather than answered, which is what stops a
+                            // retransmit storm being driven from a single packet.
                             let feedback = x_transport::Feedback::Nack {
                                 frame_index,
                                 fragments,
                             };
-                            if media_feedback_socket.send(&feedback.encode()).is_err() {
+                            let mut sealed = [0u8; x_transport::MAX_FEEDBACK_LEN];
+                            let Ok(len) = feedback_sender.seal(&feedback, &mut sealed) else {
+                                continue;
+                            };
+                            if media_feedback_socket.send(&sealed[..len]).is_err() {
                                 // Counted by the socket; the frame is lost and the FEC is what is
                                 // left, which the next release decides.
                             }
@@ -684,6 +760,11 @@ fn connection_pipeline(
                         event_queue
                             .lock()
                             .push_back(ClientCoreEvent::RealTimeConfig(config));
+                    }
+                    // The key exchange happens once, before streaming starts; a second one is either
+                    // a server that has lost track or a replay, and neither is worth acting on.
+                    Ok(ServerControlPacket::MediaKeyHandshake(_)) => {
+                        warn!("Ignoring a media key handshake after the session was keyed");
                     }
                     Ok(ServerControlPacket::StartStream) => {
                         error!("Unexpected StartStream paceket");

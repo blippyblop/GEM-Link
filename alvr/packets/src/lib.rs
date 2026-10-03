@@ -180,6 +180,13 @@ pub enum ServerControlPacket {
     Restarting,
     KeepAlive,
     RealTimeConfig(RealTimeConfig),
+    /// One message of the media-plane key exchange.
+    ///
+    /// Carried on the control socket because a Noise handshake needs a reliable ordered channel —
+    /// its messages each depend on the last — and the media socket is the one place that cannot
+    /// offer one. Nothing here *is* a key: the two ends derive the media and feedback keys from the
+    /// exchange, and neither is ever transmitted. See `alvr_sockets::media_key`.
+    MediaKeyHandshake(Vec<u8>),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
 }
@@ -222,6 +229,8 @@ pub enum ClientControlPacket {
         message: String,
     },
     ProximityState(bool),
+    /// One message of the media-plane key exchange. See [`ServerControlPacket::MediaKeyHandshake`].
+    MediaKeyHandshake(Vec<u8>),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
 }

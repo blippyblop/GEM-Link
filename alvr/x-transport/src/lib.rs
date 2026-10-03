@@ -66,7 +66,7 @@ pub use datagram::{
 };
 pub use fec::{FecError, decode_striped as fec_decode_striped, encode as fec_encode};
 pub use feedback::{
-    Feedback, FeedbackError, FeedbackOpenError, FeedbackReceiver, FeedbackSender,
+    Feedback, FeedbackError, FeedbackOpenError, FeedbackReceiver, FeedbackSender, MAX_FEEDBACK_LEN,
     MAX_NACK_FRAGMENTS, nack_retry_interval,
 };
 pub use pacer::{Pacer, PacerConfig};

@@ -262,6 +262,7 @@ dependencies = [
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "x-crypto",
  "x-transport",
 ]
 
@@ -8340,6 +8341,7 @@ dependencies = [
 name = "x-crypto"
 version = "21.0.0-dev14"
 dependencies = [
+ "hmac",
  "serde",
  "sha2",
  "snow",

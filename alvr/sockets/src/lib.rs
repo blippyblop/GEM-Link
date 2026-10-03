@@ -1,6 +1,9 @@
 mod control_socket;
 /// The media plane's datagram plumbing — one UDP socket, as `x-transport`'s sink and source.
 pub mod media;
+/// The session key the media plane is built on: a Noise-XX exchange over the control channel, and
+/// the keys exported from it. Nothing here is transmitted.
+pub mod media_key;
 mod secure_control_socket;
 mod stream_socket;
 
@@ -205,9 +208,97 @@ pub enum ServerConnectionResult {
     Restarting,
 }
 
+/// Run the media-key exchange as the responding half of a pair.
+///
+/// The server opens (it is the end that makes the outgoing connection), so this side sends first
+/// and expects two more messages. The role split is a convention both ends have to hold; it lives
+/// in `media_key` so it is written down once.
+fn negotiate_media_key(
+    control_socket: &mut ProtoControlSocket,
+    timeout: Duration,
+) -> ConResult<x_transport::KeySchedule> {
+    let mut exchange =
+        media_key::MediaKeyExchange::new(media_key::MediaKeyRole::Server).to_con()?;
+
+    let mut message = match exchange.start().to_con()? {
+        Some(message) => message,
+        // Not reachable — the server initiates, so it always has an opening message — but a
+        // `None` that silently skipped the exchange would be a session with no key at all.
+        None => con_bail!("the server half of the media key exchange produced no opening message"),
+    };
+
+    loop {
+        control_socket
+            .send(&ServerControlPacket::MediaKeyHandshake(message))
+            .to_con()?;
+
+        match control_socket.recv::<ClientControlPacket>(timeout)? {
+            ClientControlPacket::MediaKeyHandshake(reply) => {
+                match exchange.advance(&reply).to_con()? {
+                    Some(next) => message = next,
+                    None => break,
+                }
+            }
+            _ => con_bail!("Got an unexpected packet during the media key exchange"),
+        }
+    }
+
+    if !exchange.is_finished() {
+        con_bail!("The media key exchange ended without a key");
+    }
+
+    info!(
+        "Media plane keyed from the session handshake (peer {})",
+        x_crypto::fingerprint_of(&exchange.remote_static().to_con()?)
+    );
+
+    Ok(x_transport::KeySchedule::new(
+        exchange.session_secret().to_con()?,
+    ))
+}
+
+/// The responding half of the media-key exchange. See [`negotiate_media_key`].
+fn negotiate_media_key_as_client(
+    control_socket: &mut ProtoControlSocket,
+    timeout: Duration,
+) -> ConResult<x_transport::KeySchedule> {
+    let mut exchange =
+        media_key::MediaKeyExchange::new(media_key::MediaKeyRole::Client).to_con()?;
+
+    // A client owes nothing until the server's opening message arrives.
+    if exchange.start().to_con()?.is_some() {
+        con_bail!("the client half of the media key exchange tried to speak first");
+    }
+
+    loop {
+        let message = match control_socket.recv::<ServerControlPacket>(timeout)? {
+            ServerControlPacket::MediaKeyHandshake(message) => message,
+            _ => con_bail!("Got an unexpected packet during the media key exchange"),
+        };
+
+        match exchange.advance(&message).to_con()? {
+            Some(reply) => control_socket
+                .send(&ClientControlPacket::MediaKeyHandshake(reply))
+                .to_con()?,
+            None => break,
+        }
+    }
+
+    if !exchange.is_finished() {
+        con_bail!("The media key exchange ended without a key");
+    }
+
+    Ok(x_transport::KeySchedule::new(
+        exchange.session_secret().to_con()?,
+    ))
+}
+
 pub struct SocketConnection {
     control_socket: ProtoControlSocket,
     stream_socket: StreamSocket,
+    /// The session key the media plane is built on, agreed during the handshake and never
+    /// transmitted. See [`media_key`].
+    media_keys: x_transport::KeySchedule,
 }
 
 impl SocketConnection {
@@ -221,6 +312,23 @@ impl SocketConnection {
         let client_ip = control_socket.inner.peer_addr().to_con()?.ip();
 
         control_socket.send(&stream_config_packet).to_con()?;
+
+        // -----------------------------------------------------------------------------------
+        // The media key, agreed before a single media datagram exists.
+        //
+        // A Noise-XX exchange on the control socket — reliable, ordered, and already carrying the
+        // stream configuration. Both ends derive the keys the media plane is built on from the
+        // handshake, and **neither is ever sent**: an eavesdropper on this socket (which is still
+        // plaintext today) cannot read or forge a video datagram or a repair request. What it does
+        // not do is authenticate the peer — the identities are ephemeral and unpinned, so an
+        // *active* man in the middle can complete the exchange with each end separately. Closing
+        // that is pairing, and `media_key::MediaKeyExchange::with_pinned_peer` is the whole of the
+        // change.
+        //
+        // It has to happen here rather than in either caller: this is the only place that holds the
+        // unsplit control socket, and the exchange is request/response.
+        // -----------------------------------------------------------------------------------
+        let media_keys = negotiate_media_key(&mut control_socket, timeout)?;
 
         control_socket
             .send(&ServerControlPacket::StartStream)
@@ -244,7 +352,16 @@ impl SocketConnection {
         Ok(Self {
             control_socket,
             stream_socket,
+            media_keys,
         })
+    }
+
+    /// The session key for the media plane.
+    ///
+    /// The video datagrams and the feedback channel are both keyed from it, under different labels,
+    /// so a repair request cannot be replayed as a video shard or the reverse.
+    pub fn media_keys(&self) -> &x_transport::KeySchedule {
+        &self.media_keys
     }
 
     // Note: the timeout resets after each internal operation
@@ -281,9 +398,15 @@ impl SocketConnection {
             timeout,
         )?;
 
+        // The mirror of the server's exchange. Unused today — `client_core` runs its own, inline,
+        // because it interleaves the stream-config read with it — but left correct rather than
+        // leaving a second way into a session that has no key.
+        let media_keys = negotiate_media_key_as_client(&mut control_socket, timeout)?;
+
         Ok(ServerConnectionResult::Connected(Self {
             control_socket,
             stream_socket,
+            media_keys,
         }))
     }
 

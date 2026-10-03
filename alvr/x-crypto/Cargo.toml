@@ -8,6 +8,9 @@ authors = ["GemLink contributors"]
 description = "GemLink transport security: Noise-XX handshakes + AEAD media framing (encrypted always-on; plaintext exists only under the insecure-debug-transport feature for protocol debugging)"
 
 [dependencies]
+# The exporter's PRF. HMAC-SHA256 keyed by the Noise handshake hash — the standard construction, and
+# the same one the media plane uses to derive per-epoch keys.
+hmac = "0.12"
 snow = "0.9"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

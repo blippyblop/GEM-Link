@@ -1035,6 +1035,14 @@ fn connection_pipeline(
         initial_settings.connection.dscp,
     )?;
     let mut media_receive_socket = media_socket.try_clone()?;
+
+    // The key the media plane is built on, agreed over the control socket during the handshake and
+    // **never transmitted** — so a NACK is authenticated and a video datagram is sealed, and an
+    // eavesdropper on the control socket cannot forge either. It is the same session secret the
+    // client derived, under a different label for each purpose.
+    let media_keys = socket.media_keys().clone();
+    let media_cipher = media_keys.cipher_for_feedback();
+    let mut feedback_receiver = x_transport::FeedbackReceiver::new(media_cipher);
     let mut video_sender = MediaSender::new(
         SenderConfig::matching_policy(
             initial_settings.connection.packet_size as usize,
@@ -1083,17 +1091,16 @@ fn connection_pipeline(
                 // the sender is the thing that must act on them, and this loop runs at the frame
                 // rate, which is the rate a repair is useful at.
                 //
-                // **Unauthenticated, and that is a stated gap rather than an accident.** There is
-                // no session key to seal them with until the control channel is encrypted —
-                // `SecureControlSocket` exists and is not wired into the live path. The sealed
-                // `FeedbackSender`/`FeedbackReceiver` in `x-transport` are built and tested and
-                // waiting for a key source; until then a NACK in the clear is the difference
-                // between a repaired frame and a lost one, and what it exposes is a forged
-                // retransmit.
+                // Sealed under the session key, and replay-protected by the sequence the client
+                // puts in every message — so a captured NACK replayed here is refused rather than
+                // answered, which is what stops a retransmit storm being driven from one packet.
                 loop {
                     match media_receive_socket.recv(&mut feedback_buffer, Duration::ZERO) {
                         SourceEvent::Datagram => {
-                            let Ok(feedback) = Feedback::decode(&feedback_buffer) else {
+                            let Ok(Some(feedback)) = feedback_receiver.open(&feedback_buffer)
+                            else {
+                                // Authentic-but-replayed, or not authentic at all. Either way there
+                                // is nothing to act on and the counters hold the record.
                                 continue;
                             };
                             let now = timebase.from_local(session_start.elapsed());

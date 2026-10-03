@@ -188,10 +188,19 @@ pub struct MediaPlaneReceiver {
 impl MediaPlaneReceiver {
     /// `socket` is the caller's: the port and the QoS marking come from the session, and a media
     /// plane that bound its own would be a second source of truth for both.
-    pub fn new(socket: MediaSocket, policy: ReleasePolicy, now: Instant) -> Self {
+    ///
+    /// `keys` is the session's media schedule, derived from the control channel's Noise exchange
+    /// and never transmitted. `None` runs the plane in the clear, which is what a bench or a
+    /// recording wants and what a session must not do.
+    pub fn new(
+        socket: MediaSocket,
+        policy: ReleasePolicy,
+        keys: Option<x_transport::KeySchedule>,
+        now: Instant,
+    ) -> Self {
         Self {
             source: socket,
-            plane: VideoPlane::new(policy, now),
+            plane: VideoPlane::new(policy, keys, now),
         }
     }
 
@@ -361,9 +370,13 @@ pub struct VideoPlane {
 }
 
 impl VideoPlane {
-    pub fn new(policy: ReleasePolicy, now: Instant) -> Self {
+    pub fn new(
+        policy: ReleasePolicy,
+        keys: Option<x_transport::KeySchedule>,
+        now: Instant,
+    ) -> Self {
         Self {
-            receiver: Receiver::new(policy, None),
+            receiver: Receiver::new(policy, keys.map(x_transport::MediaKeys::rotating)),
             trust: x_transport::TrustGate::new(),
             stall: StuckDetector::new(now),
             started: now,
@@ -567,7 +580,7 @@ mod tests {
 
     #[test]
     fn a_clean_stream_presents_every_frame() {
-        let mut plane = VideoPlane::new(policy(), Instant::now());
+        let mut plane = VideoPlane::new(policy(), None, Instant::now());
         let mut source = ReplaySource::new(stream(10, 4, ParityPolicy::Off, 30));
 
         let now = Instant::now();
@@ -589,7 +602,7 @@ mod tests {
     #[test]
     fn loss_inside_the_fec_budget_is_repaired_and_never_held() {
         // The whole point of the media plane: a datagram is lost, the frame is not.
-        let mut plane = VideoPlane::new(policy(), Instant::now());
+        let mut plane = VideoPlane::new(policy(), None, Instant::now());
         let mut source = LossySource::new(
             ReplaySource::new(stream(20, 8, ParityPolicy::Ratio { fraction: 0.25 }, 30)),
             0x5EED,
@@ -623,7 +636,7 @@ mod tests {
     fn loss_beyond_the_budget_is_held_and_never_presented() {
         // ADR-0011. With no parity, a dropped datagram loses a frame; a frame that could not be
         // rebuilt must not reach the display path at all.
-        let mut plane = VideoPlane::new(policy(), Instant::now());
+        let mut plane = VideoPlane::new(policy(), None, Instant::now());
         let mut source = LossySource::new(
             ReplaySource::new(stream(40, 8, ParityPolicy::Off, 30)),
             0xC0FFEE,
@@ -663,7 +676,7 @@ mod tests {
     #[test]
     fn a_keyframe_after_a_loss_releases_the_hold() {
         // The recovery path end to end, including the wire bit that makes it possible.
-        let mut plane = VideoPlane::new(policy(), Instant::now());
+        let mut plane = VideoPlane::new(policy(), None, Instant::now());
         let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
         let bytes = payload(4);
         let mut seq = 0;
@@ -754,7 +767,7 @@ mod tests {
     #[test]
     fn a_silent_link_asks_for_a_keyframe_then_resets() {
         // The ladder, on the receive path this time rather than the decoder's.
-        let mut plane = VideoPlane::new(policy(), Instant::now());
+        let mut plane = VideoPlane::new(policy(), None, Instant::now());
         let now = Instant::now();
 
         assert!(plane.release(now).is_empty());
@@ -793,7 +806,7 @@ mod tests {
             deadline: Duration::from_millis(30),
             jitter_frames: 0,
         };
-        let mut plane = VideoPlane::new(hold, Instant::now());
+        let mut plane = VideoPlane::new(hold, None, Instant::now());
         let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
         let bytes = payload(8);
         let mut seq = 0;
@@ -956,7 +969,7 @@ mod tests {
         };
         let mut socket = socket_from(receiver);
         socket.accept_only_from(sender.local_addr().unwrap());
-        let mut plane = MediaPlaneReceiver::new(socket, policy, now);
+        let mut plane = MediaPlaneReceiver::new(socket, policy, None, now);
 
         let mut trace = LatencyTrace::new(64);
         let (actions, open) = plane.poll(&mut trace, now, Duration::ZERO);
