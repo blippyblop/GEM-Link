@@ -42,6 +42,10 @@ const READ_INFORMATIVE_MARGIN: f64 = 1.0;
 /// [`BitrateManager::report_client_read_rate`].
 const READ_CEILING_DECAY: f64 = 0.95;
 
+/// The lowest the read-rate ceiling may fall to. See `report_client_read_rate`: below this the stream
+/// is throttling itself, not following the client.
+const MIN_READ_CEILING_PER_SEC: u32 = 80;
+
 /// How much of the measured read rate the sender plans to use. See
 /// [`BitrateManager::delivery_budget_per_sec`]: under one, because the sensor is a lower bound.
 const DELIVERY_BUDGET_FRACTION: f64 = 0.7;
@@ -259,8 +263,13 @@ impl BitrateManager {
             return;
         }
 
+        // **With a floor.** Once the ceiling reaches zero the divisor is pinned at its maximum and the
+        // frame budget at its minimum, and the stream throttles itself to a few frames a second for
+        // the rest of the session — measured: a run that presented 307 frames settled at `budget 0`,
+        // `1 frame in 12`. A client that genuinely reads nothing is a dead client, and that is the
+        // stall ladder's judgement to make, not the budget's.
         let decayed = (self.read_ceiling_per_sec as f64 * READ_CEILING_DECAY) as u32;
-        self.read_ceiling_per_sec = per_sec.max(decayed);
+        self.read_ceiling_per_sec = per_sec.max(decayed).max(MIN_READ_CEILING_PER_SEC);
         if self.read_ceiling_per_sec > 0 {
             self.delivery_budget_per_sec =
                 Some(self.read_ceiling_per_sec as f64 * DELIVERY_BUDGET_FRACTION);
