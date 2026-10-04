@@ -739,6 +739,30 @@ fn main() {
     let ctx_for_cb = Arc::clone(&ctx);
     let decode_cb = Arc::clone(&decode);
 
+    // Decode runs on its own thread, **not** in the receive loop.
+    //
+    // The receive loop calls the callback synchronously, so a callback that decodes stops the loop
+    // reading for the whole decode. On a machine that cannot decode in real time — this rig, a
+    // 2-core host running an aarch64 client under qemu-user — the media socket then backs up and
+    // the kernel discards datagrams, which presents as network loss and is nothing of the kind.
+    // Measured before this change: the media socket's drop counter climbing ~4000/s while the
+    // callback was busy, and the plane reporting `0 repaired by FEC` because ~50 % loss is past
+    // what any code can cover. The real client (`client_openxr`) has always enqueued to its decoder
+    // thread for exactly this reason; the harness now does the same.
+    //
+    // The queue is small and bounded, and a full queue **drops the unit and counts it**: the
+    // alternative — blocking — backs the socket up and loses every frame's fragments rather than
+    // one frame.
+    let (au_tx, au_rx) = std::sync::mpsc::sync_channel::<(Duration, Vec<u8>)>(8);
+    let decode_for_worker = Arc::clone(&decode);
+    let ctx_for_worker = Arc::clone(&ctx);
+    thread::spawn(move || {
+        while let Ok((header_ts, nal)) = au_rx.recv() {
+            decode_for_worker.on_access_unit(Some(&ctx_for_worker), header_ts, &nal);
+        }
+    });
+    let au_dropped = Arc::new(AtomicUsize::new(0));
+
     let frames_seen = Arc::clone(&frames);
     let bytes_seen = Arc::clone(&bytes);
     let samples_seen = Arc::clone(&samples);
@@ -765,7 +789,12 @@ fn main() {
         // interval is the leading hypothesis for the loss: the receive loop calls us
         // synchronously, so a slow decode backs the socket up and the kernel starts
         // discarding — which looks exactly like the network losing frames.
-        decode_cb.on_access_unit(Some(&ctx_for_cb), header_ts, nal);
+        // Hand the access unit to the decode thread and return at once — see the thread above for
+        // why the loop must not decode. What remains here is only what has to be read
+        // *synchronously*: the frame identity, the compositor metadata and the counters.
+        if au_tx.try_send((header_ts, nal.to_vec())).is_err() {
+            au_dropped.fetch_add(1, Ordering::SeqCst);
+        }
         let client_ms = arrived.elapsed().as_secs_f64() * 1e3;
 
         if let Ok(mut s) = samples_seen.lock() {
@@ -782,8 +811,9 @@ fn main() {
 
         if first_frame.swap(false, Ordering::SeqCst) || n % 60 == 0 {
             println!(
-                "[framesim] video frame #{n} ts={header_ts:?} bytes={}",
-                nal.len()
+                "[framesim] video frame #{n} ts={header_ts:?} bytes={} au_dropped={}",
+                nal.len(),
+                au_dropped.load(Ordering::SeqCst),
             );
         }
 
