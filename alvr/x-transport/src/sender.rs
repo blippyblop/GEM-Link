@@ -251,6 +251,14 @@ struct LossWindow {
     frames: u64,
     datagrams_sent: u64,
     fragments_requested: u64,
+    /// Fragments the client asked for and then **received late** — after the frame was gone.
+    ///
+    /// Carried in the window rather than subtracted on arrival, because the window is what the ratio
+    /// is computed from and it resets: a correction applied once against a window holding thousands
+    /// of requests is a correction that does not exist. This is the difference between a loss
+    /// measurement and a queueing measurement, and the parity controller was being fed the second
+    /// while believing it had the first.
+    late_fragments: u64,
 }
 
 impl LossWindow {
@@ -261,7 +269,8 @@ impl LossWindow {
             // Clamped: a client that asks for the same fragment repeatedly — which a real one does,
             // see `nack_retry_interval` — would otherwise report a loss above 100 %. Erring high is
             // the safe direction for a parity estimate, but above 1.0 it is not an estimate at all.
-            (self.fragments_requested as f64 / self.datagrams_sent as f64).min(1.0)
+            let genuinely_missing = self.fragments_requested.saturating_sub(self.late_fragments);
+            (genuinely_missing as f64 / self.datagrams_sent as f64).min(1.0)
         }
     }
 
@@ -269,6 +278,7 @@ impl LossWindow {
         self.frames = 0;
         self.datagrams_sent = 0;
         self.fragments_requested = 0;
+        self.late_fragments = 0;
     }
 }
 
@@ -705,12 +715,12 @@ impl MediaSender {
                 // A NACK is the only loss signal the sender has, and a client that is behind NACKs
                 // fragments that are not lost — they are queued behind it. Nothing distinguishes the
                 // two locally, which is why the client reports the late arrivals it can count:
-                // requests that *were* answered, after the frame was gone. Subtract them, then let
-                // the controller look at what is left. Without this it read a queued receiver as a
-                // lossy link and answered with parity, which queued behind the same backlog — 50 %
-                // of the fresh traffic at the layout's ceiling, repairing 3 frames in 4 200.
-                self.loss_window.fragments_requested =
-                    self.loss_window.fragments_requested.saturating_sub(*late as u64);
+                // requests that *were* answered, after the frame was gone. Adding them to the window
+                // (not subtracting them once) is what makes the ratio that the controller sees a
+                // loss measurement rather than a queueing measurement. Without it the controller
+                // answered a queued receiver with parity, which queued behind the same backlog —
+                // 50 % of the fresh traffic at the layout's ceiling, repairing 3 frames in 4200.
+                self.loss_window.late_fragments += *late as u64;
                 self.adapt_parity();
 
                 FeedbackOutcome::QueueDelay { micros: *micros }
@@ -948,6 +958,114 @@ mod tests {
         assert_eq!(repairs.datagrams()[0], original[1]);
         assert_eq!(repairs.datagrams()[1], original[2]);
         assert_eq!(sender.stats().retransmitted_datagrams, 2);
+    }
+
+    /// The parity controller must not read a **queued** client as a lossy link.
+    ///
+    /// A late arrival was asked for, came, and was discarded because the frame was already gone —
+    /// so it is not loss. It has to be carried in the window rather than subtracted when it is
+    /// reported, because the window is what the ratio is computed from and it resets: one
+    /// subtraction against a window holding thousands of requests does nothing, which is exactly
+    /// how this correction was written the first time.
+    #[test]
+    fn late_arrivals_are_not_loss() {
+        let mut sender = sender(ParityPolicy::Ratio { fraction: 0.1 });
+        let mut sink = Collector::new();
+
+        // Five frames: below the window, so nothing is adapted yet.
+        for i in 0..5u64 {
+            sender.send_frame(
+                &mut sink,
+                meta(i, i * 33_000),
+                &payload(4),
+                Duration::from_millis(i * 33),
+            );
+        }
+
+        // The client asks for three fragments that had not arrived...
+        let mut repairs = Collector::new();
+        sender.on_feedback(
+            &mut repairs,
+            &Feedback::Nack {
+                frame_index: 2,
+                fragments: vec![0, 1, 2],
+            },
+            Duration::from_millis(100),
+        );
+
+        // ...and then reports that they did arrive, late, after the frame was released.
+        sender.on_feedback(
+            &mut repairs,
+            &Feedback::QueueDelay {
+                micros: 18_000,
+                late: 3,
+            },
+            Duration::from_millis(110),
+        );
+
+        // Cross the window so the controller looks at it.
+        for i in 5..9u64 {
+            sender.send_frame(
+                &mut sink,
+                meta(i, i * 33_000),
+                &payload(4),
+                Duration::from_millis(i * 33),
+            );
+        }
+
+        assert_eq!(
+            sender.stats().last_loss,
+            0.0,
+            "fragments that arrived late were reported as loss, so the controller will answer a \
+             queued client with parity it cannot read in time"
+        );
+    }
+
+    #[test]
+    fn fragments_that_never_arrive_are_still_loss() {
+        // The other half: the correction must not swallow real loss, or the parity would never rise
+        // on a link that is genuinely losing.
+        let mut sender = sender(ParityPolicy::Ratio { fraction: 0.1 });
+        let mut sink = Collector::new();
+        for i in 0..5u64 {
+            sender.send_frame(
+                &mut sink,
+                meta(i, i * 33_000),
+                &payload(4),
+                Duration::from_millis(i * 33),
+            );
+        }
+
+        let mut repairs = Collector::new();
+        sender.on_feedback(
+            &mut repairs,
+            &Feedback::Nack {
+                frame_index: 2,
+                fragments: vec![0, 1, 2],
+            },
+            Duration::from_millis(100),
+        );
+        sender.on_feedback(
+            &mut repairs,
+            &Feedback::QueueDelay {
+                micros: 18_000,
+                late: 1,
+            },
+            Duration::from_millis(110),
+        );
+        for i in 5..9u64 {
+            sender.send_frame(
+                &mut sink,
+                meta(i, i * 33_000),
+                &payload(4),
+                Duration::from_millis(i * 33),
+            );
+        }
+
+        assert!(
+            sender.stats().last_loss > 0.0,
+            "real loss must survive the late-arrival correction"
+        );
     }
 
     /// The client asks again when a repair does not arrive, which is correct of it — so the *sender*
