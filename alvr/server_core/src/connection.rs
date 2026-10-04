@@ -51,6 +51,12 @@ use x_transport::{
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+/// How often the send loop services the client's repair requests while it waits for the next frame.
+///
+/// A repair is useful only if it arrives inside the **client's** repair window, which is a few
+/// milliseconds — so the sender has to look at its feedback socket far more often than once per
+/// frame. See the note on the loop in `connection_pipeline`.
+const FEEDBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
@@ -1106,9 +1112,21 @@ fn connection_pipeline(
             let mut feedback_buffer = Vec::with_capacity(2048);
 
             while is_streaming(&client_hostname) {
-                // The client's repair requests, polled here rather than on a thread of their own:
-                // the sender is the thing that must act on them, and this loop runs at the frame
-                // rate, which is the rate a repair is useful at.
+                // The client's repair requests, **serviced on a millisecond cadence rather than a
+                // frame cadence**.
+                //
+                // This used to drain the feedback socket once per iteration and then block for a
+                // whole `STREAMING_RECV_TIMEOUT` on the next frame, on the reasoning that the loop
+                // "runs at the frame rate, which is the rate a repair is useful at". It does not.
+                // A repair is useful only if it arrives inside the **client's** repair window, which
+                // is a few milliseconds: at 30 Hz a NACK arriving just after the drain waited 33 ms
+                // for the next iteration, so every retransmit landed after the client had already
+                // released the frame. Measured on the rig: the client reading 525 datagrams/s, the
+                // link loss ~15 %, and 12 % of frames presented against 2771 held — with ~13 000
+                // repair requests answered too late to matter. The repair path existed and was
+                // decorative.
+                //
+                // The wait below is therefore short, and this drain runs between every chunk of it.
                 //
                 // Sealed under the session key, and replay-protected by the sequence the client
                 // puts in every message — so a captured NACK replayed here is refused rather than
@@ -1139,7 +1157,7 @@ fn connection_pipeline(
                 let VideoPacket {
                     mut header,
                     payload,
-                } = match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
+                } = match video_channel_receiver.recv_timeout(FEEDBACK_POLL_INTERVAL) {
                     Ok(packet) => packet,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
