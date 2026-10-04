@@ -173,7 +173,11 @@ pub enum MediaPlaneAction {
     Reset { stalled_for: Duration },
     /// The client's own queueing delay, to be carried back to the sender. The only message either
     /// end sends that is about the *receiver* rather than a frame.
-    QueueDelay { micros: u32, late_per_mille: u16 },
+    QueueDelay {
+        micros: u32,
+        late_per_mille: u16,
+        missing_per_mille: u16,
+    },
 }
 
 /// The client's video receive path, driven by a socket.
@@ -363,7 +367,11 @@ pub enum PlaneEvent {
     Reset { stalled_for: Duration },
     /// How far behind the client is reading, for the sender. See
     /// [`FeedbackOutcome::QueueDelay`](x_transport::FeedbackOutcome::QueueDelay).
-    QueueDelay { micros: u32, late_per_mille: u16 },
+    QueueDelay {
+        micros: u32,
+        late_per_mille: u16,
+        missing_per_mille: u16,
+    },
 }
 
 /// Counters, because a receive path whose behaviour is only visible in the picture cannot be
