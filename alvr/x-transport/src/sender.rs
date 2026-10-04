@@ -226,6 +226,9 @@ pub struct SenderStats {
     /// Frames not sent because the bootstrap was waiting for the one before. Normally zero outside a
     /// bootstrap, and large inside one — the wait is the mechanism.
     pub frames_held_for_bootstrap: u64,
+    /// Frames not sent because their chain root was one the client had never confirmed. Sending them
+    /// spends bandwidth on frames the client's own gate will hold.
+    pub frames_dropped_unconfirmed_reference: u64,
     /// Repair requests refused because the client had already acknowledged the frame.
     pub repairs_refused_delivered: u64,
     pub repairs_refused_expired: u64,
@@ -815,6 +818,41 @@ impl MediaSender {
         // This is not a general mode. It is entered when there is nothing to lose — no
         // acknowledgement has ever arrived — and left the moment one does.
         // ---------------------------------------------------------------------------------------
+        // **A frame whose chain root is not confirmed cannot be decoded, so it is not sent.**
+        //
+        // The client's gate will hold it — that is what the gate is for — and holding it costs the
+        // bandwidth that the confirmations need to arrive. The encoder is told which frames it may
+        // reference, so in a healthy stream this never fires: every non-keyframe it produces names a
+        // frame the client has already confirmed. It fires when the two disagree, which is exactly the
+        // state a stalled stream is in, and the answer to it is to stop spending — and let the
+        // bootstrap, which the stale acknowledgements bring on, produce the intra frame that ends it.
+        if !meta.is_keyframe
+            && meta.reference_frame != 0
+            && self.client_acked_frame.is_some()
+            && !self.was_acked(meta.reference_frame)
+        {
+            self.stats.frames_dropped_unconfirmed_reference += 1;
+            self.pacer.schedule(0, now);
+            return FrameSend {
+                frame_index: meta.frame_index,
+                datagrams: 0,
+                parity_datagrams: 0,
+                bytes: 0,
+                refused: 0,
+                paced_wait: self.pacer.next_send().saturating_sub(now),
+                over_budget: false,
+                layout: FrameLayout {
+                    frame_index: meta.frame_index,
+                    frame_len: 0,
+                    data_count: 0,
+                    parity_count: 0,
+                    blocks: 0,
+                    parity_per_block: 0,
+                    datagram_len: 0,
+                },
+            };
+        }
+
         if self.stop_and_wait {
             if let Some(waiting) = self.bootstrap_waiting {
                 let waited = self.bootstrap_started.map_or(Duration::ZERO, |at| {
