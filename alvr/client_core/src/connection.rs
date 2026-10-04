@@ -456,6 +456,11 @@ fn connection_pipeline(
             let mut feedback_peer: Option<std::net::SocketAddr> = None;
             let mut frames_decoded = 0u64;
             let mut requests = 0u64;
+            // A periodic line, unconditionally. ADR-0014: diagnostics are never gated by a user
+            // setting, and this one is the only place the *rate* the media plane actually works at
+            // is visible while it is running. Without it a client that reads 84 datagrams/s on a
+            // link offering 280 looks identical to a link offering 84.
+            let mut last_report = Instant::now();
 
             while is_streaming(&ctx) {
                 let (actions, open) =
@@ -463,6 +468,11 @@ fn connection_pipeline(
                 if !open {
                     warn!("The video media socket can no longer be read from; ending the stream");
                     return;
+                }
+
+                if last_report.elapsed() >= Duration::from_secs(2) {
+                    last_report = Instant::now();
+                    info!("{}", plane.stats().summary());
                 }
 
                 for action in actions {
