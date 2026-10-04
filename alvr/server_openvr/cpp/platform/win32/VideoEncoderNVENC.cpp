@@ -237,7 +237,7 @@ void VideoEncoderNVENC::Transmit(
         usePrevious = true;
     } else if (confirmSlot >= 0) {
         useConfirmedLtr = true;
-    } else if (ackValid && recoveryAllowed()) {
+    } else if (ackValid && recoveryAllowed() && params.degrade_starving == 0) {
         // The client is talking to us and has confirmed nothing for a while, so the chain really is
         // lost. Rate-limited, because a burst of keyframes is the congestion that lost the frame in
         // the first place — and this is measured, not hypothetical: an earlier version of this code
@@ -245,13 +245,21 @@ void VideoEncoderNVENC::Transmit(
         // 44 Mbps, a client that could not read them, no acknowledgements, and therefore no way out.
         rebuild = true;
     } else {
-        // **No acknowledgement has ever arrived, so carry on as before.** This is the fail-safe
+        // **No acknowledgement has ever arrived, or the client is starving, so carry on as
+        // before.** This is the fail-safe
         // branch, and it is the one that keeps the loop from closing on itself: without evidence
         // that the client can hear anything, forcing a keyframe per frame is a keyframe storm, and a
         // stream of ordinary P-frames is what this encoder produced before any of this existed. The
         // frame still reports what it was built on, so a client that did not decode that frame holds
         // — which is the old behaviour, reached by the client's own decision rather than the
-        // encoder's guess.
+        // encoder's guess. The starving case arrives here too: while the ladder is engaged, a
+        // keyframe is several times the size of any other frame and the client cannot receive the
+        // frames it is already being sent, so a rebuild spends the bandwidth the ladder is trying to
+        // reclaim. Ordinary frames are what it can still use, and they are what the client's own
+        // reference check will decide about.
+        if (params.degrade_starving != 0) {
+            m_rebuildsSuppressedByStarvation++;
+        }
         usePrevious = true;
     }
 

@@ -92,6 +92,9 @@ private:
     unsigned long long m_framesReferencingConfirmed = 0;
     unsigned long long m_framesForcedKey = 0;
     unsigned long long m_sweepsStarted = 0;
+    /// Rebuilds not attempted because the client was starving. See the note in `Transmit`: a
+    /// keyframe is a burst, and a burst is the last thing a drowning client can take.
+    unsigned long long m_rebuildsSuppressedByStarvation = 0;
     /// When the last forced rebuild happened, in milliseconds since the process started.
     ///
     /// Keyframes are rate-limited for the same reason the caller has always rate-limited them

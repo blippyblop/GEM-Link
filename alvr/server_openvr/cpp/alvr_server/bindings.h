@@ -105,6 +105,15 @@ struct FfiDynamicEncoderParams {
     unsigned long long client_acked_frame;
     unsigned int client_ack_valid;
     unsigned long long client_acked_recent_mask;
+    /// Whether the server's degradation ladder is engaged, i.e. the client is not receiving what is
+    /// being sent to it.
+    ///
+    /// **Read on every frame**, and it suppresses the encoder's own recovery: a keyframe is several
+    /// times the size of any other frame, and spending one on a client that is already drowning is
+    /// spending the bandwidth the ladder is trying to reclaim. The rule is the same one the sender
+    /// follows — the picture gives up latency, then frame rate, then quality, and a rebuild is none
+    /// of those; it is a burst, and a burst is what there is least of.
+    unsigned int degrade_starving;
 };
 
 struct FfiFoveatedEncodingParams {

@@ -679,6 +679,11 @@ impl ServerCoreContext {
     /// parameter changed. Folding it into the parameter struct would have tied it to `updated`, which
     /// is set once a second at best: the encoder would then reference frames the client lost for as
     /// long as the bitrate stayed still.
+    /// Whether the degradation ladder is engaged. See `BitrateManager::is_degrading`.
+    pub fn client_degrading(&self) -> bool {
+        self.connection_context.bitrate_manager.lock().is_degrading()
+    }
+
     pub fn client_ack_state(&self) -> (bool, u64, u64) {
         let ack = self.connection_context.bitrate_manager.lock().client_ack();
         (ack.valid, ack.newest, ack.recent_mask)

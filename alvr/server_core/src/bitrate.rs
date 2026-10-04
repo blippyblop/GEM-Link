@@ -22,13 +22,21 @@ const LADDER_FRAMERATE_FROM: f32 = 1.0;
 /// on that evidence. Two percent is already a hole in most frames; above it, one step per two percent.
 const LADDER_MISSING_FROM_PERMILLE: u32 = 20;
 
+/// Below this share of a frame missing, the ladder gives a frame rate back. Well under the threshold
+/// that takes it away, so the two do not meet in the middle and oscillate.
+const LADDER_MISSING_RECOVER_PERMILLE: u32 = 5;
+
+/// The share of a frame missing at which the client is 'drowning' — the point at which asking it to
+/// repair its own frames is asking it to add to the congestion that is losing them.
+const NACK_DROWNING_PERMILLE: u32 = 100;
+
 /// The most the frame rate is reduced by: one frame in six.
 ///
 /// Measured, not chosen: the emulated client reads ~300 datagrams/s, so at 72 Hz it can take about
 /// four datagrams per frame, and a stream of 26-datagram frames is one it cannot read no matter what
 /// the picture costs. Six is 12 fps at 72 Hz — the "drops to 15 fps for a few seconds" the ladder is
 /// allowed to spend, and a great deal better than a hole.
-const DEGRADE_MAX_FRAME_DIVISOR: u32 = 6;
+const DEGRADE_MAX_FRAME_DIVISOR: u32 = 12;
 
 /// The lowest the quality rung may take the rate, in bits per second.
 ///
@@ -86,6 +94,14 @@ pub struct BitrateManager {
     /// What share of each frame's declared shards the client says never arrived, in tenths of a
     /// percent. See [`Self::report_client_missing`].
     client_missing_permille: Option<u16>,
+    /// How many frames the ladder is currently dropping for every one it sends.
+    ///
+    /// **State, not a function of the last report.** The deficit says how much too much is being
+    /// sent — `1 / (1 - missing)` times — and the answer to that is a *rate*, which has to be
+    /// accumulated rather than recomputed, or the ladder saws: the client's report is of the last
+    /// thirty frames, so a step that only responds to the newest one oscillates around the answer
+    /// instead of converging on it.
+    degrade_divisor: u32,
     /// The client's own queueing delay, as it last reported it. See
     /// [`alvr_events::BitrateDirectives::client_queue_limiter_bps`].
     ///
@@ -126,6 +142,7 @@ impl BitrateManager {
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
             client_queue_delay_us: None,
             client_missing_permille: None,
+            degrade_divisor: 1,
             last_returned_bitrate_bps: None,
             client_ack: ClientAck::default(),
             previous_config: None,
@@ -150,7 +167,38 @@ impl BitrateManager {
     /// mildest rung of the ladder, while every frame was becoming a hole. Missing shards cannot be
     /// flattered by reading faster, because the frame declares what it should have been.
     pub fn report_client_missing(&mut self, permille: u16) {
-        self.client_missing_permille = Some(permille.min(1000));
+        let permille = permille.min(1000);
+        self.client_missing_permille = Some(permille);
+
+        // The frame-rate rung, as a controller rather than a lookup table.
+        //
+        // What the client cannot receive is what should not be sent: if it is missing a share `m` of
+        // every frame, then sending at a rate scaled by `(1 - m)` leaves it with whole frames, and
+        // that step is multiplicative for the same reason the FEC ratio's is — a link that loses a
+        // tenth needs a tenth more, and one that loses two thirds needs three times as much again.
+        //
+        // Below the threshold the need is reversed, and the divisor decays by one step per report
+        // rather than jumping back: coming *out* of a degrade is the half that has to be slow, or a
+        // client that has just stopped drowning is drowned by the recovery.
+        if permille > LADDER_MISSING_FROM_PERMILLE as u16 {
+            let missing = permille as f32 / 1000.0;
+            let scale = 1.0 / (1.0 - missing).max(0.05);
+            let stepped = self.degrade_divisor as f32 * scale;
+            self.degrade_divisor = self
+                .degrade_divisor
+                .max(1)
+                .max(stepped.ceil() as u32)
+                .min(DEGRADE_MAX_FRAME_DIVISOR);
+        } else if permille < LADDER_MISSING_RECOVER_PERMILLE as u16 && self.degrade_divisor > 1 {
+            self.degrade_divisor -= 1;
+        }
+    }
+
+    /// Whether the ladder is engaged at all — the flag the encoder is given so that it does not
+    /// spend a keyframe on a client that cannot receive one. See [`Self::degrade_divisor`].
+    pub fn is_degrading(&self) -> bool {
+        self.degrade_divisor > 1
+            || self.client_missing_permille.is_some_and(|m| m as u32 > NACK_DROWNING_PERMILLE)
     }
 
     /// Record that the client decoded a frame. See [`ClientAck`].
@@ -425,13 +473,22 @@ impl BitrateManager {
         // ladder is doing. A hole is the one outcome that is not allowed to be a trade.
         let frame_divisor = self.ladder_frame_divisor();
         bitrate_directives.degrade_frame_divisor = Some(frame_divisor);
+        bitrate_directives.degrade_starving = Some(self.is_degrading());
         if let Some(queue_us) = self.client_queue_delay_us {
             let latency_budget_us = self.nominal_frame_interval.as_micros() as f32;
             // Quality is the third rung: it is the bitrate that comes down, and only once the frame
             // rate has already been reduced to its floor.
-            if queue_us as f32 > latency_budget_us {
-                let target_us = latency_budget_us / 3.0;
-                let max_bps = bitrate_bps * target_us / queue_us as f32;
+            let by_deficit = self.client_missing_permille.map(|missing| {
+                bitrate_bps * (1.0 - missing.min(1000) as f32 / 1000.0).max(0.05)
+            });
+            let by_queue = (queue_us as f32 > latency_budget_us)
+                .then(|| bitrate_bps * (latency_budget_us / 3.0) / queue_us as f32);
+            if let Some(max_bps) = match (by_queue, by_deficit) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            } {
                 // A quality floor as well: below this the picture is not worth sending at all, and
                 // the honest lever left is the frame rate, which is already at its limit — so the
                 // rate stops here and the log says the ladder is exhausted.
@@ -501,15 +558,9 @@ impl BitrateManager {
 
         // 2. **The client is missing shards.** A client that is not behind but is not receiving is a
         //    client being sent more than it can take, and the queue delay cannot see it: the frames
-        //    it completes are the small ones, and it completes them promptly. Two percent of a frame
-        //    missing is enough to leave a hole; the ladder steps once per two percent beyond that.
-        let by_missing = match self.client_missing_permille {
-            Some(missing) if missing as u32 > LADDER_MISSING_FROM_PERMILLE => {
-                ((missing as u32 - LADDER_MISSING_FROM_PERMILLE) / 20 + 2).min(DEGRADE_MAX_FRAME_DIVISOR)
-            }
-            _ => 1,
-        };
-
-        by_queue.max(by_missing)
+        //    it completes are the small ones, and it completes them promptly. This rung is a
+        //    controller with state — see `report_client_missing` — because the answer to "a third of
+        //    every frame is missing" is a *rate*, not a multiple of the last sample.
+        by_queue.max(self.degrade_divisor).min(DEGRADE_MAX_FRAME_DIVISOR)
     }
 }
