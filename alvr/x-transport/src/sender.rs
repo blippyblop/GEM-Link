@@ -250,8 +250,8 @@ impl SenderStats {
             "media sender: {} frames ({} datagrams, {} parity = {:.1} % overhead), {} refused by \
              the sink, {} repair request(s) answered with {} datagram(s), {} repair(s) refused \
              ({} expired, {} too late, {} evicted, {} unknown, {} already decoded), {} keyframe \
-             request(s), {} reset(s), {} frame(s) over budget; client decoded {} frame(s) and could \
-             not use {}",
+             request(s), {} reset(s), {} frame(s) over budget, {} skipped for rate; client decoded \
+             {} frame(s) and could not use {}",
             self.frames_sent,
             self.datagrams_sent,
             self.parity_datagrams,
@@ -272,6 +272,7 @@ impl SenderStats {
             self.keyframes_required,
             self.stream_resets,
             self.over_budget_frames,
+            self.frames_skipped_for_rate,
             self.frames_acked,
             self.frames_unacked,
         )

@@ -1280,16 +1280,18 @@ fn connection_pipeline(
                         .unwrap_or(0.0)
                         as f64
                         / 1e6;
+                    let divisor = ctx.bitrate_manager.lock().ladder_frame_divisor();
                     info!(
                         "encoder: {mean_bytes:.0} B/frame ({mean_mbps:.2} Mbps at {fps:.0} fps), asked \
-                         for {asked_mbps:.2} Mbps"
+                         for {asked_mbps:.2} Mbps, sending 1 frame in {divisor}"
                     );
                     info!(
-                        "media sender: {} frame(s) sent, {} datagram(s) ({} parity), {} requested, {} \
-                         retransmitted, {} coalesced, refusals {}/{}/{}/{}",
+                        "media sender: {} frame(s) sent, {} datagram(s) ({} parity), {} skipped for \
+                         rate, {} requested, {} retransmitted, {} coalesced, refusals {}/{}/{}/{}",
                         stats.frames_sent,
                         stats.datagrams_sent,
                         stats.parity_datagrams,
+                        stats.frames_skipped_for_rate,
                         stats.retransmit_requests,
                         stats.retransmitted_datagrams,
                         stats.repairs_coalesced,

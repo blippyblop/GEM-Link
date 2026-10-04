@@ -36,6 +36,12 @@ pub struct BitrateDirectives {
     /// side: a shard that never arrived and a shard still queued behind it are the same fact
     /// locally. The delay is not ambiguous — it says the sender is outrunning the receiver.
     pub client_queue_limiter_bps: Option<f32>,
+    /// How many frames the degradation ladder is dropping for every one it sends, if it is above 1.
+    ///
+    /// Reported so the ladder is visible in the throughput statistics rather than only in the frame
+    /// rate someone notices: the second rung is the one that costs smoothness, and it should be
+    /// possible to see it being spent.
+    pub degrade_frame_divisor: Option<u32>,
     pub requested_bitrate_bps: f32,
 }
 

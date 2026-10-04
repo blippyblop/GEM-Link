@@ -18,13 +18,21 @@ const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// costs nothing but the delay itself. Past that it is not catching up while being fed at this rate.
 const LADDER_FRAMERATE_FROM: f32 = 1.0;
 
-/// The most the frame rate is reduced by: one frame in three. Halving twice is where a stream stops
-/// looking like a stream, and quality — the next rung — is a better thing to spend than smoothness.
-const DEGRADE_MAX_FRAME_DIVISOR: u32 = 3;
+/// The most the frame rate is reduced by: one frame in six.
+///
+/// Measured, not chosen: the emulated client reads ~300 datagrams/s, so at 72 Hz it can take about
+/// four datagrams per frame, and a stream of 26-datagram frames is one it cannot read no matter what
+/// the picture costs. Six is 12 fps at 72 Hz — the "drops to 15 fps for a few seconds" the ladder is
+/// allowed to spend, and a great deal better than a hole.
+const DEGRADE_MAX_FRAME_DIVISOR: u32 = 6;
 
-/// How much of the configured rate the quality rung may remove. Below a quarter of the rate the
-/// stream is not worth sending, and the honest thing to say is that the ladder is exhausted.
-const QUALITY_FLOOR_FRACTION: f32 = 0.25;
+/// The lowest the quality rung may take the rate, in bits per second.
+///
+/// An absolute floor rather than a fraction of the setting, and the first version was the latter —
+/// a quarter of 30 Mbps is 7.5 Mbps, which is *above* what this client can read, so the "floor" was
+/// the thing keeping the sender from ever matching the receiver. Below this the stream stops being a
+/// stream, and the honest thing left is to say the ladder is exhausted.
+const QUALITY_FLOOR_BPS: f32 = 1.5e6;
 
 pub struct DynamicEncoderParams {
     pub bitrate_bps: f32,
@@ -397,6 +405,7 @@ impl BitrateManager {
         // `x_transport::AdaptiveConfig::min`: the parity ratio is never relaxed to zero, whatever the
         // ladder is doing. A hole is the one outcome that is not allowed to be a trade.
         let frame_divisor = self.ladder_frame_divisor();
+        bitrate_directives.degrade_frame_divisor = Some(frame_divisor);
         if let Some(queue_us) = self.client_queue_delay_us {
             let latency_budget_us = self.nominal_frame_interval.as_micros() as f32;
             // Quality is the third rung: it is the bitrate that comes down, and only once the frame
@@ -407,7 +416,7 @@ impl BitrateManager {
                 // A quality floor as well: below this the picture is not worth sending at all, and
                 // the honest lever left is the frame rate, which is already at its limit — so the
                 // rate stops here and the log says the ladder is exhausted.
-                let floor_bps = nominal_bitrate_bps * QUALITY_FLOOR_FRACTION;
+                let floor_bps = QUALITY_FLOOR_BPS.min(nominal_bitrate_bps.max(QUALITY_FLOOR_BPS));
                 let capped = f32::max(f32::min(bitrate_bps, max_bps), floor_bps.min(bitrate_bps));
                 bitrate_bps = capped;
                 bitrate_directives.client_queue_limiter_bps = Some(max_bps);
@@ -456,13 +465,13 @@ impl BitrateManager {
         if interval_us <= 0.0 {
             return 1;
         }
+        // One step per frame interval of queueing, from "nothing" to the cap: the second rung is a
+        // dial rather than a switch, so a client that is two frames behind is not treated the same as
+        // one that is six behind.
         let behind = queue_us as f32 / interval_us;
         if behind < LADDER_FRAMERATE_FROM {
-            1
-        } else if behind < LADDER_FRAMERATE_FROM * 2.0 {
-            2
-        } else {
-            DEGRADE_MAX_FRAME_DIVISOR
+            return 1;
         }
+        (behind.floor() as u32).min(DEGRADE_MAX_FRAME_DIVISOR)
     }
 }

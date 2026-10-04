@@ -143,6 +143,19 @@ void VideoEncoderNVENC::Transmit(
         reconfigureParams.reInitEncodeParams = initializeParams;
         m_NvNecoder->Reconfigure(&reconfigureParams);
 
+        // Named, because "the encoder ignores the cap" and "the cap never reached the encoder" are
+        // the same fact in the output and different facts in the code. This is the line that tells
+        // them apart, and it is the third time this boundary has been worth instrumenting.
+        Info(
+            "NVENC reconfigured: %d Mbps at %.1f fps -> %lld B/frame allowed",
+            m_bitrateInMBits,
+            params.framerate,
+            (long long)(m_bitrateInMBits * 1'000'000L / (params.framerate > 0.1f
+                                                             ? params.framerate
+                                                             : (float)m_refreshRate)
+                        / 8)
+        );
+
         // A reconfigure can reset the encoder's picture buffer, and a long-term reference that is no
         // longer there is worse than none: the frame that names it cannot be decoded. Forgetting
         // which frames are marked means the next unconfirmed frame rebuilds the chain instead of
