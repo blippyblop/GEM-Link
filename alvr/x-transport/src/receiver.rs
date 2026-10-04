@@ -296,6 +296,9 @@ pub struct ReceiverStats {
     /// taken and the maximum kept.
     pub window_datagrams: u64,
     pub window_started_us: u64,
+    /// How many windows have closed since the caller last took the rate. Zero means the number it is
+    /// holding is the previous window's, not a fresh one.
+    pub windows_closed_since_take: u32,
     /// How much of each frame's **declared** shards actually arrived, in tenths of a percent missing,
     /// as an EWMA over every frame that finished — usable or not.
     ///
@@ -536,6 +539,7 @@ impl Receiver {
         self.stats.read_per_sec = self.stats.read_per_sec.max(rate);
         self.stats.window_datagrams = 0;
         self.stats.window_started_us = now_us;
+        self.stats.windows_closed_since_take += 1;
         self.stats.read_per_sec
     }
 
@@ -543,6 +547,16 @@ impl Receiver {
     /// one. The maximum is per reporting interval, so a burst is not averaged away by the minutes
     /// around it.
     pub fn take_read_rate(&mut self) -> u32 {
+        // **A window that produced no reading is not a reading of zero.** The sensor closes on
+        // datagrams, so a client being offered one frame every 300 ms does not close a window inside a
+        // 250 ms report interval at all — and reporting the zero it never measured is how a run that
+        // was presenting 325 frames told the sender it was reading nothing. The last measurement is
+        // still the best evidence, decayed rather than discarded.
+        if self.stats.windows_closed_since_take == 0 {
+            self.stats.read_per_sec = self.stats.read_per_sec * 3 / 4;
+            return self.stats.read_per_sec;
+        }
+        self.stats.windows_closed_since_take = 0;
         std::mem::take(&mut self.stats.read_per_sec)
     }
 
