@@ -165,6 +165,10 @@ pub struct SenderStats {
     pub frames_refused: u64,
     pub retransmit_requests: u64,
     pub retransmitted_datagrams: u64,
+    /// Fragments a request asked for that had **already** been answered inside one round trip, and
+    /// which were therefore not sent again. This is the counter that says the sender is not
+    /// answering the same question twice.
+    pub repairs_coalesced: u64,
     pub repairs_refused_expired: u64,
     pub repairs_refused_late: u64,
     pub repairs_refused_evicted: u64,
@@ -263,6 +267,13 @@ struct CachedFrame {
     /// The instant after which a repair cannot help.
     repair_until: Duration,
     is_keyframe: bool,
+    /// When each fragment was last retransmitted — "do not answer a request already answered".
+    ///
+    /// The client asks again when a repair does not arrive, which is correct of it. Without this,
+    /// the sender answers every request by sending the same fragment again: one lost fragment
+    /// becomes a fresh copy per request, inside exactly the congestion that lost it, and the repair
+    /// traffic *is* the load that keeps it lost. Parallel to `datagrams`.
+    retransmitted_at: Vec<Option<Duration>>,
 }
 
 /// Which key seals which frame.
@@ -552,6 +563,7 @@ impl MediaSender {
 
         self.remember(
             CachedFrame {
+                retransmitted_at: vec![None; datagrams.len()],
                 datagrams,
                 repair_until: target_as_duration(meta.target_timestamp_us)
                     + self.config.repair_window,
@@ -676,7 +688,11 @@ impl MediaSender {
         fragments: &[u16],
         now: Duration,
     ) -> FeedbackOutcome {
-        let Some(frame) = self.cache.get(&frame_index) else {
+        // One round trip's worth of "that answer is already in flight" — the client's floor for
+        // asking again, which is the same number and therefore the honest window to answer in.
+        let retry_floor = crate::nack_retry_interval(self.rtt);
+
+        let Some(frame) = self.cache.get_mut(&frame_index) else {
             self.stats.repairs_refused_unknown += 1;
             return FeedbackOutcome::RepairRefused {
                 frame_index,
@@ -704,20 +720,35 @@ impl MediaSender {
         }
 
         let mut sent = 0;
+        let mut coalesced = 0;
         for fragment in fragments {
-            let Some(datagram) = frame.datagrams.get(*fragment as usize) else {
+            let index = *fragment as usize;
+            let Some(datagram) = frame.datagrams.get(index) else {
                 // A fragment index past the end of the frame: a corrupt or hostile NACK. Skipped
                 // rather than fatal, and the frame is not counted as repaired.
                 continue;
             };
+
+            // Already sent, and not long enough ago for it to have been given up on: this is the
+            // same request arriving again, not a new one. Counted, and **not** answered twice.
+            if frame.retransmitted_at[index]
+                .is_some_and(|answered_at| now.saturating_sub(answered_at) < retry_floor)
+            {
+                coalesced += 1;
+                continue;
+            }
+
             self.pacer.schedule(datagram.len(), now);
             if sink.send(datagram).is_ok() {
+                frame.retransmitted_at[index] = Some(now);
                 sent += 1;
                 self.stats.retransmitted_datagrams += 1;
                 self.stats.datagrams_sent += 1;
                 self.stats.bytes_sent += datagram.len() as u64;
             }
         }
+
+        self.stats.repairs_coalesced += coalesced;
 
         FeedbackOutcome::Repaired {
             frame_index,
@@ -872,6 +903,87 @@ mod tests {
         assert_eq!(repairs.datagrams()[0], original[1]);
         assert_eq!(repairs.datagrams()[1], original[2]);
         assert_eq!(sender.stats().retransmitted_datagrams, 2);
+    }
+
+    /// The client asks again when a repair does not arrive, which is correct of it — so the *sender*
+    /// is what has to refuse to answer the same question twice inside a round trip. Without that,
+    /// one lost fragment becomes a fresh copy per request, inside the congestion that lost it.
+    #[test]
+    fn a_repeated_request_inside_a_round_trip_is_not_answered_twice() {
+        let mut sender = sender(ParityPolicy::Off);
+        // The floor of `nack_retry_interval` (4 ms), so the whole exchange fits inside the frame's
+        // repair window.
+        sender.set_rtt(Duration::ZERO);
+        let mut sink = Collector::new();
+        sender.send_frame(&mut sink, meta(5, 100_000), &payload(4), Duration::ZERO);
+
+        // First ask: answered, and one datagram goes out.
+        let mut first = Collector::new();
+        let outcome = sender.on_feedback(
+            &mut first,
+            &Feedback::Nack {
+                frame_index: 5,
+                fragments: vec![1],
+            },
+            Duration::from_micros(101_000),
+        );
+        assert_eq!(
+            outcome,
+            FeedbackOutcome::Repaired {
+                frame_index: 5,
+                datagrams: 1
+            }
+        );
+        assert_eq!(first.len(), 1);
+
+        // The same ask again, well inside `nack_retry_interval(6 ms)` = 12 ms: **not** answered.
+        let mut second = Collector::new();
+        let outcome = sender.on_feedback(
+            &mut second,
+            &Feedback::Nack {
+                frame_index: 5,
+                fragments: vec![1],
+            },
+            Duration::from_micros(103_000),
+        );
+        assert_eq!(
+            outcome,
+            FeedbackOutcome::Repaired {
+                frame_index: 5,
+                datagrams: 0
+            },
+            "a request already answered inside a round trip must not be sent again"
+        );
+        assert!(
+            second.is_empty(),
+            "the repair path must not be its own congestion"
+        );
+        assert_eq!(sender.stats().repairs_coalesced, 1);
+        assert_eq!(
+            sender.stats().retransmitted_datagrams,
+            1,
+            "one request, one datagram"
+        );
+
+        // ...and long enough afterwards it is answered again, because by then the answer really may
+        // have been lost.
+        let mut third = Collector::new();
+        let outcome = sender.on_feedback(
+            &mut third,
+            &Feedback::Nack {
+                frame_index: 5,
+                fragments: vec![1],
+            },
+            Duration::from_micros(106_000),
+        );
+        assert_eq!(
+            outcome,
+            FeedbackOutcome::Repaired {
+                frame_index: 5,
+                datagrams: 1
+            }
+        );
+        assert_eq!(third.len(), 1);
     }
 
     #[test]

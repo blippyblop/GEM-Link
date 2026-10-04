@@ -1103,6 +1103,7 @@ fn connection_pipeline(
     let session_start = Instant::now();
     let mut timebase = TimebaseOffset::new(Duration::from_secs(1));
     let mut over_budget_frames = 0u64;
+    let mut frames_this_run = 0u64;
 
     let video_send_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
@@ -1216,6 +1217,28 @@ fn connection_pipeline(
                             over_budget_frames,
                         );
                     }
+                }
+
+                // The sender's own account of the repair path, every few seconds. Without it the
+                // only way to see what the sender did with a client's requests is to stop the
+                // session — and a repair path that answers the same question repeatedly, or answers
+                // none of them, looks identical from the client's side.
+                frames_this_run += 1;
+                if frames_this_run.is_multiple_of(150) {
+                    let stats = video_sender.stats();
+                    info!(
+                        "media sender: {} frame(s) sent, {} datagram(s), {} requested, {} \
+                         retransmitted, {} coalesced, refusals {}/{}/{}/{}",
+                        stats.frames_sent,
+                        stats.datagrams_sent,
+                        stats.retransmit_requests,
+                        stats.retransmitted_datagrams,
+                        stats.repairs_coalesced,
+                        stats.repairs_refused_expired,
+                        stats.repairs_refused_late,
+                        stats.repairs_refused_evicted,
+                        stats.repairs_refused_unknown,
+                    );
                 }
             }
         }
