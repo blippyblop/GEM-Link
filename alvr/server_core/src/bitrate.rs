@@ -263,7 +263,15 @@ impl BitrateManager {
                 // Steam Link's, which selects a bandwidth against the fraction of the stream queued
                 // above ~60 ms.
                 if let Some(queue_us) = self.client_queue_delay_us {
-                    let target_us = self.nominal_frame_interval.as_micros() as f32;
+                    // **The target is the client's repair window, not a frame interval.**
+                    //
+                    // One frame interval was the first guess and it is too loose to ever fire: the
+                    // rig reported 14–18 ms of delay against a 33 ms target, while the client's
+                    // release window is ~12 ms — so the frame was still being released *before* its
+                    // own shards had finished arriving, which is the whole fault. A client that reads
+                    // a frame in less than the time it has to rebuild one is keeping up; anything
+                    // slower is the sender's to fix.
+                    let target_us = self.nominal_frame_interval.as_micros() as f32 / 3.0;
                     if queue_us as f32 > target_us && queue_us > 0 {
                         let max_bps = throughput_bps * target_us / queue_us as f32;
                         throughput_bps = f32::min(throughput_bps, max_bps);
