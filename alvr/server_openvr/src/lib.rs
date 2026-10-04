@@ -693,6 +693,7 @@ extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
     // bitrate stayed still, which is exactly the session that needs it most.
     let (ack_valid, acked_frame, acked_mask) = context.client_ack_state();
     let starving = context.client_degrading();
+    let bootstrap = context.client_bootstrapping();
 
     match context.get_dynamic_encoder_params() {
         Some(params) => FfiDynamicEncoderParams {
@@ -703,6 +704,7 @@ extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
             client_ack_valid: ack_valid as u32,
             client_acked_recent_mask: acked_mask,
             degrade_starving: starving as u32,
+            bootstrap: bootstrap as u32,
         },
         None => FfiDynamicEncoderParams {
             updated: 0,
@@ -712,6 +714,7 @@ extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
             client_ack_valid: ack_valid as u32,
             client_acked_recent_mask: acked_mask,
             degrade_starving: starving as u32,
+            bootstrap: bootstrap as u32,
         },
     }
 }

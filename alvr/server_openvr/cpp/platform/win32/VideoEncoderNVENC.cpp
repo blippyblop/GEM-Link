@@ -229,9 +229,12 @@ void VideoEncoderNVENC::Transmit(
     bool usePrevious = false;
     bool useConfirmedLtr = false;
     bool rebuild = false;
-    if (m_lastEncodedFrameIndex == 0 || insertIDR) {
-        // The first picture of a session, or the caller asked (stream start, or the client's own
-        // keyframe request). Nothing to refresh from and nothing to reference: a real IDR.
+    if (m_lastEncodedFrameIndex == 0 || insertIDR || params.bootstrap != 0) {
+        // The first picture of a session; the caller asked (stream start, or the client's own
+        // keyframe request); or the stream is in its bootstrap, where the frame that goes out must be
+        // one the client can decode **and present**. Never a P-frame there, even if its predecessor
+        // was confirmed: the client is holding, and the only thing that releases a hold is a
+        // keyframe — while a P-frame chained to a frame it holds would extend the hold it is in.
         rebuild = true;
     } else if (prevConfirmed) {
         usePrevious = true;

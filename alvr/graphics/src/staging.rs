@@ -88,6 +88,14 @@ impl StagingRenderer {
             // This is an external surface and storage should not be initialized
             let surface_texture = ck!(gl.create_texture().unwrap());
 
+            // **The staging textures are cleared to a no-signal grey, not left black.**
+            //
+            // They are what the renderer samples when the decoder has nothing new — deliberately, so
+            // a held frame stays on screen. But before the *first* frame, and after a stream reset,
+            // "nothing new" means an uninitialised texture: a driver is free to hand back anything,
+            // and on every driver that means zeros. A black screen is indistinguishable from a
+            // crashed streamer, and the one thing the display path must never do is look dead while
+            // the stream is alive. Grey reads as "no signal yet", which is what it is.
             let mut framebuffers = vec![];
             for tex in staging_textures {
                 let framebuffer = ck!(gl.create_framebuffer().unwrap());
@@ -99,6 +107,9 @@ impl StagingRenderer {
                     Some(tex),
                     0,
                 ));
+
+                ck!(gl.clear_color(0.5, 0.5, 0.5, 1.0));
+                ck!(gl.clear(gl::COLOR_BUFFER_BIT));
 
                 framebuffers.push(framebuffer);
             }

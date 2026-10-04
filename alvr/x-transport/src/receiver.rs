@@ -430,17 +430,43 @@ impl PartialFrame {
         }
         let blocks = fec::blocks_for(data_count);
         let parity_per_block = self.parity_count as usize / blocks;
-
-        let mut missing_per_block = vec![0usize; blocks];
-        for (index, slot) in self.shards[..data_count].iter().enumerate() {
-            if slot.is_none() {
-                missing_per_block[fec::block_of(index, blocks)] += 1;
-            }
+        if parity_per_block == 0 {
+            return false;
         }
 
-        missing_per_block
-            .iter()
-            .all(|missing| *missing <= parity_per_block)
+        for block in 0..blocks {
+            let mut missing = 0usize;
+            for (index, slot) in self.shards[..data_count].iter().enumerate() {
+                if slot.is_none() && fec::block_of(index, blocks) == block {
+                    missing += 1;
+                }
+            }
+            if missing == 0 {
+                continue;
+            }
+
+            // **The parity that has ARRIVED, not the parity that was declared.**
+            //
+            // This compared missing data shards against `parity_count` — the number the frame said it
+            // carried — and never asked whether any of it was here. A frame with five data shards
+            // missing and five declared parity shards is then "repairable" at its straggler window, is
+            // released, fails to decode, and becomes a hole: exactly the shape the live runs kept
+            // reporting, `4.4 erasures vs 5.0 parity on average`, where the parity was declared and
+            // still in flight. It is also why the release window and the repair window could never be
+            // tuned into agreement — the decision to stop waiting was made on evidence that did not
+            // exist.
+            let mut present = 0usize;
+            for position in 0..parity_per_block {
+                let wire_index = data_count + position * blocks + block;
+                if self.shards.get(wire_index).is_some_and(Option::is_some) {
+                    present += 1;
+                }
+            }
+            if missing > present {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1028,6 +1054,54 @@ mod tests {
         assert_eq!(released[0].frame_index, 1);
         assert_eq!(released[0].outcome, FrameOutcome::Complete);
         assert_eq!(released[0].payload().unwrap(), &bytes[..]);
+    }
+
+    #[test]
+    fn parity_that_has_not_arrived_is_not_parity_the_frame_can_be_repaired_with() {
+        // **The bug the live rig kept reporting and nothing caught.** Two data shards are missing and
+        // two parity shards were declared — but neither parity shard has arrived. The old rule called
+        // that repairable, released the frame at its straggler window, failed to decode, and turned it
+        // into a hole: `4.4 erasures vs 5.0 parity`, where the parity was still in flight.
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Fixed(2));
+        let bytes = payload(SHARD * 5);
+        let mut first = receiver();
+        let mut seq = 0;
+        // Two data shards and both parity shards are missing. Repairable: two erasures, two parity.
+        send(
+            &mut first,
+            &packetizer,
+            1,
+            &bytes,
+            &[1, 3, 5, 6],
+            Duration::ZERO,
+            &mut seq,
+        );
+        // *Not* repairable in fact — the parity is not here — so the straggler window must not release
+        // it as though it were.
+        let released = first.release(Duration::from_millis(50));
+        assert!(
+            !released.iter().any(|f| f.is_displayable()),
+            "a frame with two erasures and no parity in hand was released as repairable: {released:?}"
+        );
+
+        // And when the parity does arrive, it is repairable and repaired.
+        let mut fresh = receiver();
+        let mut seq = 0;
+        send(
+            &mut fresh,
+            &packetizer,
+            1,
+            &bytes,
+            &[1, 3],
+            Duration::ZERO,
+            &mut seq,
+        );
+        let released = fresh.release(Duration::from_millis(50));
+        assert_eq!(
+            released[0].outcome,
+            FrameOutcome::Recovered { repaired: 2 },
+            "two erasures with two parity shards present must be repaired"
+        );
     }
 
     #[test]

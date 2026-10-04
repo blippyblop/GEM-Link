@@ -57,6 +57,12 @@ pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 /// milliseconds — so the sender has to look at its feedback socket far more often than once per
 /// frame. See the note on the loop in `connection_pipeline`.
 const FEEDBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// How long without an acknowledgement before the stream returns to its bootstrap.
+///
+/// Several round trips on this link class: long enough that a burst of lost acknowledgements does not
+/// restart the stream, short enough that a client which has stopped confirming frames is answered
+/// with a keyframe rather than with more frames it cannot decode.
+const ACK_STALE_AFTER: Duration = Duration::from_millis(500);
 const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
@@ -1246,7 +1252,17 @@ fn connection_pipeline(
                 // frame the client can actually read. Measured, on this rig: 2038 frames completed, 2
                 // presented and 0 acknowledgements, because a 64-datagram keyframe needs 220 ms of
                 // reading against release windows of 6, 12 and 66 ms with the stream still sending.
-                let acknowledged = video_sender.client_acked_frame().is_some();
+                // **Two ways into the bootstrap**: nothing has ever been acknowledged, or the
+                // acknowledgements have gone quiet. The second is the one that matters after a
+                // session has started: a client that is holding decodes nothing, so it confirms
+                // nothing, so the encoder's reference set empties and every frame it makes references
+                // a frame the client is holding — the loop closes on itself, and only an intra frame
+                // the client can present opens it.
+                let acknowledged = video_sender.client_acked_frame().is_some()
+                    && !video_sender.acknowledgements_stale(
+                        timebase.from_local(arrived),
+                        ACK_STALE_AFTER,
+                    );
                 let observed_parity = video_sender.stats().overhead_fraction() as f32;
                 video_sender.set_stop_and_wait(!acknowledged);
                 video_sender.set_frame_divisor({

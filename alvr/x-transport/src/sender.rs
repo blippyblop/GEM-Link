@@ -521,8 +521,6 @@ pub struct MediaSender {
     bootstrap_started: Option<Duration>,
     /// How long to wait for the bootstrap frame before giving up on it.
     bootstrap_timeout: Duration,
-    /// Frames the bootstrap did not send because it was waiting for the one before.
-    frames_held_for_bootstrap: u64,
     /// Whether the stop-and-wait bootstrap is armed. See the note in `send_frame`.
     stop_and_wait: bool,
     /// Set when a bootstrap wait expired, for the caller to take and act on — the action being
@@ -581,7 +579,6 @@ impl MediaSender {
             bootstrap_waiting: None,
             bootstrap_started: None,
             bootstrap_timeout: BOOTSTRAP_TIMEOUT,
-            frames_held_for_bootstrap: 0,
             stop_and_wait: false,
             bootstrap_timed_out: false,
             send_seq: 0,
@@ -691,10 +688,31 @@ impl MediaSender {
         self.stop_and_wait = on;
     }
 
+    /// Whether the acknowledgement loop has gone quiet: the client has confirmed frames in this
+    /// session, but nothing for `threshold`.
+    ///
+    /// **The second way into the bootstrap.** The first is a session that never got an
+    /// acknowledgement at all; this is one that had them and lost them, which happens when the client
+    /// holds — it presents nothing, so it decodes nothing, so it confirms nothing, so the encoder's
+    /// reference set empties and every frame it produces references a frame the client is holding. The
+    /// loop closes on itself, and only a frame the client can decode *and present* opens it again.
+    pub fn acknowledgements_stale(&self, now: Duration, threshold: Duration) -> bool {
+        self.client_acked_frame.is_some()
+            && self
+                .last_ack_at
+                .is_some_and(|at| now.saturating_sub(at) >= threshold)
+    }
+
     /// Take the fact that a bootstrap wait expired, for the caller to act on by asking the encoder
     /// for a *smaller* intra frame.
     pub fn take_bootstrap_timeout(&mut self) -> bool {
         std::mem::take(&mut self.bootstrap_timed_out)
+    }
+
+    /// How long a bootstrap frame is given. See [`BOOTSTRAP_TIMEOUT`]; a test sets it to something it
+    /// does not have to wait for.
+    pub fn set_bootstrap_timeout(&mut self, timeout: Duration) {
+        self.bootstrap_timeout = timeout;
     }
 
     /// Whether this exact frame index has been acknowledged decoded.
@@ -782,7 +800,7 @@ impl MediaSender {
                     now.saturating_sub(at)
                 });
                 if waited < self.bootstrap_timeout {
-                    self.frames_held_for_bootstrap += 1;
+                    self.stats.frames_held_for_bootstrap += 1;
                     self.pacer.schedule(0, now);
                     return FrameSend {
                         frame_index: meta.frame_index,
@@ -2054,6 +2072,272 @@ mod tests {
         // Frame 2 is still owed an acknowledgement, so it is not yet written off either way.
         assert_eq!(sender.stats().frames_unacked, 0);
         assert_eq!(sender.client_acked_frame(), Some(1));
+    }
+
+    // -- the bootstrap -------------------------------------------------------------------------
+    //
+    // The fixture the deadlock needed. Every mechanism in this plane assumes at least one
+    // acknowledgement, and this is the state whose only job is to produce one; it is also the state
+    // that is impossible to reach if the frame it sends is bigger than the client can read. These
+    // tests drive the whole loop — sender, wire, reassembly, release, acknowledgement — against a
+    // client whose reading is *throttled*, which is the only way to see it.
+
+    /// A client that reads `per_sec` datagrams and holds the rest in a finite kernel queue, which is
+    /// what a real receiver is: what it cannot read within the queue's size is lost, not delayed.
+    struct ThrottledClient {
+        receiver: crate::Receiver,
+        queue: std::collections::VecDeque<Vec<u8>>,
+        queue_capacity: usize,
+        per_sec: f64,
+        credit: f64,
+        released: Vec<crate::DeliveredFrame>,
+        dropped: u64,
+    }
+
+    impl ThrottledClient {
+        fn new(per_sec: f64, policy: crate::ReleasePolicy) -> Self {
+            Self {
+                receiver: crate::Receiver::new(policy, None),
+                queue: std::collections::VecDeque::new(),
+                // The socket buffer this rig actually has, in datagrams.
+                queue_capacity: 64,
+                per_sec,
+                credit: 0.0,
+                released: Vec::new(),
+                dropped: 0,
+            }
+        }
+
+        fn offer(&mut self, datagrams: &[Vec<u8>]) {
+            for datagram in datagrams {
+                if self.queue.len() >= self.queue_capacity {
+                    self.dropped += 1;
+                    continue;
+                }
+                self.queue.push_back(datagram.clone());
+            }
+        }
+
+        /// Let `dt` of time pass: read what this client can, then release what is ready.
+        fn advance(&mut self, now: Duration, dt: Duration) {
+            self.credit += self.per_sec * dt.as_secs_f64();
+            while self.credit >= 1.0 {
+                self.credit -= 1.0;
+                let Some(datagram) = self.queue.pop_front() else {
+                    self.credit = 0.0;
+                    break;
+                };
+                self.receiver.observe_read_rate(now, Duration::from_millis(250));
+                self.receiver.on_datagram(&datagram, now);
+            }
+            self.released.extend(self.receiver.release(now));
+        }
+
+        /// The acknowledgement the client would send: what it has decoded, in the form the wire uses.
+        fn acknowledge(&self) -> Option<(u64, u64)> {
+            let mut decoded = crate::DecodeHistory::default();
+            for frame in &self.released {
+                if frame.is_displayable() {
+                    decoded.record(frame.frame_index);
+                }
+            }
+            decoded.snapshot()
+        }
+    }
+
+    /// The bootstrap, end to end, against a client that can only read `per_sec` datagrams a second.
+    ///
+    /// `keep_sending` is the variable the rig turned on: with the stream still sending behind the
+    /// frame, a later frame takes the slot and the frame is abandoned before it can be read; with the
+    /// stop-and-wait, nothing is behind it and it completes. Returns when the first acknowledgement
+    /// arrived, or `None` if the stream never started.
+    fn bootstrap(per_sec: f64, frame_datagrams: usize, keep_sending: bool) -> Option<Duration> {
+        let mut sender = sender(ParityPolicy::Ratio { fraction: 0.25 });
+        sender.set_stop_and_wait(!keep_sending);
+        sender.set_bootstrap_timeout(Duration::from_millis(400));
+
+        let policy = crate::ReleasePolicy {
+            straggler_delay: Duration::from_millis(6),
+            repair_delay: Duration::from_millis(12),
+            late_hold_frames: 2,
+            jitter_frames: 0,
+        };
+        let mut client = ThrottledClient::new(per_sec, policy);
+
+        let dt = Duration::from_millis(1);
+        let mut now = Duration::ZERO;
+        let mut frame_index = 1u64;
+        let mut acked_at = None;
+
+        while now < Duration::from_millis(1_200) {
+            // What the sender would put on the wire this tick — a frame every tick when the caller is
+            // not holding it back, which is what the stream did before the bootstrap existed.
+            let mut sink = Collector::new();
+            sender.send_frame(
+                &mut sink,
+                meta(frame_index, now.as_micros() as u64),
+                &payload(frame_datagrams),
+                now,
+            );
+            if !sink.datagrams().is_empty() {
+                client.offer(sink.datagrams());
+                frame_index += 1;
+            }
+
+            client.advance(now, dt);
+
+            if let Some((newest, mask)) = client.acknowledge() {
+                let mut back = Collector::new();
+                sender.on_feedback(&mut back, &Feedback::Ack { newest, mask }, now);
+                acked_at = Some(now);
+                break;
+            }
+            now += dt;
+        }
+        acked_at
+    }
+
+    #[test]
+    fn a_bootstrap_frame_sized_to_the_client_starts_the_stream() {
+        // 285 datagrams/s is what this rig's client reads; twenty datagrams is what the budget gives
+        // it, and eighteen is a plausible frame at that rate. The frame is read in 63 ms, its
+        // acknowledgement comes back inside the wait, and the stream is running.
+        let acked = bootstrap(285.0, 18, false);
+        assert!(
+            acked.is_some(),
+            "the bootstrap never produced an acknowledgement at a rate the client can read"
+        );
+        assert!(
+            acked.unwrap() < Duration::from_millis(400),
+            "the first acknowledgement took {:?}",
+            acked.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_frame_bigger_than_the_client_can_read_inside_the_wait_never_starts_the_stream() {
+        // **The floor, as a fixture: the frame has to be readable inside the wait.** At forty
+        // datagrams a second — a client a quarter as fast as this rig's — a frame sized to the budget
+        // for that rate is six datagrams and is read in 150 ms, well inside the 400 ms wait. The same
+        // client sent a keyframe-sized frame of sixty-four datagrams needs 1.6 seconds, so the wait
+        // expires, the frame is written off, and the stream never starts. That ratio is the whole
+        // reason the bootstrap sizes its frame from the client's own reading rather than from quality.
+        let small = bootstrap(40.0, 6, false);
+        assert!(
+            small.is_some(),
+            "a frame sized to the budget at 40 datagrams/s did not start the stream"
+        );
+        assert!(small.unwrap() < Duration::from_millis(400));
+
+        let oversized = bootstrap(40.0, 64, false);
+        assert!(
+            oversized.is_none() || oversized.unwrap() > Duration::from_millis(800),
+            "a 64-datagram frame started a stream whose client reads 40 datagrams/s: {oversized:?}"
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_stops_the_stream_until_it_is_answered() {
+        let mut sender = sender(ParityPolicy::Off);
+        sender.set_stop_and_wait(true);
+        let mut sink = Collector::new();
+
+        let first = sender.send_frame(&mut sink, meta(1, 11_111), &payload(4), Duration::ZERO);
+        assert_eq!(first.datagrams, 4, "the bootstrap frame went out");
+        let sent_after_first = sender.stats().datagrams_sent;
+
+        // Every frame while the first is unanswered is held: no slot pressure on the bootstrap frame,
+        // which is the property that lets the client hold it long enough to read it.
+        for index in 2..=10 {
+            let held = sender.send_frame(
+                &mut sink,
+                meta(index, index * 11_111),
+                &payload(4),
+                Duration::from_millis(index as u64),
+            );
+            assert_eq!(held.datagrams, 0, "frame {index} went out behind the bootstrap");
+        }
+        assert_eq!(sender.stats().datagrams_sent, sent_after_first);
+        assert_eq!(sender.stats().frames_held_for_bootstrap, 9);
+    }
+
+    #[test]
+    fn a_bootstrap_that_is_not_answered_times_out_and_asks_for_a_smaller_frame() {
+        let mut sender = sender(ParityPolicy::Off);
+        sender.set_stop_and_wait(true);
+        sender.set_bootstrap_timeout(Duration::from_millis(100));
+        let mut sink = Collector::new();
+        sender.send_frame(&mut sink, meta(1, 11_111), &payload(4), Duration::ZERO);
+        assert!(!sender.take_bootstrap_timeout());
+
+        // Past the wait: the frame is written off, and the caller is told to ask for a smaller one.
+        sender.send_frame(&mut sink, meta(2, 22_222), &payload(4), Duration::from_millis(150));
+        assert!(sender.take_bootstrap_timeout());
+        assert_eq!(sender.stats().bootstrap_timeouts, 1);
+        assert!(!sender.take_bootstrap_timeout(), "the timeout was reported twice");
+    }
+
+    #[test]
+    fn an_acknowledgement_ends_the_stop_and_wait() {
+        let mut sender = sender(ParityPolicy::Off);
+        sender.set_stop_and_wait(true);
+        let mut sink = Collector::new();
+        sender.send_frame(&mut sink, meta(1, 11_111), &payload(4), Duration::ZERO);
+
+        let mut back = Collector::new();
+        sender.on_feedback(
+            &mut back,
+            &Feedback::Ack {
+                newest: 1,
+                mask: 1,
+            },
+            Duration::from_millis(20),
+        );
+        // The next frame goes: the bootstrap is over, and the stream is running.
+        let second = sender.send_frame(&mut sink, meta(2, 22_222), &payload(4), Duration::from_millis(21));
+        assert!(second.datagrams > 0);
+        assert_eq!(sender.stats().bootstrap_acks, 1);
+    }
+
+    #[test]
+    fn a_bitmap_repairs_an_acknowledgement_that_was_lost() {
+        // The acknowledgement is the single point of failure of the reference scheme: with one lost,
+        // the client must not read as one that decoded nothing. The bitmap is what makes the next one
+        // repair it — here frames 1, 2 and 4 were decoded, frame 3 was not, and the *second*
+        // acknowledgement carries the whole picture.
+        let mut sender = sender(ParityPolicy::Off);
+        let mut sink = Collector::new();
+        for index in 1..=4 {
+            sender.send_frame(&mut sink, meta(index, index * 11_111), &payload(1), Duration::ZERO);
+        }
+
+        let mut back = Collector::new();
+        sender.on_feedback(
+            &mut back,
+            &Feedback::Ack {
+                newest: 2,
+                mask: 0b11,
+            },
+            Duration::from_millis(20),
+        );
+        assert!(sender.was_acked(1) && sender.was_acked(2));
+        assert!(!sender.was_acked(3), "frame 3 was never acknowledged");
+        assert!(
+            !sender.was_acked(4),
+            "frame 4 is newer than the acknowledgement that arrived"
+        );
+
+        sender.on_feedback(
+            &mut back,
+            &Feedback::Ack {
+                newest: 4,
+                // Bit 0 is frame 4, bit 2 is frame 2, bit 3 is frame 1. Frame 3 is not in it.
+                mask: 0b1101,
+            },
+            Duration::from_millis(40),
+        );
+        assert!(sender.was_acked(4) && sender.was_acked(1), "the bitmap was not applied");
+        assert!(!sender.was_acked(3));
     }
 
     #[test]

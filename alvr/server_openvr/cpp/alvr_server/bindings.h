@@ -114,6 +114,14 @@ struct FfiDynamicEncoderParams {
     /// follows — the picture gives up latency, then frame rate, then quality, and a rebuild is none
     /// of those; it is a burst, and a burst is what there is least of.
     unsigned int degrade_starving;
+    /// Whether the stream is in its **bootstrap**: nothing has been acknowledged, or nothing has been
+    /// acknowledged for long enough that the reference chain must be rebuilt by hand.
+    ///
+    /// Then the frame that goes out must be one the client can decode *and present* — an intra frame,
+    /// never a P-frame referencing something it is holding — because the bootstrap's entire job is to
+    /// produce the acknowledgement that ends it. It is read on every frame like the rest of this
+    /// block: it is a fact about the stream, not a parameter of the encoder.
+    unsigned int bootstrap;
 };
 
 struct FfiFoveatedEncodingParams {

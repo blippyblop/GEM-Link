@@ -33,6 +33,10 @@ const BOOTSTRAP_FRAME_BYTES: usize = 24_000;
 /// How much smaller each bootstrap retry asks for.
 const BOOTSTRAP_SHRINK: f64 = 0.6;
 
+/// How fast the read-rate high-water mark decays when the client reports less. See
+/// [`BitrateManager::report_client_read_rate`].
+const READ_CEILING_DECAY: f64 = 0.95;
+
 /// How much of the measured read rate the sender plans to use. See
 /// [`BitrateManager::delivery_budget_per_sec`]: under one, because the sensor is a lower bound.
 const DELIVERY_BUDGET_FRACTION: f64 = 0.7;
@@ -218,11 +222,25 @@ impl BitrateManager {
     /// The maximum over the client's window, so a burst is not averaged away. Deliberately not
     /// smoothed here as well: the client already reports a maximum over a quarter of a second, and a
     /// second smoothing would make the budget a memory of a link rather than a measurement of one.
+    /// A **high-water mark that decays**, not the newest reading.
+    ///
+    /// The sensor is a lower bound on capacity: it can only ever measure what the sender offered. A
+    /// window in which the sender happened to offer little — because the ladder had already reduced
+    /// the rate, or because a stop-and-wait was in progress — reads as a slow *client*, and taking it
+    /// at face value shrinks the budget, which offers less, which reads slower still. Measured on the
+    /// rig: 144 datagrams/s, then 0, then a budget of 27/s, which is a collapse dressed as a
+    /// measurement.
+    ///
+    /// So a reading below the mark is treated as a window that was starved, and the mark decays
+    /// slowly instead — five percent per report, so a client that has genuinely slowed down is
+    /// followed within a few seconds while a momentary stall costs nothing.
     pub fn report_client_read_rate(&mut self, per_sec: u32) {
-        self.read_ceiling_per_sec = per_sec;
         self.read_report_at = Some(Instant::now());
-        if per_sec > 0 {
-            self.delivery_budget_per_sec = Some(per_sec as f64 * DELIVERY_BUDGET_FRACTION);
+        let decayed = (self.read_ceiling_per_sec as f64 * READ_CEILING_DECAY) as u32;
+        self.read_ceiling_per_sec = per_sec.max(decayed);
+        if self.read_ceiling_per_sec > 0 {
+            self.delivery_budget_per_sec =
+                Some(self.read_ceiling_per_sec as f64 * DELIVERY_BUDGET_FRACTION);
         }
     }
 
