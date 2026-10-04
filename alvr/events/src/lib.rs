@@ -42,6 +42,12 @@ pub struct BitrateDirectives {
     /// rate someone notices: the second rung is the one that costs smoothness, and it should be
     /// possible to see it being spent.
     pub degrade_frame_divisor: Option<u32>,
+    /// Whether the degradation ladder is engaged: the client is not receiving what is being sent.
+    ///
+    /// Reported because it is the one fact that changes what the *encoder* should do rather than what
+    /// it should be told: while it is set, a keyframe is a burst the client cannot take, so the
+    /// recovery is suppressed rather than requested.
+    pub degrade_starving: Option<bool>,
     pub requested_bitrate_bps: f32,
 }
 
