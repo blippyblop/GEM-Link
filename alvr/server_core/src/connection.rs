@@ -1119,6 +1119,13 @@ fn connection_pipeline(
         move || {
             let mut media_socket = media_socket;
             let mut feedback_buffer = Vec::with_capacity(2048);
+            // What the client's reports are evidence *about*: datagrams offered since the last one,
+            // and when the last one arrived. A reading taken while the sender was holding the stream —
+            // a bootstrap, a degraded frame rate — says nothing about the client, and letting it decay
+            // the delivery budget is a collapse dressed as a measurement.
+            let mut last_reported_datagrams = 0u64;
+            let mut last_report_at = timebase.from_local(session_start.elapsed());
+            let mut report_interval = Duration::from_millis(250);
 
             while is_streaming(&client_hostname) {
                 // The client's repair requests, **serviced on a millisecond cadence rather than a
@@ -1169,8 +1176,20 @@ fn connection_pipeline(
                                     manager.report_client_missing(missing_per_mille);
                                     // **The budget's source.** Everything the sender does about rate
                                     // is solved from this one number, and it is the only one that
-                                    // survives a client which completes nothing.
-                                    manager.report_client_read_rate(read_per_sec);
+                                    // survives a client which completes nothing — with the rate the
+                                    // sender was actually offering beside it, because a reading below
+                                    // what was offered is evidence and one above it is a description of
+                                    // our own pacing.
+                                    let now_sent = video_sender.stats().datagrams_sent;
+                                    let offered = ((now_sent - last_reported_datagrams) as f64
+                                        / report_interval.as_secs_f64())
+                                        as u32;
+                                    last_reported_datagrams = now_sent;
+                                    report_interval = now.saturating_sub(last_report_at).max(
+                                        Duration::from_millis(1),
+                                    );
+                                    last_report_at = now;
+                                    manager.report_client_read_rate(read_per_sec, offered);
                                 }
                                 FeedbackOutcome::Acknowledged { newest, mask, .. } => {
                                     // **The one thing the encoder cannot work out for itself.** A

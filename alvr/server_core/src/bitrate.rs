@@ -33,6 +33,11 @@ const BOOTSTRAP_FRAME_BYTES: usize = 24_000;
 /// How much smaller each bootstrap retry asks for.
 const BOOTSTRAP_SHRINK: f64 = 0.6;
 
+/// How much more than the budget the sender must have offered before a reading is treated as evidence
+/// about the client. A little above one: the budget is 70 % of a previous measurement, so offering
+/// exactly the budget is already offering more than the client read last time.
+const READ_INFORMATIVE_MARGIN: f64 = 1.0;
+
 /// How fast the read-rate high-water mark decays when the client reports less. See
 /// [`BitrateManager::report_client_read_rate`].
 const READ_CEILING_DECAY: f64 = 0.95;
@@ -134,6 +139,8 @@ pub struct BitrateManager {
     delivery_budget_per_sec: Option<f64>,
     /// What the client measured, kept for reporting: the sensor's own number, before the margin.
     read_ceiling_per_sec: u32,
+    /// What the sender was offering at the last report. See `report_client_read_rate`.
+    last_offered_per_sec: Option<u32>,
     /// The media plane's shape, without which a datagram budget cannot be turned into bytes: how many
     /// payload bytes a shard carries, and the fraction of extra shards the FEC adds.
     shard_bytes: usize,
@@ -194,6 +201,7 @@ impl BitrateManager {
             client_missing_permille: None,
             delivery_budget_per_sec: None,
             read_ceiling_per_sec: 0,
+            last_offered_per_sec: None,
             read_report_at: None,
             shard_bytes: 1_360,
             parity_ratio: 0.0,
@@ -234,14 +242,34 @@ impl BitrateManager {
     /// So a reading below the mark is treated as a window that was starved, and the mark decays
     /// slowly instead — five percent per report, so a client that has genuinely slowed down is
     /// followed within a few seconds while a momentary stall costs nothing.
-    pub fn report_client_read_rate(&mut self, per_sec: u32) {
+    /// `offered_per_sec` is what the sender actually put on the wire in the same window, because
+    /// **a reading is only evidence about the client when the sender offered more than the client
+    /// read**. A window in which the bootstrap held the stream to one frame is a window that says
+    /// nothing about capacity, and letting it decay the ceiling is the same collapse in slow motion:
+    /// measured, a stream that started at 222 datagrams/s settles at 18 as its own stop-and-wait
+    /// teaches the budget to expect nothing.
+    pub fn report_client_read_rate(&mut self, per_sec: u32, offered_per_sec: u32) {
         self.read_report_at = Some(Instant::now());
+        self.last_offered_per_sec = Some(offered_per_sec);
+
+        let informative = offered_per_sec as f64
+            >= self.delivery_budget_per_sec.unwrap_or(f64::MAX) * READ_INFORMATIVE_MARGIN;
+        if !informative {
+            // Hold the ceiling: this window was starved by our own pacing, not by the client.
+            return;
+        }
+
         let decayed = (self.read_ceiling_per_sec as f64 * READ_CEILING_DECAY) as u32;
         self.read_ceiling_per_sec = per_sec.max(decayed);
         if self.read_ceiling_per_sec > 0 {
             self.delivery_budget_per_sec =
                 Some(self.read_ceiling_per_sec as f64 * DELIVERY_BUDGET_FRACTION);
         }
+    }
+
+    /// What the sender was offering when the client last reported, for the summary.
+    pub fn last_offered_per_sec(&self) -> Option<u32> {
+        self.last_offered_per_sec
     }
 
     /// Tell the manager the media plane's shape, so a datagram budget can become a byte budget.
