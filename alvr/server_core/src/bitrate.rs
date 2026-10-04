@@ -189,7 +189,7 @@ impl BitrateManager {
 
         let mut bitrate_directives = BitrateDirectives::default();
 
-        let bitrate_bps = match &config.mode {
+        let mut bitrate_bps = match &config.mode {
             BitrateMode::ConstantMbps(bitrate_mbps) => *bitrate_mbps as f32 * 1e6,
             BitrateMode::Adaptive {
                 saturation_multiplier,
@@ -248,37 +248,6 @@ impl BitrateManager {
                     bitrate_directives.manual_min_throughput_bps = Some(min_bps);
                 }
 
-                // **The receiver's own measurement, and the only limiter that comes from it.**
-                //
-                // Every other signal here is the server's view of the link, or a latency the server
-                // measured on its own side. The client's queueing delay is the one fact that says
-                // the sender is outrunning the receiver — and the receiver being behind is what
-                // makes its frames arrive holed, its repairs impossible and its trust gate block,
-                // because a shard that is still queued and a shard that is lost are the same thing
-                // from its side.
-                //
-                // The target is one frame interval: a client less than a frame behind is reading as
-                // fast as frames are produced, which is as good as it gets. Past that the rate is
-                // scaled by how far past, so the correction is proportional — the same shape as
-                // Steam Link's, which selects a bandwidth against the fraction of the stream queued
-                // above ~60 ms.
-                if let Some(queue_us) = self.client_queue_delay_us {
-                    // **The target is the client's repair window, not a frame interval.**
-                    //
-                    // One frame interval was the first guess and it is too loose to ever fire: the
-                    // rig reported 14–18 ms of delay against a 33 ms target, while the client's
-                    // release window is ~12 ms — so the frame was still being released *before* its
-                    // own shards had finished arriving, which is the whole fault. A client that reads
-                    // a frame in less than the time it has to rebuild one is keeping up; anything
-                    // slower is the sender's to fix.
-                    let target_us = self.nominal_frame_interval.as_micros() as f32 / 3.0;
-                    if queue_us as f32 > target_us && queue_us > 0 {
-                        let max_bps = throughput_bps * target_us / queue_us as f32;
-                        throughput_bps = f32::min(throughput_bps, max_bps);
-                        bitrate_directives.client_queue_limiter_bps = Some(max_bps);
-                    }
-                }
-
                 // NB: Here we assign the calculated throughput to the requested bitrate. This is
                 // crucial for the working of the adaptive bitrate algorithm. The goal is to
                 // optimally occupy the available bandwidth, which is when the bitrate corresponds
@@ -286,6 +255,33 @@ impl BitrateManager {
                 throughput_bps
             }
         };
+
+        // **The receiver's own measurement — and it applies to every bitrate mode.**
+        //
+        // It was inside the adaptive arm first, which is where it was written and where it was
+        // invisible: the session's mode is `ConstantMbps`, so the limiter never ran and the client's
+        // report of 14–18 ms of queueing delay changed nothing. But a fixed rate is exactly the case
+        // this exists for — the user has pinned the bitrate, nothing else in the pipeline will ever
+        // lower it, and the client is saying its frames are arriving after they were needed.
+        //
+        // Every other limiter here is the server's view of the link, or a latency the server measured
+        // on its own side. This one is the receiver saying it is behind, and a shard still queued and
+        // a shard lost are the same fact from there — which is why nothing else the client can see
+        // was usable.
+        //
+        // The target is a third of a frame interval, because that is the client's rebuild window: a
+        // client that reads a frame faster than it is given to rebuild one is keeping up. (One frame
+        // interval was the first guess and too loose to ever fire.) Past the target the rate scales by
+        // how far past — proportional, like Steam Link's bandwidth choice against the fraction of the
+        // stream queued above ~60 ms.
+        if let Some(queue_us) = self.client_queue_delay_us {
+            let target_us = self.nominal_frame_interval.as_micros() as f32 / 3.0;
+            if queue_us > 0 && queue_us as f32 > target_us {
+                let max_bps = bitrate_bps * target_us / queue_us as f32;
+                bitrate_bps = f32::min(bitrate_bps, max_bps);
+                bitrate_directives.client_queue_limiter_bps = Some(max_bps);
+            }
+        }
 
         bitrate_directives.requested_bitrate_bps = bitrate_bps;
 
