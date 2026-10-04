@@ -400,6 +400,10 @@ impl SenderCrypto {
 /// genuinely stopped is treated as having stopped rather than as merely quiet.
 const MAX_OUTSTANDING_ACKS: usize = 360;
 
+/// How stale an acknowledgement may be and still count as a live report, for the frame-rate rung.
+/// A quarter of a second is several round trips on any link this plane is built for.
+const ACK_FRESHNESS: Duration = Duration::from_millis(250);
+
 /// The ratio a fixed policy stands for, for a controller that has to start somewhere.
 ///
 /// `ParityPolicy::Fixed` is a shard *count* rather than a fraction, so it has no fraction to
@@ -470,6 +474,14 @@ pub struct MediaSender {
     frame_divisor: u32,
     /// Frames seen since the last one that went out, for the divisor above.
     frames_seen: u64,
+    /// When the newest acknowledgement arrived, in the sender's own clock.
+    ///
+    /// "Has acknowledged at any point" is not enough to make frame dropping safe: the first few
+    /// acknowledgements of a session would enable it for the rest of it, and the run that did exactly
+    /// that completed 443 frames and held 428 on the gaps the dropping created. What makes the
+    /// dropping safe is a *live* acknowledgement loop — the encoder can only route around a hole it
+    /// has been told about.
+    last_ack_at: Option<Duration>,
     send_seq: u32,
     /// Set by a keyframe request; the caller takes it and asks the encoder.
     pending_keyframe: Option<u64>,
@@ -516,6 +528,7 @@ impl MediaSender {
             acks_seen: 0,
             frame_divisor: 1,
             frames_seen: 0,
+            last_ack_at: None,
             send_seq: 0,
             pending_keyframe: None,
             resume_from: None,
@@ -655,7 +668,9 @@ impl MediaSender {
         // use — it converts a stream of frames into a stream of holes. Measured: with the divisor on
         // and no acknowledgements, the client completed 443 frames and held 428 of them on gaps.
         if self.frame_divisor > 1
-            && self.client_acked_frame.is_some()
+            && self
+                .last_ack_at
+                .is_some_and(|at| now.saturating_sub(at) < ACK_FRESHNESS)
             && !meta.is_keyframe
             && !(self.frames_seen - 1).is_multiple_of(self.frame_divisor as u64)
         {
@@ -989,6 +1004,7 @@ impl MediaSender {
                 }
             }
             Feedback::Ack { frame_index } => {
+                self.last_ack_at = Some(now);
                 let newest = self.client_acked_frame.map_or(*frame_index, |cur| cur.max(*frame_index));
                 self.client_acked_frame = Some(newest);
                 self.stats.frames_acked += 1;

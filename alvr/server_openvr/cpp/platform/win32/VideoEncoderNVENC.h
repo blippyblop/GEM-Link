@@ -9,12 +9,16 @@ enum AdaptiveQuantizationMode { SpatialAQ = 1, TemporalAQ = 2 };
 
 /// How many long-term reference slots the encoder keeps.
 ///
-/// Four is two round trips at 90 Hz: enough that a confirmed frame survives a lost
-/// acknowledgement and a burst of unusable frames, small enough that marking every frame as an LTR
-/// costs the rate controller almost nothing. NVENC treats this as a ceiling and may keep fewer
-/// (`NV_ENC_CONFIG_HEVC::ltrNumFrames` is documented as guidance rather than a promise), which is
-/// why the code does not assume a slot exists merely because it is in range.
-const int LTR_SLOTS = 4;
+/// **Sixteen, and four was the number that did not work.** The slots rotate once per encoded frame,
+/// so four of them at 72 Hz cover 55 ms — shorter than the round trip an acknowledgement takes, which
+/// meant the frame the client had confirmed was always overwritten before the encoder could reference
+/// it. Measured on the live rig: the encoder fell back to referencing its immediately previous frame
+/// every time, which is the frame a hole is most likely to be, so the client held 485 frames on gaps
+/// while completing 497. Sixteen covers about a quarter of a second and costs a fraction of the rate
+/// controller's budget. NVENC treats this as a ceiling and may keep fewer
+/// (`NV_ENC_CONFIG_HEVC::ltrNumFrames` is documented as guidance rather than a promise), which is why
+/// the code does not assume a slot exists merely because it is in range.
+const int LTR_SLOTS = 16;
 
 /// The least time between two forced rebuilds of the reference chain, in milliseconds.
 ///
