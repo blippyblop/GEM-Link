@@ -394,6 +394,9 @@ pub struct PlaneStats {
     pub frames_abandoned: u64,
     pub frames_repaired: u64,
     pub nacks_sent: u64,
+    /// Frames whose missing shards were **not** asked for, because the client was missing too much of
+    /// every frame for a repair to be the answer. See [`NACK_SUPPRESS_MISSING_PERMILLE`].
+    pub nacks_suppressed: u64,
     pub keyframe_requests: u64,
     pub resets: u64,
     /// Queue-delay reports sent to the sender. See [`PlaneEvent::QueueDelay`].
@@ -429,8 +432,8 @@ impl PlaneStats {
             "video plane: {} datagrams in ({} dropped by source, {} rejected), {} frames presented \
              ({} across a hole on a confirmed reference), {} held ({} no-keyframe, {} gap, {} \
              datagram-loss, {} unconfirmed-reference, {} decoder), {} abandoned, \
-             {} repaired by FEC, {} keyframe(s) in ({} clean), {} nack(s), {} keyframe request(s), \
-             {} reset(s), {} ack(s)",
+             {} repaired by FEC, {} keyframe(s) in ({} clean), {} nack(s) ({} suppressed while \
+             drowning), {} keyframe request(s), {} reset(s), {} ack(s)",
             self.datagrams_received,
             self.datagrams_dropped_by_source,
             self.datagrams_rejected,
@@ -447,6 +450,7 @@ impl PlaneStats {
             self.keyframes_in,
             self.keyframes_clean,
             self.nacks_sent,
+            self.nacks_suppressed,
             self.keyframe_requests,
             self.resets,
             self.acks_sent,
@@ -455,6 +459,20 @@ impl PlaneStats {
 }
 
 const QUEUE_REPORT_FRAMES: u32 = 30;
+
+/// Above this share of a frame's declared shards missing, the client stops asking for repairs.
+///
+/// **A client that is drowning does not ask for more water.** A repair is a datagram like any other
+/// and it crosses the same link, so a client that is missing a large share of *every* frame is a
+/// client whose requests become the congestion: measured on the live rig, 20 229 retransmitted
+/// datagrams against 43 229 sent — every second datagram on the wire was a repair the client had
+/// asked for, and 10 686 of them arrived after the frame they were for had been given up on. The
+/// ask cannot be right when the receiver is the bottleneck; the answer to that is for the *sender*
+/// to send less, which is what the same report carries (see `Feedback::QueueDelay`).
+///
+/// Ten percent is the point where a frame is unlikely to survive on its own stragglers anyway, and
+/// well above the sub-one-percent a healthy link shows.
+const NACK_SUPPRESS_MISSING_PERMILLE: u32 = 100;
 
 /// The client's video receive path.
 pub struct VideoPlane {
@@ -662,15 +680,27 @@ impl VideoPlane {
         // The floor under the whole idea is that a client which is behind cannot distinguish "this
         // shard is lost" from "this shard is still queued behind me". The fix for that is to stop
         // being behind, not to tune the question — which is what the queue-delay report below is for.
+        //
+        // And there is one condition under which it is not made at all: see
+        // [`NACK_SUPPRESS_MISSING_PERMILLE`]. The timing experiments above were about *when* to ask;
+        // this is about *whether*, and the difference is that the answer is now measurable — the
+        // client knows what share of every frame it is failing to receive, and while that is most of
+        // a frame, asking for more of it is asking the sender to add to the congestion.
+        let drowning = self.receiver.stats().missing_permille > NACK_SUPPRESS_MISSING_PERMILLE;
         for frame_index in self.receiver.incomplete_frames() {
             let fragments = self.receiver.nack(frame_index);
-            if !fragments.is_empty() {
-                self.stats.nacks_sent += fragments.len() as u64;
-                events.push(PlaneEvent::Nack {
-                    frame_index,
-                    fragments,
-                });
+            if fragments.is_empty() {
+                continue;
             }
+            if drowning {
+                self.stats.nacks_suppressed += 1;
+                continue;
+            }
+            self.stats.nacks_sent += fragments.len() as u64;
+            events.push(PlaneEvent::Nack {
+                frame_index,
+                fragments,
+            });
         }
 
         // Tell the sender how far behind the client is reading. This is the one signal that lets the

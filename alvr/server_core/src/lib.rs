@@ -558,14 +558,12 @@ impl ServerCoreContext {
             if reference_frame != 0 && !is_idr {
                 static CHECKED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
                 let mut checked = CHECKED.lock();
-                if !*checked
-                    && !self
-                        .connection_context
-                        .bitrate_manager
-                        .lock()
-                        .client_ack()
-                        .contains(reference_frame)
-                {
+                let ack = self.connection_context.bitrate_manager.lock().client_ack();
+                // Only a claim made *while the client is talking to us* can be wrong. With no
+                // acknowledgements at all the encoder is in its fallback branch — it reports the
+                // frame it actually built on, which is unconfirmed by definition, and the client
+                // holds on it. That is the designed behaviour, not a disagreement.
+                if !*checked && ack.valid && !ack.contains(reference_frame) {
                     *checked = true;
                     warn!(
                         "frame {frame_index} says it was encoded against {reference_frame}, which the \
