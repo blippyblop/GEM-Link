@@ -1319,10 +1319,19 @@ fn connection_pipeline(
                         .unwrap_or(0.0)
                         as f64
                         / 1e6;
-                    let divisor = ctx.bitrate_manager.lock().ladder_frame_divisor();
+                    let (divisor, read_ceiling, budget) = {
+                        let manager = ctx.bitrate_manager.lock();
+                        (
+                            manager.ladder_frame_divisor(),
+                            manager.read_ceiling_per_sec(),
+                            manager.delivery_budget_per_sec(),
+                        )
+                    };
                     info!(
                         "encoder: {mean_bytes:.0} B/frame ({mean_mbps:.2} Mbps at {fps:.0} fps), asked \
-                         for {asked_mbps:.2} Mbps, sending 1 frame in {divisor}"
+                         for {asked_mbps:.2} Mbps, sending 1 frame in {divisor}; client reads \
+                         {read_ceiling} datagram(s)/s, budget {} datagram(s)/s",
+                        budget.unwrap_or(0.0).round() as u64
                     );
                     info!(
                         "media sender: {} frame(s) sent, {} datagram(s) ({} parity), {} skipped for \
