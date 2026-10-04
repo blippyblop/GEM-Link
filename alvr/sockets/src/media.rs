@@ -84,9 +84,16 @@ impl MediaSocket {
 
     /// Bind for receiving from **one** peer. Datagrams from anywhere else are counted and dropped:
     /// a client that accepts a datagram from anywhere is a client that will believe anything.
+    ///
+    /// The **host** is pinned, not the port: the peer sends from an ephemeral port, and this end
+    /// cannot know it until a datagram arrives ([`MediaSocket::last_sender`]), which
+    /// [`MediaSocket::accept_only_from`] pins at that point. The only port available here is this
+    /// end's own, and pinning *that* means no datagram ever matches — the socket drains into a
+    /// counter and the plane reports an empty link while packets pile up in the kernel buffer. Port
+    /// 0 is the encoding for "any port from this host".
     pub fn bind_to(port: u16, peer: IpAddr, dscp: Option<DscpTos>) -> ConResult<Self> {
         let mut socket = Self::bind(port, dscp)?;
-        socket.peer = Some(SocketAddr::new(peer, port));
+        socket.peer = Some(SocketAddr::new(peer, 0));
         Ok(socket)
     }
 
@@ -196,7 +203,11 @@ impl MediaSocket {
 
 impl DatagramSink for MediaSocket {
     fn send(&mut self, datagram: &[u8]) -> Result<(), SinkError> {
-        let result = match self.peer {
+        // A peer pinned by `bind_to` has no port — it is a *receive* filter until the peer's source
+        // is learned. Sending to "any port" is meaningless, so it is treated as no peer at all, and
+        // the connected send that follows fails loudly rather than going somewhere arbitrary.
+        let peer = self.peer.filter(|peer| peer.port() != 0);
+        let result = match peer {
             Some(peer) => self.socket.send_to(datagram, peer),
             None => self.socket.send(datagram),
         };
@@ -230,7 +241,12 @@ impl DatagramSource for MediaSocket {
         let mut buffer = [0u8; MAX_DATAGRAM_SIZE];
         match self.socket.recv_from(&mut buffer) {
             Ok((len, from)) => {
-                if self.peer.is_some_and(|peer| peer != from) {
+                // A peer with port 0 pins the **host** only — the sender's source port is ephemeral
+                // and is learned from the first datagram. `accept_only_from` replaces the peer with
+                // an exact address, which then matches on the port as well.
+                if let Some(peer) = self.peer
+                    && (peer.ip() != from.ip() || (peer.port() != 0 && peer.port() != from.port()))
+                {
                     self.datagrams_from_elsewhere += 1;
                     // Reported as a timeout rather than as a datagram: it is not a fragment, and
                     // handing it to the receiver would count it as a rejected one — which is a
@@ -354,6 +370,68 @@ mod tests {
             SourceEvent::Timeout
         );
         assert!(out.is_empty());
+        assert_eq!(receiver.datagrams_from_elsewhere(), 1);
+    }
+
+    /// The defect a live run found, and the reason the whole media plane looked dead while the
+    /// kernel's receive queue filled up.
+    ///
+    /// `bind_to` used to pin the peer to `peer_ip:<this end's own port>`. The peer sends from an
+    /// *ephemeral* port — it cannot bind the client's media port, and the client cannot know the
+    /// ephemeral one until a datagram arrives — so no datagram ever matched, every one was counted
+    /// `from_elsewhere` and dropped, and the plane reported `0 datagrams in (0 dropped, 0 rejected)`
+    /// on a link that was delivering perfectly. A black screen that reads as a network fault.
+    #[test]
+    fn bind_to_pins_the_host_and_not_the_source_port() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // A concrete local port, exactly as the client's media port is — not 0. The bug this
+        // guards was `peer = peer_ip:<this port>`, and port 0 would accidentally agree with the
+        // "any port" encoding and hide it.
+        let probe = ok(MediaSocket::bind(0, None), "probe");
+        let port = ok(probe.local_addr(), "probe addr").port();
+        drop(probe);
+
+        let mut receiver = ok(
+            MediaSocket::bind_to(port, IpAddr::V4(Ipv4Addr::LOCALHOST), None),
+            "bind_to receiver",
+        );
+        assert_eq!(
+            receiver.peer,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            "the port must not be pinned to this end's own"
+        );
+        let addr = ok(receiver.local_addr(), "local addr");
+        assert_eq!(addr.port(), port);
+
+        // The peer, sending from whatever ephemeral port the kernel gave it.
+        let mut sender = ok(MediaSocket::connect_to(addr, None), "connect sender");
+        sender.send(b"a fragment from the streamer").unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(
+            receiver.recv(&mut out, Duration::from_millis(50)),
+            SourceEvent::Datagram,
+            "a datagram from the pinned host must be handed over, whatever port it came from"
+        );
+        assert_eq!(out, b"a fragment from the streamer");
+        assert_eq!(receiver.datagrams_from_elsewhere(), 0);
+    }
+
+    /// ...and once the source *is* known, the exact address — including its port — is enforced.
+    #[test]
+    fn accept_only_from_still_matches_on_the_port() {
+        let (mut receiver, mut sender) = pair();
+        receiver.accept_only_from("127.0.0.1:1".parse().unwrap());
+
+        let target = ok(receiver.local_addr(), "local addr");
+        sender.send_to(&target, b"from the wrong port").unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(
+            receiver.recv(&mut out, Duration::from_millis(20)),
+            SourceEvent::Timeout
+        );
         assert_eq!(receiver.datagrams_from_elsewhere(), 1);
     }
 
