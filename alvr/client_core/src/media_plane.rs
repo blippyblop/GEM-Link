@@ -366,14 +366,6 @@ impl PlaneStats {
     }
 }
 
-/// What the client assumes a repair round trip costs.
-///
-/// The same assumption the release policy is already built on — its repair window is a straggler
-/// window **plus a round trip** — and it is what [`x_transport::nack_retry_interval`] is fed. Asking
-/// again sooner than a round trip could have been answered is asking for something that is already
-/// on its way.
-const NACK_ROUND_TRIP: Duration = Duration::from_millis(6);
-
 /// The client's video receive path.
 pub struct VideoPlane {
     receiver: Receiver,
@@ -381,9 +373,6 @@ pub struct VideoPlane {
     stall: StuckDetector,
     started: Instant,
     stats: PlaneStats,
-    /// When each still-incomplete frame was last asked for, so the ask is made **once per round
-    /// trip** rather than once per release pass. See the note in [`VideoPlane::release`].
-    nacked_at: std::collections::HashMap<u64, Duration>,
 }
 
 impl VideoPlane {
@@ -398,7 +387,6 @@ impl VideoPlane {
             stall: StuckDetector::new(now),
             started: now,
             stats: PlaneStats::default(),
-            nacked_at: std::collections::HashMap::new(),
         }
     }
 
@@ -500,39 +488,30 @@ impl VideoPlane {
         // Ask for the fragments of anything still incomplete. The receiver knows which ones are
         // missing; this is the round trip that saves a frame instead of a keyframe.
         //
-        // **Once per round trip, not once per pass.** A frame stays incomplete across many passes,
-        // and re-asking on each of them asks for the same fragments again — which the sender
-        // dutifully answers. The repair traffic then becomes load on a link that is already losing
-        // datagrams, and the loss it is reacting to is the loss it is causing. `nack_retry_interval`
-        // is the cadence the other end assumes, so it is the only cadence that can be right. (The
-        // sender refuses to answer the same request twice inside the same window: see
-        // `MediaSender::repair`.)
-        let incomplete = self.receiver.incomplete_frames();
-        // Frames that have left the receiver's hands will never be asked for again.
-        self.nacked_at
-            .retain(|index, _| incomplete.contains(index));
-
-        let retry_floor = x_transport::nack_retry_interval(NACK_ROUND_TRIP);
-        for frame_index in incomplete {
-            let retry_due = self
-                .nacked_at
-                .get(&frame_index)
-                .is_none_or(|last| clock.saturating_sub(*last) >= retry_floor);
-            if !retry_due {
-                continue;
-            }
-
+        // This is deliberately the only place the ask is made, and deliberately ungated. Two attempts
+        // at making it cleverer were measured on the rig and both were worse:
+        //
+        // - Moving it into `pump` to go out sooner (`c73255bf`) put the ask *before* the frame's own
+        //   shards had finished arriving. On this rig the client's socket carries a backlog, so the
+        //   "missing" set at that moment is mostly datagrams already on their way in — the requests
+        //   named them, the sender answered them, and the repair traffic became the congestion.
+        //   Measured: 6.6 k requests answered with 35 k datagrams, and 40 frames presented against
+        //   927 for this version.
+        // - Rate-limiting it per round trip without moving it (`03e2e961`) left one ask where there
+        //   had been several, and that one ask landed after the release pass — past the window.
+        //
+        // The floor under the whole idea is that a client which is behind cannot distinguish "this
+        // shard is lost" from "this shard is still queued behind me". The fix for that is to stop
+        // being behind, not to tune the question.
+        for frame_index in self.receiver.incomplete_frames() {
             let fragments = self.receiver.nack(frame_index);
-            if fragments.is_empty() {
-                continue;
+            if !fragments.is_empty() {
+                self.stats.nacks_sent += fragments.len() as u64;
+                events.push(PlaneEvent::Nack {
+                    frame_index,
+                    fragments,
+                });
             }
-
-            self.nacked_at.insert(frame_index, clock);
-            self.stats.nacks_sent += fragments.len() as u64;
-            events.push(PlaneEvent::Nack {
-                frame_index,
-                fragments,
-            });
         }
 
         events
