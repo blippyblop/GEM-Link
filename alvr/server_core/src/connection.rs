@@ -1072,6 +1072,7 @@ fn connection_pipeline(
                 fraction: MEDIA_STARTING_FEC_FRACTION,
             },
             &media_release_policy(fps),
+            frame_interval,
         ),
         PacerConfig::for_rate(nominal_bitrate_bps(&initial_settings), frame_interval),
         frame_interval,
