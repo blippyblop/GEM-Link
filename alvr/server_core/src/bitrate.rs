@@ -256,8 +256,14 @@ impl BitrateManager {
         self.read_report_at = Some(Instant::now());
         self.last_offered_per_sec = Some(offered_per_sec);
 
-        let informative = offered_per_sec as f64
-            >= self.delivery_budget_per_sec.unwrap_or(f64::MAX) * READ_INFORMATIVE_MARGIN;
+        // The **first** report is always informative: there is no budget to compare it against, and
+        // without one the stream has nothing to solve from. Every report after that is evidence only
+        // if the sender was offering at least what it had budgeted — otherwise the window says more
+        // about our pacing than about the client.
+        let informative = match self.delivery_budget_per_sec {
+            None => true,
+            Some(budget) => offered_per_sec as f64 >= budget * READ_INFORMATIVE_MARGIN,
+        };
         if !informative {
             // Hold the ceiling: this window was starved by our own pacing, not by the client.
             return;
