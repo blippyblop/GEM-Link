@@ -23,7 +23,7 @@ use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientConnectionsAction, ClientControlPacket,
     ClientNegotiatedStreamingConfig, ClientStatistics, HAPTICS, NegotiatedStreamingConfigExt,
     RealTimeConfig, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VideoPacketHeader,
+    VideoPacketHeader,
 };
 use alvr_session::BitrateMode;
 use alvr_session::{
@@ -44,8 +44,8 @@ use std::{
     time::{Duration, Instant},
 };
 use x_transport::{
-    DatagramSink, DatagramSource, Feedback, FeedbackOutcome, FrameMeta, MediaSender, PacerConfig,
-    ParityPolicy, SenderConfig, SourceEvent, TimebaseOffset,
+    DatagramSource, FeedbackOutcome, FrameMeta, MediaSender, PacerConfig, ParityPolicy,
+    SenderConfig, SourceEvent, TimebaseOffset,
 };
 
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -94,12 +94,23 @@ fn media_release_policy(fps: f32) -> x_transport::ReleasePolicy {
 /// adapted would be two controllers fighting over one actuator. This is the rate the *settings* ask
 /// for, and the frame-level `over_budget` warning is how the settings find out they are wrong.
 fn nominal_bitrate_bps(settings: &alvr_session::Settings) -> u64 {
+    // Adaptive mode with no ceiling asks the *controller* to find the rate, which the pacer cannot
+    // do — it is deliberately not adaptive. The safe direction is a pacer sized *above* the
+    // controller rather than below it: too high and the controller is the only rate authority (its
+    // own `max_throughput_mbps` limiter still applies); too low and the pacer throttles the stream
+    // beneath the rate the controller chose, which shows up as `over_budget` on every frame. The
+    // top of the setting's own range is the honest ceiling to fall back to.
+    const UNBOUNDED_ADAPTIVE_BPS: u64 = 1_000_000_000;
+
     match &settings.video.bitrate.mode {
         BitrateMode::ConstantMbps(mbps) => *mbps * 1_000_000,
         BitrateMode::Adaptive {
             max_throughput_mbps,
             ..
-        } => *max_throughput_mbps * 1_000_000,
+        } => match max_throughput_mbps {
+            Switch::Enabled(mbps) => *mbps * 1_000_000,
+            Switch::Disabled => UNBOUNDED_ADAPTIVE_BPS,
+        },
     }
 }
 
@@ -780,6 +791,11 @@ fn connection_pipeline(
         warn!("Chosen refresh rate not supported. Using {fps}Hz");
     }
 
+    // One frame at the chosen rate. The media plane is built on this number — the pacer's burst
+    // credit, the sender's own `frame_interval` and the release policy all derive from it — so it is
+    // computed once, from the negotiated rate, rather than re-derived from `fps` at each use.
+    let frame_interval = Duration::from_secs_f32(1.0 / fps.max(1.0));
+
     let foveated_encoding = if let Switch::Enabled(config) =
         &initial_settings.video.foveated_encoding
     {
@@ -1053,7 +1069,10 @@ fn connection_pipeline(
         ),
         PacerConfig::for_rate(nominal_bitrate_bps(&initial_settings), frame_interval),
         frame_interval,
-        None,
+        // Sealed with the same session key the client derives, under the media label. This is what
+        // the client demands: a media datagram that is not sealed under the negotiated epoch key is
+        // refused, so a server that sent in the clear would deliver exactly zero frames.
+        Some(media_keys),
     );
     video_sender.set_rtt(MEDIA_ROUND_TRIP);
 

@@ -432,6 +432,7 @@ dependencies = [
  "alvr_sockets",
  "ash",
  "axum",
+ "bincode",
  "chrono",
  "fern",
  "flume",

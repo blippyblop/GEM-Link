@@ -28,6 +28,7 @@ x-transport = { path = "../x-transport" }
 
 ash = "0.38"
 axum = { version = "0.8", features = ["ws"] }
+bincode = { version = "2", features = ["serde"] }
 chrono = "0.4"
 fern = "0.7"
 flume = "0.11"
