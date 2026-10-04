@@ -620,7 +620,10 @@ fn connection_pipeline(
                                 // left, which the next release decides.
                             }
                         }
-                        crate::media_plane::MediaPlaneAction::QueueDelay { micros, late } => {
+                        crate::media_plane::MediaPlaneAction::QueueDelay {
+                            micros,
+                            late_per_mille,
+                        } => {
                             // The client's own queueing delay, carried back so the sender can send
                             // *less*. Every other message either end sends is about a frame; this is
                             // the only one that is about the receiver, and without it the sender has
@@ -636,7 +639,10 @@ fn connection_pipeline(
                                 continue;
                             }
 
-                            let feedback = x_transport::Feedback::QueueDelay { micros, late };
+                            let feedback = x_transport::Feedback::QueueDelay {
+                                micros,
+                                late_per_mille,
+                            };
                             let mut sealed = [0u8; x_transport::MAX_FEEDBACK_LEN];
                             let Ok(len) = feedback_sender.seal(&feedback, &mut sealed) else {
                                 continue;

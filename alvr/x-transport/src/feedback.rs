@@ -82,15 +82,17 @@ pub enum Feedback {
     /// many frames, and a control loop fed per-frame noise is a control loop that oscillates.
     QueueDelay {
         micros: u32,
-        /// How many datagrams arrived **after** their frame had been released, since the last
-        /// report.
+        /// What share of the fragments the client asked for, since the last report, **arrived late
+        /// rather than never** — in tenths of a percent, so it fits in a `u16` with room to spare.
         ///
-        /// These are the NACKs that were answered too late to help, and they are **not loss**. The
-        /// sender subtracts them from the loss it feeds the parity controller, because otherwise —
-        /// and this is what was measured — it reads a queued receiver as a lossy link, answers with
-        /// more parity, and the parity queues behind the same backlog: 50 % of the fresh traffic, at
-        /// the layout's ceiling, repairing almost nothing.
-        late: u32,
+        /// These are requests that were answered too late to help, and they are **not loss**. A share
+        /// rather than a count because the client's reporting interval and the sender's loss window
+        /// are different lengths and both are ours: a count has to be credited to the interval it was
+        /// measured over, and two earlier attempts to do that got it wrong — one subtracted once per
+        /// report against a window holding thousands of requests, the other dumped a 30-frame count
+        /// into an 8-frame window that then reset and took most of it away. A share needs no
+        /// interval: the sender applies it to its own window's requests.
+        late_per_mille: u16,
     },
 }
 
@@ -147,11 +149,11 @@ impl Feedback {
                 out.extend_from_slice(&last_presented.to_le_bytes());
                 out
             }
-            Feedback::QueueDelay { micros, late } => {
-                let mut out = Vec::with_capacity(9);
+            Feedback::QueueDelay { micros, late_per_mille } => {
+                let mut out = Vec::with_capacity(11);
                 out.push(TAG_QUEUE_DELAY);
                 out.extend_from_slice(&micros.to_le_bytes());
-                out.extend_from_slice(&late.to_le_bytes());
+                out.extend_from_slice(&late_per_mille.to_le_bytes());
                 out
             }
         }
@@ -208,13 +210,16 @@ impl Feedback {
                         .try_into()
                         .expect("4 bytes"),
                 );
-                let late = u32::from_le_bytes(
-                    body.get(4..8)
+                let late_per_mille = u16::from_le_bytes(
+                    body.get(4..6)
                         .ok_or(FeedbackError::Truncated)?
                         .try_into()
-                        .expect("4 bytes"),
+                        .expect("2 bytes"),
                 );
-                Ok(Feedback::QueueDelay { micros, late })
+                Ok(Feedback::QueueDelay {
+                    micros,
+                    late_per_mille,
+                })
             }
             other => Err(FeedbackError::UnknownTag(other)),
         }
@@ -412,7 +417,7 @@ mod tests {
             Feedback::StreamReset {
                 last_presented: 1_000_000,
             },
-            Feedback::QueueDelay { micros: 41_000, late: 1_234 },
+            Feedback::QueueDelay { micros: 41_000, late_per_mille: 123 },
         ];
 
         for message in messages {

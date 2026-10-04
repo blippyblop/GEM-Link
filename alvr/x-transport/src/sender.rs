@@ -258,7 +258,7 @@ struct LossWindow {
     /// of requests is a correction that does not exist. This is the difference between a loss
     /// measurement and a queueing measurement, and the parity controller was being fed the second
     /// while believing it had the first.
-    late_fragments: u64,
+    late_fraction: f64,
 }
 
 impl LossWindow {
@@ -269,8 +269,9 @@ impl LossWindow {
             // Clamped: a client that asks for the same fragment repeatedly — which a real one does,
             // see `nack_retry_interval` — would otherwise report a loss above 100 %. Erring high is
             // the safe direction for a parity estimate, but above 1.0 it is not an estimate at all.
-            let genuinely_missing = self.fragments_requested.saturating_sub(self.late_fragments);
-            (genuinely_missing as f64 / self.datagrams_sent as f64).min(1.0)
+            let genuinely_missing =
+                self.fragments_requested as f64 * (1.0 - self.late_fraction);
+            (genuinely_missing / self.datagrams_sent as f64).min(1.0)
         }
     }
 
@@ -278,7 +279,7 @@ impl LossWindow {
         self.frames = 0;
         self.datagrams_sent = 0;
         self.fragments_requested = 0;
-        self.late_fragments = 0;
+        self.late_fraction = 0.0;
     }
 }
 
@@ -360,6 +361,9 @@ pub struct MediaSender {
     /// [`FeedbackOutcome::QueueDelay`] — the caller turns this into a rate, because only the
     /// caller knows what the encoder's floor is.
     reported_queue_delay_us: Option<u32>,
+    /// The share of the client's repair requests that arrived late rather than never, from its last
+    /// report. Applied to this end's own window, so the two never have to agree on an interval.
+    late_fraction: f64,
     /// The last loss the controller was told about, for the summary and for a caller that wants to
     /// know why the ratio moved.
     observed_loss: f64,
@@ -400,6 +404,7 @@ impl MediaSender {
             loss_window_frames: 8,
             loss_window: LossWindow::default(),
             reported_queue_delay_us: None,
+            late_fraction: 0.0,
             observed_loss: 0.0,
             send_seq: 0,
             pending_keyframe: None,
@@ -621,6 +626,10 @@ impl MediaSender {
             return;
         }
 
+        // The window carries the correction, the sender carries the report. Copy it in before the
+        // ratio is computed — the two are separate fields and only one of them was being written.
+        self.loss_window.late_fraction = self.late_fraction;
+
         let loss = self.loss_window.loss();
         self.observed_loss = loss;
         self.stats.last_loss = loss;
@@ -705,23 +714,26 @@ impl MediaSender {
                     last_presented: *last_presented,
                 }
             }
-            Feedback::QueueDelay { micros, late } => {
+            Feedback::QueueDelay { micros, late_per_mille } => {
                 self.stats.queue_delay_reports += 1;
                 self.stats.reported_queue_delay_us = *micros as u64;
                 self.reported_queue_delay_us = Some(*micros);
 
-                // **The correction that keeps the parity controller honest.**
+                // **The correction that keeps the parity controller honest, as a rate.**
                 //
                 // A NACK is the only loss signal the sender has, and a client that is behind NACKs
-                // fragments that are not lost — they are queued behind it. Nothing distinguishes the
-                // two locally, which is why the client reports the late arrivals it can count:
-                // requests that *were* answered, after the frame was gone. Adding them to the window
-                // (not subtracting them once) is what makes the ratio that the controller sees a
-                // loss measurement rather than a queueing measurement. Without it the controller
-                // answered a queued receiver with parity, which queued behind the same backlog —
-                // 50 % of the fresh traffic at the layout's ceiling, repairing 3 frames in 4200.
-                self.loss_window.late_fragments += *late as u64;
-                self.adapt_parity();
+                // fragments that are not lost — they are queued behind it. The client reports the
+                // late arrivals it can count: requests that *were* answered, after the frame was
+                // gone. They have to be subtracted from the same interval the requests were counted
+                // over, and the two intervals are not the same length — the report covers its own
+                // frame count and the loss window covers another, and both are ours. So it goes in
+                // as a **rate**, accrued as the window fills.
+                //
+                // Two earlier versions of this did nothing: one subtracted once per report against a
+                // window holding thousands of requests, and one dumped a 30-frame count into an
+                // 8-frame window that then reset and took most of it with it. Both left the ratio
+                // pinned at the layout's 50 % ceiling, repairing 3 frames in 4200.
+                self.late_fraction = (*late_per_mille as f64 / 1000.0).min(1.0);
 
                 FeedbackOutcome::QueueDelay { micros: *micros }
             }
@@ -998,7 +1010,7 @@ mod tests {
             &mut repairs,
             &Feedback::QueueDelay {
                 micros: 18_000,
-                late: 3,
+                late_per_mille: 1000,
             },
             Duration::from_millis(110),
         );
@@ -1049,7 +1061,7 @@ mod tests {
             &mut repairs,
             &Feedback::QueueDelay {
                 micros: 18_000,
-                late: 1,
+                late_per_mille: 333,
             },
             Duration::from_millis(110),
         );

@@ -173,7 +173,7 @@ pub enum MediaPlaneAction {
     Reset { stalled_for: Duration },
     /// The client's own queueing delay, to be carried back to the sender. The only message either
     /// end sends that is about the *receiver* rather than a frame.
-    QueueDelay { micros: u32, late: u32 },
+    QueueDelay { micros: u32, late_per_mille: u16 },
 }
 
 /// The client's video receive path, driven by a socket.
@@ -257,8 +257,8 @@ impl MediaPlaneReceiver {
                     Some(MediaPlaneAction::AskForKeyframe { stalled_for })
                 }
                 PlaneEvent::Reset { stalled_for } => Some(MediaPlaneAction::Reset { stalled_for }),
-                PlaneEvent::QueueDelay { micros, late } => {
-                    Some(MediaPlaneAction::QueueDelay { micros, late })
+                PlaneEvent::QueueDelay { micros, late_per_mille } => {
+                    Some(MediaPlaneAction::QueueDelay { micros, late_per_mille })
                 }
             })
             .collect();
@@ -339,7 +339,7 @@ pub enum PlaneEvent {
     Reset { stalled_for: Duration },
     /// How far behind the client is reading, for the sender. See
     /// [`FeedbackOutcome::QueueDelay`](x_transport::FeedbackOutcome::QueueDelay).
-    QueueDelay { micros: u32, late: u32 },
+    QueueDelay { micros: u32, late_per_mille: u16 },
 }
 
 /// Counters, because a receive path whose behaviour is only visible in the picture cannot be
@@ -423,8 +423,11 @@ pub struct VideoPlane {
     /// one that oscillates.
     frames_since_queue_report: u32,
     /// The receiver's late-datagram count at the last queue report, so each report carries the
-    /// delta rather than the running total.
+    /// delta rather than the running total, and the repair requests the same interval made, so the
+    /// delta can be expressed as a share of them 2014 which is the only form the sender can apply
+    /// without having to agree on an interval.
     last_late_reported: u64,
+    last_nacks_reported: u64,
 }
 
 impl VideoPlane {
@@ -441,6 +444,7 @@ impl VideoPlane {
             stats: PlaneStats::default(),
             frames_since_queue_report: 0,
             last_late_reported: 0,
+            last_nacks_reported: 0,
         }
     }
 
@@ -617,11 +621,20 @@ impl VideoPlane {
             let late = late_total.saturating_sub(self.last_late_reported);
             self.last_late_reported = late_total;
 
-            if micros > 0 || late > 0 {
+            let nacks_total = self.stats.nacks_sent;
+            let nacks = nacks_total.saturating_sub(self.last_nacks_reported);
+            self.last_nacks_reported = nacks_total;
+            let late_per_mille = if nacks == 0 {
+                0
+            } else {
+                ((late * 1000) / nacks).min(1000) as u16
+            };
+
+            if micros > 0 || late_per_mille > 0 {
                 self.stats.queue_delay_reports += 1;
                 events.push(PlaneEvent::QueueDelay {
                     micros: micros.min(u32::MAX as u64) as u32,
-                    late: late.min(u32::MAX as u64) as u32,
+                    late_per_mille,
                 });
             }
         }
