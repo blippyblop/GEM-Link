@@ -281,6 +281,12 @@ impl MediaPlaneReceiver {
     pub fn oversized_datagrams(&self) -> u64 {
         self.source.datagrams_oversized()
     }
+
+    /// Datagrams read off the socket, whatever became of them. The one number that separates "the
+    /// wire lost it" from "we never looked".
+    pub fn datagrams_received(&self) -> u64 {
+        self.source.datagrams_received()
+    }
 }
 
 /// What the receive path decided. One of these per frame, plus the ladder's escalations.
@@ -998,6 +1004,135 @@ mod tests {
         // same index, with the server's own target time beside it.
         assert_eq!(trace.len(), 1);
         assert_eq!(trace.frame_index_at(0), Some(7));
+    }
+
+    /// **The switch, end to end.** A real `MediaSender` on one side of a real socket, the client's
+    /// `MediaPlaneReceiver` on the other, and the frame that comes out has to be the frame that went
+    /// in — header and all.
+    ///
+    /// This exists because the switch introduced framing that nothing exercised: the per-frame
+    /// header is now serialised *in front of* the NAL and travels on the same datagrams, and if the
+    /// split is wrong the client hands the decoder a NAL with a header glued to the front of it.
+    /// That is a decoder that either fails or produces a plausible wrong picture, and neither of
+    /// those is a thing to find out on a device.
+    #[test]
+    fn a_frame_the_server_sends_arrives_with_its_header_and_its_bytes() {
+        use alvr_common::ViewParams;
+        use alvr_packets::VideoPacketHeader;
+
+        /// `ConnectionError` is not `Debug`, so an assertion helper rather than `unwrap`.
+        fn ok<T>(result: alvr_common::ConResult<T>, what: &str) -> T {
+            match result {
+                Ok(value) => value,
+                Err(e) => panic!("{what}: {e}"),
+            }
+        }
+
+        // Only the receiver's socket is used: the sending end is a `MediaSocket::connect_to`, which
+        // is the shape the server actually has.
+        let (receiver_socket, _unused) = socket_pair();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        let mut sender_side = ok(MediaSocket::connect_to(receiver_addr, None), "connect");
+        let receiver_side = socket_from(receiver_socket);
+        // Deliberately *not* pinned to `sender_side.local_addr()`: the sender bound an unspecified
+        // address, so it reports `0.0.0.0:port` while its datagrams arrive from `127.0.0.1:port`.
+        // Pinning to the reported address rejects every datagram as foreign — which is exactly what
+        // this test did the first time it ran, and why `MediaSocket::connect_to` now documents it.
+
+        let interval = Duration::from_millis(11);
+        let schedule = x_transport::KeySchedule::with_frames_per_key([42u8; 32], u64::MAX);
+        let policy = ReleasePolicy {
+            straggler_delay: Duration::ZERO,
+            repair_delay: Duration::from_millis(30),
+            deadline: Duration::from_millis(60),
+            jitter_frames: 0,
+        };
+
+        let mut sender = x_transport::MediaSender::new(
+            x_transport::SenderConfig::matching_policy(
+                MTU,
+                ParityPolicy::Ratio { fraction: 0.05 },
+                &policy,
+            ),
+            x_transport::PacerConfig::for_rate(300_000_000, interval),
+            interval,
+            Some(schedule.clone()),
+        );
+
+        let header = VideoPacketHeader {
+            frame_index: 7,
+            timestamp: Duration::from_millis(1_234),
+            global_view_params: [ViewParams::DUMMY; 2],
+            foveation_center_shifts: Some([[0.25, 0.5], [0.75, 0.5]]),
+            is_idr: true,
+        };
+        let nal: Vec<u8> = vec![0, 0, 0, 1, 0x26, 0x01, 0xde, 0xad, 0xbe, 0xef];
+
+        // Exactly what the server does: the header in front of the NAL, one frame.
+        let mut frame_bytes =
+            bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
+        frame_bytes.extend_from_slice(&nal);
+
+        let sent = sender.send_frame(
+            &mut sender_side,
+            x_transport::FrameMeta {
+                frame_index: header.frame_index,
+                target_timestamp_us: header.timestamp.as_micros() as u64,
+                is_keyframe: header.is_idr,
+                key_epoch: 0,
+            },
+            &frame_bytes,
+            Duration::ZERO,
+        );
+        assert_eq!(sent.refused, 0, "the frame was not sent");
+
+        let now = Instant::now();
+        let mut plane = MediaPlaneReceiver::new(receiver_side, policy, Some(schedule), now);
+        let mut trace = LatencyTrace::new(64);
+
+        let mut decoded = None;
+        for _ in 0..50 {
+            let (actions, open) = plane.poll(&mut trace, Instant::now(), Duration::from_millis(5));
+            assert!(open);
+            for action in actions {
+                if let MediaPlaneAction::Decode { payload, .. } = action {
+                    decoded = Some(payload);
+                }
+            }
+            if decoded.is_some() {
+                break;
+            }
+        }
+
+        let payload = decoded.unwrap_or_else(|| {
+            panic!(
+                "the frame never came out: {} (socket: {} received, {} from elsewhere, {} oversized)",
+                plane.stats().summary(),
+                plane.datagrams_received(),
+                plane.datagrams_from_elsewhere(),
+                plane.oversized_datagrams()
+            )
+        });
+        let (decoded_header, header_len) =
+            bincode::serde::decode_from_slice::<VideoPacketHeader, _>(
+                &payload,
+                bincode::config::standard(),
+            )
+            .expect("the header in front of the frame did not decode");
+
+        assert_eq!(decoded_header.frame_index, 7);
+        assert_eq!(decoded_header.timestamp, Duration::from_millis(1_234));
+        assert!(decoded_header.is_idr, "the keyframe flag was lost");
+        assert_eq!(
+            decoded_header.foveation_center_shifts,
+            Some([[0.25, 0.5], [0.75, 0.5]]),
+            "the per-frame metadata did not survive the trip"
+        );
+        assert_eq!(
+            &payload[header_len..],
+            &nal[..],
+            "the bytes after the header are not the NAL that was sent"
+        );
     }
 
     #[test]

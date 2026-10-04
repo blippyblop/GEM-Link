@@ -90,7 +90,16 @@ impl MediaSocket {
         Ok(socket)
     }
 
-    /// Connect an ephemeral local port to a peer, for the sending end.
+    /// Open an ephemeral local port to a peer, for the sending end.
+    ///
+    /// **`local_addr` will report `0.0.0.0:port`, and that is not what the peer will see.** The bind
+    /// is deliberately unspecified — a host with several interfaces should let routing choose the
+    /// source, and binding one address would pin the session to it — but it means the address this
+    /// end reports and the address its datagrams appear to come from are different things. A peer
+    /// that needs to reply must learn the source from a datagram it received
+    /// ([`MediaSocket::last_sender`]), which is what the client's feedback socket does. Reading
+    /// `local_addr` and handing it to the other end produces a socket that sends into the void, and
+    /// the failure is a frame that simply never arrives.
     pub fn connect_to(peer: SocketAddr, dscp: Option<DscpTos>) -> ConResult<Self> {
         let socket = UdpSocket::bind((crate::LOCAL_IP, 0)).to_con()?;
         let mut socket = Self::from_socket(socket);
