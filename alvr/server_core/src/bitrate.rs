@@ -94,6 +94,13 @@ pub struct BitrateManager {
     /// What share of each frame's declared shards the client says never arrived, in tenths of a
     /// percent. See [`Self::report_client_missing`].
     client_missing_permille: Option<u16>,
+    /// The rate the ladder is currently asking the encoder for, once the deficit has been applied.
+    ///
+    /// State, like the divisor, and for the same reason: the deficit is measured over the last thirty
+    /// frames, so a rung recomputed from the newest report saws around the answer instead of settling
+    /// on it. Coming down is proportional to the deficit; going back up is one step per clean report,
+    /// because that is the half where being slow costs nothing.
+    degrade_bitrate_bps: Option<f32>,
     /// How many frames the ladder is currently dropping for every one it sends.
     ///
     /// **State, not a function of the last report.** The deficit says how much too much is being
@@ -142,6 +149,7 @@ impl BitrateManager {
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
             client_queue_delay_us: None,
             client_missing_permille: None,
+            degrade_bitrate_bps: None,
             degrade_divisor: 1,
             last_returned_bitrate_bps: None,
             client_ack: ClientAck::default(),
@@ -189,8 +197,15 @@ impl BitrateManager {
                 .max(1)
                 .max(stepped.ceil() as u32)
                 .min(DEGRADE_MAX_FRAME_DIVISOR);
-        } else if permille < LADDER_MISSING_RECOVER_PERMILLE as u16 && self.degrade_divisor > 1 {
-            self.degrade_divisor -= 1;
+        } else if permille < LADDER_MISSING_RECOVER_PERMILLE as u16 {
+            if self.degrade_divisor > 1 {
+                self.degrade_divisor -= 1;
+            }
+            if let Some(bps) = &mut self.degrade_bitrate_bps {
+                // A tenth back per clean report, and the state is dropped once it is no longer
+                // limiting anything.
+                *bps *= 1.1;
+            }
         }
     }
 
@@ -481,6 +496,14 @@ impl BitrateManager {
             let by_deficit = self.client_missing_permille.map(|missing| {
                 bitrate_bps * (1.0 - missing.min(1000) as f32 / 1000.0).max(0.05)
             });
+            // The same number, carried forward as state: the deficit says how much too much is being
+            // sent, and the answer has to survive between reports or the rate climbs straight back to
+            // the setting the moment a report reads clean.
+            if let Some(deficit) = by_deficit {
+                let carried = self.degrade_bitrate_bps.unwrap_or(f32::MAX);
+                self.degrade_bitrate_bps = Some(carried.min(deficit).max(QUALITY_FLOOR_BPS));
+            }
+            let by_deficit = self.degrade_bitrate_bps;
             let by_queue = (queue_us as f32 > latency_budget_us)
                 .then(|| bitrate_bps * (latency_budget_us / 3.0) / queue_us as f32);
             if let Some(max_bps) = match (by_queue, by_deficit) {

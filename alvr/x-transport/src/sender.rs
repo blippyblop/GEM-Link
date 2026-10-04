@@ -648,7 +648,14 @@ impl MediaSender {
         // acknowledgement — as far as the client and the encoder's reference loop are concerned it
         // never existed, which is precisely why skipping is safe here and would not be without the
         // acknowledgement. Keyframes are never skipped: they are what a hold recovers from.
+        // **Only while the client is confirming what it decodes.** A frame dropped here leaves a hole
+        // in the frame indices, and the frames after it reference the frame before it; the encoder can
+        // only route around the hole when it knows which frames *did* arrive, which is what an
+        // acknowledgement is. Without one, dropping a frame does not lower the rate the client can
+        // use — it converts a stream of frames into a stream of holes. Measured: with the divisor on
+        // and no acknowledgements, the client completed 443 frames and held 428 of them on gaps.
         if self.frame_divisor > 1
+            && self.client_acked_frame.is_some()
             && !meta.is_keyframe
             && !(self.frames_seen - 1).is_multiple_of(self.frame_divisor as u64)
         {
