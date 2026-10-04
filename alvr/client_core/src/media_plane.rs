@@ -269,6 +269,11 @@ impl MediaPlaneReceiver {
         self.plane.receiver_account()
     }
 
+    /// What the failed frames actually had. See [`VideoPlane::failed_frame_account`].
+    pub fn failed_frame_account(&self) -> String {
+        self.plane.failed_frame_account()
+    }
+
     /// The address the last datagram came from.
     ///
     /// The server sends the media stream from an ephemeral port, so this is the only place the
@@ -441,6 +446,18 @@ impl VideoPlane {
             s.datagrams_duplicate,
             s.datagrams_retransmit,
             s.fragments_repaired,
+        )
+    }
+
+    /// What the frames that could not be rebuilt actually had, and how long they were given.
+    pub fn failed_frame_account(&self) -> String {
+        let s = self.receiver.stats();
+        let failed = s.frames_unreconstructable.max(1);
+        format!(
+            "failed frames: waited {:.1} ms on average, had {:.1} of {:.1} shards when declared",
+            s.failed_waited_us as f64 / failed as f64 / 1000.0,
+            s.failed_shards_present as f64 / failed as f64,
+            s.failed_shards_total as f64 / failed as f64,
         )
     }
 

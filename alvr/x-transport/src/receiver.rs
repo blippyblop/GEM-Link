@@ -222,6 +222,17 @@ pub struct ReceiverStats {
     pub unreconstructable_parity: u64,
     /// The worst single frame.
     pub max_erasures: u16,
+    /// For the frames that could not be rebuilt: how long the frame waited before it was declared
+    /// failed, how many of its shards (data **and** parity) had actually been read by then, and how
+    /// many it had altogether.
+    ///
+    /// `unreconstructable_parity` is the parity the frame **declared**, which is what a repair
+    /// needs to be *possible*; these are what it actually **had**. When the declared number is
+    /// sufficient and the repair still fails, the difference between the two is the answer, and it
+    /// is not a fact about the code.
+    pub failed_waited_us: u64,
+    pub failed_shards_present: u64,
+    pub failed_shards_total: u64,
 }
 
 impl ReceiverStats {
@@ -620,6 +631,12 @@ impl Receiver {
                 if erasures as u16 > self.stats.max_erasures {
                     self.stats.max_erasures = erasures as u16;
                 }
+                // What the frame actually had, and how long it was given to get it.
+                self.stats.failed_waited_us += now.saturating_sub(frame.first_arrival).as_micros()
+                    as u64;
+                self.stats.failed_shards_present +=
+                    frame.shards.iter().filter(|s| s.is_some()).count() as u64;
+                self.stats.failed_shards_total += frame.shards.len() as u64;
             }
         }
         self.stats.payload_bytes_delivered += payload.as_ref().map_or(0, Vec::len) as u64;

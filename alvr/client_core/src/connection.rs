@@ -474,6 +474,7 @@ fn connection_pipeline(
                     last_report = Instant::now();
                     info!("{}", plane.stats().summary());
                     info!("{}", plane.receiver_account());
+                    info!("{}", plane.failed_frame_account());
                 }
 
                 for action in actions {
