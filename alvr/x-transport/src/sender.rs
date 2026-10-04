@@ -491,6 +491,17 @@ pub struct MediaSender {
     frame_divisor: u32,
     /// Frames seen since the last one that went out, for the divisor above.
     frames_seen: u64,
+    /// When the **newest** acknowledgement arrived, in the sender's own clock, and which frame it
+    /// named.
+    ///
+    /// "When did I last hear from the client" is not the question: the client repeats its newest
+    /// acknowledgement on a timer precisely so a quiet client is distinguishable from a dead one, so
+    /// a client that has stopped decoding keeps sending the *same* frame index. Measured: the client
+    /// sat on frame 607 for the rest of a run, repeating it every 250 ms, while the sender — reading
+    /// those repeats as life — never rebuilt the chain, and the encoder's long-term reference window
+    /// expired on a frame the client already had.
+    acked_progress_at: Option<Duration>,
+    acked_progress_frame: Option<u64>,
     /// When the newest acknowledgement arrived, in the sender's own clock.
     ///
     /// "Has acknowledged at any point" is not enough to make frame dropping safe: the first few
@@ -573,6 +584,8 @@ impl MediaSender {
             frame_divisor: 1,
             frames_seen: 0,
             last_ack_at: None,
+            acked_progress_at: None,
+            acked_progress_frame: None,
             acked_recent: 0,
             acked_recent_newest: 0,
             reported_read_per_sec: 0,
@@ -697,10 +710,18 @@ impl MediaSender {
     /// reference set empties and every frame it produces references a frame the client is holding. The
     /// loop closes on itself, and only a frame the client can decode *and present* opens it again.
     pub fn acknowledgements_stale(&self, now: Duration, threshold: Duration) -> bool {
+        // **Progress, not messages.** The client repeats its newest acknowledgement on a timer, so a
+        // client that has stopped decoding keeps saying the same frame index every 250 ms and reads as
+        // a live one. What matters is whether the index is *moving*.
         self.client_acked_frame.is_some()
             && self
-                .last_ack_at
+                .acked_progress_at
                 .is_some_and(|at| now.saturating_sub(at) >= threshold)
+    }
+
+    /// The newest frame the client has confirmed, and when it last confirmed a *new* one.
+    pub fn acked_progress(&self) -> (Option<u64>, Option<Duration>) {
+        (self.acked_progress_frame, self.acked_progress_at)
     }
 
     /// Take the fact that a bootstrap wait expired, for the caller to act on by asking the encoder
@@ -1188,7 +1209,12 @@ impl MediaSender {
                 let newest = self
                     .client_acked_frame
                     .map_or(*acked, |current| current.max(*acked));
+                let advanced = self.client_acked_frame.is_none_or(|current| newest > current);
                 self.client_acked_frame = Some(newest);
+                if advanced {
+                    self.acked_progress_at = Some(now);
+                    self.acked_progress_frame = Some(newest);
+                }
                 self.acked_recent = *mask;
                 self.acked_recent_newest = *acked;
                 self.stats.frames_acked += 1;

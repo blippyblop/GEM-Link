@@ -1273,7 +1273,14 @@ fn connection_pipeline(
                         observed_parity,
                     );
                     manager.set_bootstrap(!acknowledged);
-                    manager.ladder_frame_divisor()
+                    // The bootstrap sends every frame it decides to send: a frame-rate rung that
+                    // skips frames *and* a stop-and-wait would leave the client with holes to
+                    // decode around while it is trying to decode its first picture.
+                    if acknowledged {
+                        manager.ladder_frame_divisor()
+                    } else {
+                        1
+                    }
                 });
 
                 // A bootstrap frame that did not arrive in the time its own size implied was too big
