@@ -473,6 +473,7 @@ fn connection_pipeline(
                 if last_report.elapsed() >= Duration::from_secs(2) {
                     last_report = Instant::now();
                     info!("{}", plane.stats().summary());
+                    info!("{}", plane.receiver_account());
                 }
 
                 for action in actions {

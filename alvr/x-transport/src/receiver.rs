@@ -212,6 +212,16 @@ pub struct ReceiverStats {
     pub frames_recovered: u64,
     pub frames_unreconstructable: u64,
     pub fragments_repaired: u64,
+    /// For the frames that could **not** be rebuilt: how many data shards were missing, and how
+    /// many parity shards the frame carried, summed.
+    ///
+    /// The pair is the whole diagnosis. A frame that fails with *fewer* erasures than parity is a
+    /// bug in the code — the repair was available and was not taken. A frame that fails with more
+    /// is the link, and no amount of code would have saved it.
+    pub unreconstructable_erasures: u64,
+    pub unreconstructable_parity: u64,
+    /// The worst single frame.
+    pub max_erasures: u16,
 }
 
 impl ReceiverStats {
@@ -599,7 +609,18 @@ impl Receiver {
         match outcome {
             FrameOutcome::Complete => self.stats.frames_complete += 1,
             FrameOutcome::Recovered { .. } => self.stats.frames_recovered += 1,
-            FrameOutcome::Unreconstructable { .. } => self.stats.frames_unreconstructable += 1,
+            FrameOutcome::Unreconstructable { .. } => {
+                self.stats.frames_unreconstructable += 1;
+                // The erasure count against the parity that was *there*. A frame that could not be
+                // rebuilt with fewer erasures than parity is a bug in this code; one that could not
+                // be rebuilt with more is the link. Without both numbers the two are the same fact.
+                let erasures = missing.len();
+                self.stats.unreconstructable_erasures += erasures as u64;
+                self.stats.unreconstructable_parity += frame.parity_count as u64;
+                if erasures as u16 > self.stats.max_erasures {
+                    self.stats.max_erasures = erasures as u16;
+                }
+            }
         }
         self.stats.payload_bytes_delivered += payload.as_ref().map_or(0, Vec::len) as u64;
         let _ = now;

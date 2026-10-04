@@ -264,6 +264,11 @@ impl MediaPlaneReceiver {
         self.plane.stats()
     }
 
+    /// The receiver's own account. See [`VideoPlane::receiver_account`].
+    pub fn receiver_account(&self) -> String {
+        self.plane.receiver_account()
+    }
+
     /// The address the last datagram came from.
     ///
     /// The server sends the media stream from an ephemeral port, so this is the only place the
@@ -414,6 +419,29 @@ impl VideoPlane {
 
     pub fn stats(&self) -> &PlaneStats {
         &self.stats
+    }
+
+    /// The receiver's own account of what it rebuilt — and, for what it could not, how many shards
+    /// were missing against how many parity shards it had. Those two numbers together are the
+    /// difference between "the repair path is broken" and "the link was worse than the code rate",
+    /// and they had never been printed.
+    pub fn receiver_account(&self) -> String {
+        let s = self.receiver.stats();
+        let failed = s.frames_unreconstructable.max(1);
+        format!(
+            "receiver: {} complete, {} recovered, {} unreconstructable ({:.1} erasures vs {:.1} \
+             parity on average, worst {}), {} late, {} duplicate, {} retransmit, {} fragment(s) rebuilt",
+            s.frames_complete,
+            s.frames_recovered,
+            s.frames_unreconstructable,
+            s.unreconstructable_erasures as f64 / failed as f64,
+            s.unreconstructable_parity as f64 / failed as f64,
+            s.max_erasures,
+            s.datagrams_late,
+            s.datagrams_duplicate,
+            s.datagrams_retransmit,
+            s.fragments_repaired,
+        )
     }
 
     /// Milliseconds since this plane was created — the receiver's time base.
