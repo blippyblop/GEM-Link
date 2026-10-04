@@ -345,20 +345,42 @@ pub struct PlaneStats {
     pub nacks_sent: u64,
     pub keyframe_requests: u64,
     pub resets: u64,
+    /// Keyframes *released to the display path*, and how many of them had a payload.
+    ///
+    /// A keyframe is the only thing that clears the trust gate, so "did a clean keyframe ever
+    /// arrive" is the difference between a hold that ends and a hold that is permanent — and
+    /// without these two numbers those look identical from every other counter.
+    pub keyframes_in: u64,
+    pub keyframes_clean: u64,
+    /// Why frames were held, by reason. The gate has four, and they call for different fixes:
+    /// a missing keyframe is a request that did not land, a gap is loss, `DatagramLoss` is a hole
+    /// inside the frame, and `DecoderRejected` is the decoder.
+    pub held_no_keyframe: u64,
+    pub held_gap: u64,
+    pub held_datagram_loss: u64,
+    pub held_decoder: u64,
 }
 
 impl PlaneStats {
     pub fn summary(&self) -> String {
         format!(
             "video plane: {} datagrams in ({} dropped by source, {} rejected), {} frames presented, \
-             {} held, {} abandoned, {} repaired by FEC, {} nack(s), {} keyframe request(s), {} reset(s)",
+             {} held ({} no-keyframe, {} gap, {} datagram-loss, {} decoder), {} abandoned, \
+             {} repaired by FEC, {} keyframe(s) in ({} clean), {} nack(s), {} keyframe request(s), \
+             {} reset(s)",
             self.datagrams_received,
             self.datagrams_dropped_by_source,
             self.datagrams_rejected,
             self.frames_presented,
             self.frames_held,
+            self.held_no_keyframe,
+            self.held_gap,
+            self.held_datagram_loss,
+            self.held_decoder,
             self.frames_abandoned,
             self.frames_repaired,
+            self.keyframes_in,
+            self.keyframes_clean,
             self.nacks_sent,
             self.keyframe_requests,
             self.resets,
@@ -520,6 +542,12 @@ impl VideoPlane {
     /// Apply the display rule to one released frame, counting what it decides.
     fn classify(&mut self, frame: &DeliveredFrame, now: Instant) -> Decision {
         let usable = frame.is_displayable();
+        if frame.is_keyframe {
+            self.stats.keyframes_in += 1;
+            if usable {
+                self.stats.keyframes_clean += 1;
+            }
+        }
         if !usable {
             self.stats.frames_abandoned += 1;
         } else if matches!(frame.outcome, x_transport::FrameOutcome::Recovered { .. }) {
@@ -539,6 +567,14 @@ impl VideoPlane {
             }
             FrameTrust::Untrusted { reason, .. } => {
                 self.stats.frames_held += 1;
+                match reason {
+                    x_transport::UntrustedReason::NoKeyframeYet => self.stats.held_no_keyframe += 1,
+                    x_transport::UntrustedReason::Gap { .. } => self.stats.held_gap += 1,
+                    x_transport::UntrustedReason::DatagramLoss => {
+                        self.stats.held_datagram_loss += 1
+                    }
+                    x_transport::UntrustedReason::DecoderRejected => self.stats.held_decoder += 1,
+                }
                 Decision::Held(reason)
             }
         }

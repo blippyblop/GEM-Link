@@ -1227,10 +1227,11 @@ fn connection_pipeline(
                 if frames_this_run.is_multiple_of(150) {
                     let stats = video_sender.stats();
                     info!(
-                        "media sender: {} frame(s) sent, {} datagram(s), {} requested, {} \
+                        "media sender: {} frame(s) sent, {} datagram(s) ({} parity), {} requested, {} \
                          retransmitted, {} coalesced, refusals {}/{}/{}/{}",
                         stats.frames_sent,
                         stats.datagrams_sent,
+                        stats.parity_datagrams,
                         stats.retransmit_requests,
                         stats.retransmitted_datagrams,
                         stats.repairs_coalesced,
