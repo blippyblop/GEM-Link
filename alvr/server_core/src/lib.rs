@@ -550,6 +550,31 @@ impl ServerCoreContext {
             // frame was encoded against. The encoder references only frames the client has
             // acknowledged, so a frame that *states* its reference is decodable however the frames
             // around it fared, and the stream no longer has to stop for a discard. See `SendGate`.
+            //
+            // And the invariant is checked here rather than assumed: the encoder may only name a
+            // frame the client confirmed, and a mismatch between what the C++ side thinks it was told
+            // and what this side knows would silently reintroduce the poisoning this whole path
+            // exists to remove. One warning, then silence — it is an invariant, not a rate.
+            if reference_frame != 0 && !is_idr {
+                static CHECKED: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
+                let mut checked = CHECKED.lock();
+                if !*checked
+                    && !self
+                        .connection_context
+                        .bitrate_manager
+                        .lock()
+                        .client_ack()
+                        .contains(reference_frame)
+                {
+                    *checked = true;
+                    warn!(
+                        "frame {frame_index} says it was encoded against {reference_frame}, which the \
+                         client has never confirmed decoded. The encoder's reference decision and this \
+                         side's acknowledgements disagree — a lost frame will poison the chain again"
+                    );
+                }
+            }
+
             let mut gate = SEND_GATE.lock();
             match gate.may_transmit(is_idr, reference_frame) {
                 x_transport::SendDecision::Transmit => {
