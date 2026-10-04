@@ -1166,20 +1166,22 @@ fn connection_pipeline(
                                     // survives a client which completes nothing.
                                     manager.report_client_read_rate(read_per_sec);
                                 }
-                                FeedbackOutcome::Acknowledged { frame_index, frames_unusable, .. } => {
+                                FeedbackOutcome::Acknowledged { newest, mask, .. } => {
                                     // **The one thing the encoder cannot work out for itself.** A
                                     // frame the client decoded may be referenced by the frames that
                                     // follow; a frame it did not, may not — and that is what keeps a
                                     // lost frame from poisoning everything behind it, and what lets
                                     // the client present across a hole instead of holding until a
                                     // keyframe. See `Feedback::Ack`.
-                                    if frames_unusable > 0 {
-                                        debug!(
-                                            "client acknowledged frame {frame_index} and could not \
-                                             use {frames_unusable} before it"
-                                        );
-                                    }
-                                    ctx.bitrate_manager.lock().report_client_ack(frame_index);
+                                    //
+                                    // The bitmap travels with the cursor so one lost acknowledgement
+                                    // is repaired by the next: the client's decoded frames are what
+                                    // the encoder may build on, and a gap in the reports must not read
+                                    // as a client that decoded nothing.
+                                    debug!(
+                                        "client acknowledged frame {newest} (mask {mask:#018b})"
+                                    );
+                                    ctx.bitrate_manager.lock().report_client_ack(newest);
                                 }
                                 _ => {}
                             }
