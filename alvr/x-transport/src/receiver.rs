@@ -30,12 +30,21 @@
 //! * **Reorder cover** ([`ReleasePolicy::jitter_frames`]): once a frame `n + jitter_frames`
 //!   has completed, frame `n` is released whether or not its stragglers arrived. Waiting
 //!   longer only helps if the stragglers are still coming.
-//! * **Deadline** ([`ReleasePolicy::deadline`]): a hard bound from the frame's first arriving
-//!   datagram, so an incomplete frame cannot be held forever. This is also what bounds the
-//!   receiver's memory: nothing survives its deadline.
+//! * **Slot pressure** ([`ReleasePolicy::late_hold_frames`]): a frame that could not be rebuilt is
+//!   **kept**, not released, and the stream holds behind it — because a frame whose shards are still
+//!   arriving is not a frame that was lost, and the display has not moved past it yet. It is given up
+//!   on when `late_hold_frames` newer frames are waiting behind it, i.e. when the stream has genuinely
+//!   moved on. **Not on a timer**: a timer fired on the frames whose repair was still in flight, which
+//!   is the defect this rule replaced (22 000 datagrams over one run arrived after the frame they
+//!   belonged to had already been released, and each of those frames became a hole).
 //!
-//! A deadline that is too tight wastes repair that was available; too loose and it adds
-//! latency. The bench is where that trade is measured.
+//! An important asymmetry makes the hold cheap when it matters most: when the holed frame is the
+//! *newest* one, nothing is waiting behind it, so holding it costs no ordering latency at all — the
+//! display is waiting for that frame anyway. The cost only appears when the stream has moved on, and
+//! that is exactly when the hold ends.
+//!
+//! What bounds memory is not a clock but [`Receiver::with_max_in_flight`], which evicts the oldest
+//! frame, plus the pressure rule above.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -80,6 +89,10 @@ pub struct DeliveredFrame {
     /// The display gate needs it and nothing else on the wire could supply it: a hold is released
     /// by a keyframe, and "keyframe" is a property of the encoder's output, not of the transport.
     pub is_keyframe: bool,
+    /// The frame index the sender encoded this frame against, or `0` for "not stated". The display
+    /// rule turns it into the one question that matters — *is the picture this frame depends on one
+    /// I have already decoded?* — and with it a hole stops poisoning the frames behind it.
+    pub reference_frame: u64,
     payload: Option<Vec<u8>>,
 }
 
@@ -135,8 +148,13 @@ pub struct ReleasePolicy {
     /// re-send to arrive. Only a frame in that state pays it, and the round trip is unavoidable —
     /// it is the cost of asking.
     pub repair_delay: Duration,
-    /// Hard bound from the first arriving datagram: after this, whatever is still missing is lost.
-    pub deadline: Duration,
+    /// How many newer frames may pile up behind an unrebuilt frame before it is given up on.
+    ///
+    /// This is the whole of the abandonment rule. Zero restores the old behaviour (give up at the
+    /// repair window, whatever is behind it); two or three is a grace period measured in the only
+    /// unit that means anything — **the stream moving on**. It is deliberately not a time: a timer
+    /// fires on frames whose repair is in flight, and the measurement is that this is most of them.
+    pub late_hold_frames: u16,
     /// Kept for callers that size the cover in whole frames. [`Self::for_link`] does not use it.
     pub jitter_frames: u16,
 }
@@ -151,7 +169,7 @@ impl ReleasePolicy {
         Self {
             straggler_delay: window,
             repair_delay: window,
-            deadline: window + frame_interval,
+            late_hold_frames: 0,
             jitter_frames,
         }
     }
@@ -179,11 +197,9 @@ impl ReleasePolicy {
             // out made the window exactly the round trip, which the bench showed as repairs landing
             // a hundredth of a millisecond after the frame that was waiting for them.
             repair_delay,
-            // The hard bound is one frame interval *past the repair window*, not past the straggler
-            // window. Being derived from the wrong one made the deadline fire before the window it
-            // was supposed to be a backstop for, so a frame was given up on while the repair it had
-            // asked for was still in flight.
-            deadline: repair_delay + frame_interval,
+            // Two frames of grace. At 90 Hz that is 22 ms of extra patience on a frame whose repair
+            // is in flight, paid only when the stream has already moved on without it.
+            late_hold_frames: 2,
             jitter_frames: 0,
         }
     }
@@ -194,6 +210,15 @@ impl ReleasePolicy {
             return 0.0;
         }
         self.straggler_delay.as_secs_f64() / frame_interval.as_secs_f64()
+    }
+
+    /// The longest this policy will hold a frame it could not rebuild, given the link's pacing.
+    ///
+    /// This is the *sender's* side of the same fact: a repair that arrives after it is a datagram the
+    /// client has stopped assembling. It is the repair window plus the grace
+    /// [`Self::late_hold_frames`] buys, which is where the old `deadline` field's meaning went.
+    pub fn hold_ceiling(&self, frame_interval: Duration) -> Duration {
+        self.repair_delay + frame_interval * self.late_hold_frames as u32
     }
 }
 
@@ -233,6 +258,19 @@ pub struct ReceiverStats {
     pub failed_waited_us: u64,
     pub failed_shards_present: u64,
     pub failed_shards_total: u64,
+    /// Frames that could not be rebuilt when their repair window closed and were **kept** rather
+    /// than dropped, and how many of those were later assembled from shards that arrived while they
+    /// waited.
+    ///
+    /// These two numbers are the whole case for holding: `frames_rescued_late` frames are frames the
+    /// old rule created holes from. A rescue rate near zero would mean the hold costs latency for
+    /// nothing, and that would be the honest reason to put the timer back.
+    pub frames_held_late: u64,
+    pub frames_rescued_late: u64,
+    /// Frames given up on because newer frames were waiting behind them — the stream moved on. The
+    /// rest of `frames_unreconstructable` were given up on for the same reason inside the ordinary
+    /// repair window, or evicted at the in-flight cap.
+    pub frames_abandoned_pressure: u64,
     /// The **drain spread** of a usable frame — how long the client took to read the frame after
     /// its first shard appeared — as an EWMA and a worst case, in microseconds.
     ///
@@ -317,6 +355,10 @@ struct PartialFrame {
     /// worse.
     last_arrival: Duration,
     target_timestamp_us: u64,
+    /// The frame index this frame's picture was encoded against, from the wire header; `0` means
+    /// the sender did not say. Carried out with the frame so the display rule can ask whether the
+    /// reference is one this client has decoded.
+    reference_frame: u64,
     /// Learned from the first shard that arrives, whichever kind it is.
     is_keyframe: bool,
     frame_len: u32,
@@ -324,6 +366,10 @@ struct PartialFrame {
     parity_count: u16,
     shards: Vec<Option<Vec<u8>>>,
     received: usize,
+    /// When this frame's repair window closed with the frame still unrebuilt and it was **kept**
+    /// anyway — see [`ReleasePolicy::late_hold_frames`]. `None` until then, and set once, so the
+    /// hold is counted once per frame rather than once per release pass.
+    held_late_at: Option<Duration>,
 }
 
 impl PartialFrame {
@@ -484,12 +530,14 @@ impl Receiver {
                 first_arrival: now,
                 last_arrival: now,
                 target_timestamp_us: header.target_timestamp_us,
+                reference_frame: header.reference_frame,
                 is_keyframe: header.flags.is_keyframe(),
                 frame_len: header.frame_len,
                 data_count: header.data_count,
                 parity_count: header.parity_count,
                 shards: vec![None; header.data_count as usize + header.parity_count as usize],
                 received: 0,
+                held_late_at: None,
             });
 
         // Every shard carries the keyframe bit, so a frame whose first shard was lost still
@@ -501,6 +549,7 @@ impl Receiver {
         if entry.data_count != header.data_count
             || entry.parity_count != header.parity_count
             || entry.frame_len != header.frame_len
+            || entry.reference_frame != header.reference_frame
         {
             self.stats.datagrams_malformed += 1;
             return RecvEvent::Rejected(RecvError::Wire(WireError::Malformed(
@@ -553,7 +602,7 @@ impl Receiver {
     /// Release everything that is ready, oldest frame first, **stopping at the first frame that is
     /// not** — so what comes out is always in frame order.
     ///
-    /// Three ways a frame becomes ready, and the first is the one that matters:
+    /// Three ways a frame becomes ready:
     ///
     /// 1. **It is complete.** Nothing is missing, so there is nothing to wait for. This is the
     ///    change that removed a whole frame interval of latency from every frame: the cover exists
@@ -562,35 +611,48 @@ impl Receiver {
     ///    stream released each frame at the very end of its own period — late by definition.
     /// 2. Its straggler window has elapsed **and** the FEC can rebuild it from what has arrived —
     ///    the data is here, so stop waiting. See [`ReleasePolicy::straggler_delay`].
-    /// 3. Its repair window has elapsed: the code could not fill the hole, a re-send was asked for,
-    ///    and this is how long it was given. See [`ReleasePolicy::repair_delay`].
-    /// 4. Its deadline has passed. The hole is permanent and the frame goes out with whatever the
-    ///    FEC could make of it, or without a payload at all.
+    /// 3. It is holed, its repair window has closed, and **the stream has moved on without it**:
+    ///    [`ReleasePolicy::late_hold_frames`] newer frames are waiting behind it. This is the only
+    ///    way a frame is given up on, and it is why a frame whose repair is in flight is no longer
+    ///    released a moment before that repair lands. See the module docs.
     ///
     /// The stopping is what keeps ordering: frame `n + 1` may not overtake a held frame `n`, or the
     /// display path would show the newer picture and then the older one.
     pub fn release(&mut self, now: Duration) -> Vec<DeliveredFrame> {
+        // Which frames are ready, and which unrebuilt frames are entering (or continuing) the late
+        // hold. Computed in one pass over an immutable borrow, then applied.
         let mut ready: Vec<u64> = Vec::new();
+        let mut newly_held: Vec<u64> = Vec::new();
 
         for (index, frame) in self.partial.iter() {
             let waited = now.saturating_sub(frame.first_arrival);
             let stragglers_over = waited >= self.policy.straggler_delay;
-            let repair_window_over = waited >= self.policy.repair_delay;
-            let deadline_passed = waited >= self.policy.deadline;
 
             // Complete: nothing to wait for.
             // FEC can rebuild it: the data is here, so stop waiting for the stragglers.
-            // Otherwise the repair window, then the deadline.
+            // Otherwise: hold it, unless the stream has moved on without it.
             let due = frame.has_all_data()
                 || (stragglers_over && frame.fec_repairable())
-                || repair_window_over
-                || deadline_passed;
+                || (waited >= self.policy.repair_delay
+                    && self.newer_frames_behind(*index) >= self.policy.late_hold_frames as usize);
 
             if due {
                 ready.push(*index);
             } else {
-                // Holding a hole holds everything behind it — for at most one of the windows above.
+                if !frame.has_all_data() && waited >= self.policy.repair_delay {
+                    if frame.held_late_at.is_none() {
+                        newly_held.push(*index);
+                    }
+                }
+                // Holding a hole holds everything behind it — for as long as the rule above says.
                 break;
+            }
+        }
+
+        for index in newly_held {
+            if let Some(frame) = self.partial.get_mut(&index) {
+                frame.held_late_at = Some(now);
+                self.stats.frames_held_late += 1;
             }
         }
 
@@ -599,10 +661,23 @@ impl Receiver {
             let Some(mut frame) = self.partial.remove(&index) else {
                 continue;
             };
+            let abandoned_late = frame.held_late_at.is_some() && !frame.has_all_data();
+            if abandoned_late {
+                // Held past its repair window and then given up on because the stream moved on.
+                self.stats.frames_abandoned_pressure += 1;
+            }
             self.max_released = Some(self.max_released.map_or(index, |r| r.max(index)));
             out.push(self.finish(index, &mut frame, now));
         }
         out
+    }
+
+    /// How many frames newer than `index` are waiting in the reassembly buffer.
+    ///
+    /// The stream has moved on when this is non-zero: a newer frame's first shard has arrived, so the
+    /// sender is past `index` and the display is being held for it.
+    fn newer_frames_behind(&self, index: u64) -> usize {
+        self.partial.range((index + 1)..).count()
     }
 
     fn finish(&mut self, index: u64, frame: &mut PartialFrame, now: Duration) -> DeliveredFrame {
@@ -664,8 +739,18 @@ impl Receiver {
         }
 
         match outcome {
-            FrameOutcome::Complete => self.stats.frames_complete += 1,
-            FrameOutcome::Recovered { .. } => self.stats.frames_recovered += 1,
+            FrameOutcome::Complete => {
+                self.stats.frames_complete += 1;
+                if frame.held_late_at.is_some() {
+                    self.stats.frames_rescued_late += 1;
+                }
+            }
+            FrameOutcome::Recovered { .. } => {
+                self.stats.frames_recovered += 1;
+                if frame.held_late_at.is_some() {
+                    self.stats.frames_rescued_late += 1;
+                }
+            }
             FrameOutcome::Unreconstructable { .. } => {
                 self.stats.frames_unreconstructable += 1;
                 // The erasure count against the parity that was *there*. A frame that could not be
@@ -694,6 +779,7 @@ impl Receiver {
             released_at: now,
             outcome,
             is_keyframe: frame.is_keyframe,
+            reference_frame: frame.reference_frame,
             payload,
         }
     }
@@ -746,7 +832,7 @@ mod tests {
         ReleasePolicy {
             straggler_delay: Duration::ZERO,
             repair_delay: Duration::ZERO,
-            deadline: Duration::from_millis(11),
+            late_hold_frames: 0,
             jitter_frames: 0,
         }
     }
@@ -772,6 +858,7 @@ mod tests {
                     target_timestamp_us: 11_111 * frame_index,
                     is_keyframe: false,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 bytes,
                 seq,
@@ -955,6 +1042,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1015,6 +1103,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1050,6 +1139,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1116,6 +1206,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &payload(100),
                 &mut seq,
@@ -1230,6 +1321,7 @@ mod tests {
                     target_timestamp_us: 0,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1306,6 +1398,136 @@ mod tests {
     }
 
     #[test]
+    fn a_hole_with_nothing_behind_it_is_kept_rather_than_thrown_away() {
+        // The rule that replaced the timer. A frame whose shards are still arriving is not a lost
+        // frame, and when it is the newest frame there is nothing behind it — so holding it costs no
+        // ordering latency at all. It is given up on when the stream moves on without it, never
+        // because a clock said so.
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
+        let mut receiver = Receiver::new(
+            ReleasePolicy {
+                straggler_delay: Duration::from_millis(2),
+                repair_delay: Duration::from_millis(4),
+                late_hold_frames: 2,
+                jitter_frames: 0,
+            },
+            None,
+        );
+        let mut seq = 0;
+        send(
+            &mut receiver,
+            &packetizer,
+            1,
+            &payload(SHARD * 3),
+            &[0],
+            Duration::ZERO,
+            &mut seq,
+        );
+
+        // Long past every window the old policy had, and still nothing has been given up on.
+        let released = receiver.release(Duration::from_millis(500));
+        assert!(
+            released.is_empty(),
+            "a hole in the newest frame was released without a repair even being in flight: \
+             {released:?}"
+        );
+        assert_eq!(receiver.stats().frames_held_late, 1);
+        assert_eq!(receiver.in_flight(), 1, "the reassembly state is still alive");
+
+        // And then the shard that was missing arrives, 500 ms late. Under the old rule this frame was
+        // already gone: the datagram would have been counted `late` and dropped, and the frame
+        // released with no payload.
+        let mut seq = 0;
+        let (_, datagrams) = packetizer
+            .fragment(
+                FrameMeta {
+                    frame_index: 1,
+                    target_timestamp_us: 11_111,
+                    is_keyframe: false,
+                    key_epoch: 0,
+                    reference_frame: 0,
+                },
+                &payload(SHARD * 3),
+                &mut seq,
+                None,
+            )
+            .unwrap();
+        receiver.on_datagram(&datagrams[0], Duration::from_millis(500));
+
+        let released = receiver.release(Duration::from_millis(501));
+        assert_eq!(released.len(), 1);
+        assert!(
+            released[0].is_displayable(),
+            "the frame was complete as soon as its last shard arrived"
+        );
+        assert_eq!(released[0].payload().unwrap().len(), SHARD * 3);
+        assert_eq!(receiver.stats().frames_rescued_late, 1);
+        assert_eq!(receiver.stats().frames_unreconstructable, 0);
+    }
+
+    #[test]
+    fn a_held_hole_is_abandoned_when_the_stream_moves_on_without_it() {
+        // The other half: the grace is finite, and the unit it is measured in is the stream's own
+        // progress. Two newer frames waiting behind the hole is the point at which waiting for frame
+        // 1 costs frame 2 and frame 3, and that is worse than the hole.
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
+        let mut receiver = Receiver::new(
+            ReleasePolicy {
+                straggler_delay: Duration::from_millis(2),
+                repair_delay: Duration::from_millis(4),
+                late_hold_frames: 2,
+                jitter_frames: 0,
+            },
+            None,
+        );
+        let mut seq = 0;
+        send(
+            &mut receiver,
+            &packetizer,
+            1,
+            &payload(SHARD * 3),
+            &[0],
+            Duration::ZERO,
+            &mut seq,
+        );
+
+        // One newer frame: not enough. The hold stands.
+        send(
+            &mut receiver,
+            &packetizer,
+            2,
+            &payload(SHARD),
+            &[],
+            Duration::ZERO,
+            &mut seq,
+        );
+        let released = receiver.release(Duration::from_millis(10));
+        assert!(released.is_empty(), "one frame behind a hole is not pressure");
+
+        // Two newer frames: the stream has moved on, so the hole goes.
+        send(
+            &mut receiver,
+            &packetizer,
+            3,
+            &payload(SHARD),
+            &[],
+            Duration::ZERO,
+            &mut seq,
+        );
+        let released = receiver.release(Duration::from_millis(11));
+        assert_eq!(released.len(), 3, "the hole and the two frames behind it");
+        assert_eq!(released[0].frame_index, 1);
+        assert!(
+            !released[0].is_displayable(),
+            "the hole itself is still a hole — it is released, not invented"
+        );
+        assert!(released[1].is_displayable());
+        assert!(released[2].is_displayable());
+        assert_eq!(receiver.stats().frames_abandoned_pressure, 1);
+        assert_eq!(receiver.stats().frames_held_late, 1);
+    }
+
+    #[test]
     fn the_deadline_bounds_memory() {
         // A frame whose fragments simply stop arriving must be released by the deadline, or
         // the receiver would hold it forever.
@@ -1321,6 +1543,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1369,6 +1592,7 @@ mod tests {
                         target_timestamp_us: frame_index * 11_111,
                         is_keyframe: frame_index == 5,
                         key_epoch: epoch,
+                        reference_frame: 0,
                     },
                     &bytes,
                     &mut seq,
@@ -1412,6 +1636,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1459,6 +1684,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1501,6 +1727,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &payload(SHARD * 3),
                 &mut seq,

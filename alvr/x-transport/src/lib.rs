@@ -80,7 +80,9 @@ pub use scheduler::{
 pub use sender::{
     FeedbackOutcome, FrameSend, MediaSender, RepairRefusal, SenderConfig, SenderStats,
 };
-pub use trust::{FrameTrust, SendDecision, SendGate, SuppressReason, TrustGate, UntrustedReason};
+pub use trust::{
+    DecodeHistory, FrameTrust, SendDecision, SendGate, SuppressReason, TrustGate, UntrustedReason,
+};
 pub use wire::{Flags, FragmentHeader, HEADER_LEN};
 
 /// The largest payload a single datagram may carry, given an MTU.

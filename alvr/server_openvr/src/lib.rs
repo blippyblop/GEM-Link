@@ -631,6 +631,7 @@ extern "C" fn send_video(
     buffer_ptr: *mut u8,
     len: i32,
     is_idr: bool,
+    chain_root: u64,
 ) {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
         let timestamp = Duration::from_nanos(timestamp_ns);
@@ -674,6 +675,7 @@ extern "C" fn send_video(
             global_view_params,
             foveation_center_shifts,
             is_idr,
+            chain_root,
             buffer.to_vec(),
         );
     }
@@ -681,16 +683,33 @@ extern "C" fn send_video(
 
 #[unsafe(export_name = "GetDynamicEncoderParams")]
 extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
-    if let Some(context) = &*SERVER_CORE_CONTEXT.read()
-        && let Some(params) = context.get_dynamic_encoder_params()
-    {
-        FfiDynamicEncoderParams {
+    let Some(context) = &*SERVER_CORE_CONTEXT.read() else {
+        return FfiDynamicEncoderParams::default();
+    };
+
+    // The acknowledgement state is read on **every** frame, so it goes out whether or not any
+    // parameter changed: `updated = 0` means "do not reconfigure", not "no information". Tying this
+    // to `updated` would leave the encoder referencing frames the client lost for as long as the
+    // bitrate stayed still, which is exactly the session that needs it most.
+    let (ack_valid, acked_frame, acked_mask) = context.client_ack_state();
+
+    match context.get_dynamic_encoder_params() {
+        Some(params) => FfiDynamicEncoderParams {
             updated: 1,
             bitrate_bps: params.bitrate_bps as u64,
             framerate: params.framerate,
-        }
-    } else {
-        FfiDynamicEncoderParams::default()
+            client_acked_frame: acked_frame,
+            client_ack_valid: ack_valid as u32,
+            client_acked_recent_mask: acked_mask,
+        },
+        None => FfiDynamicEncoderParams {
+            updated: 0,
+            bitrate_bps: 0,
+            framerate: 0.0,
+            client_acked_frame: acked_frame,
+            client_ack_valid: ack_valid as u32,
+            client_acked_recent_mask: acked_mask,
+        },
     }
 }
 

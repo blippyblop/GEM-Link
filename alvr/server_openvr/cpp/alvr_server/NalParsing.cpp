@@ -99,6 +99,16 @@ static unsigned long long g_frameSequence = 0;
 
 void SetFrameSequence(unsigned long long frameSequence) { g_frameSequence = frameSequence; }
 
+unsigned long long GetFrameSequence() { return g_frameSequence; }
+
+// The frame the picture being emitted was encoded against, set by the encoder just before it emits
+// these NALs. Same lifetime and same single-threaded discipline as the sequence number above.
+static unsigned long long g_frameChainRoot = 0;
+
+void SetFrameChainRoot(unsigned long long chainRoot) { g_frameChainRoot = chainRoot; }
+
+unsigned long long GetFrameChainRoot() { return g_frameChainRoot; }
+
 void ParseFrameNals(
     int codec, unsigned char* buf, int len, unsigned long long targetTimestampNs, bool isIdr
 ) {
@@ -117,5 +127,5 @@ void ParseFrameNals(
         SetVideoConfigNals(0, 0, codec);
     }
 
-    VideoSend(g_frameSequence, targetTimestampNs, buf, len, isIdr);
+    VideoSend(g_frameSequence, targetTimestampNs, buf, len, isIdr, g_frameChainRoot);
 }

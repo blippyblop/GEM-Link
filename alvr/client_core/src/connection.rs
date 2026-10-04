@@ -454,7 +454,13 @@ fn connection_pipeline(
         straggler_delay: Duration::from_millis(3) + link_slack,
         repair_delay: (Duration::from_millis(3) + Duration::from_millis(6) + link_slack)
             .min(frame_interval),
-        deadline: frame_interval * 2,
+        // **A hole is held until the stream moves on without it.** The old policy gave up on a frame
+        // when a timer fired, and the measurement is that the repairs it was waiting for arrived
+        // after it had already been released (22 000 datagrams over one run landed on frames that no
+        // longer existed) — so the frame became a hole for no reason. Two frames of grace is the
+        // equivalent of one frame period of extra patience at 90 Hz, paid only when the stream has
+        // genuinely moved past the frame.
+        late_hold_frames: 2,
         jitter_frames: 0,
     };
 
@@ -560,10 +566,41 @@ fn connection_pipeline(
                                 if let Some(sender) = &mut *ctx.control_sender.lock() {
                                     sender.send(&ClientControlPacket::RequestIdr).ok();
                                 }
+                                // The decoder did not take it, so it is not a reference for anything
+                                // behind it — whatever its bytes looked like.
+                                plane.on_decode_failed(header.frame_index);
                                 warn!("Dropped video packet. Reason: Decoder saturation")
                             } else {
                                 frames_decoded += 1;
                                 let _ = target_timestamp_us;
+
+                                // The decoder took it, so it is in the reference chain — and that is
+                                // the fact the sender's encoder runs on. It tells the encoder which
+                                // frames it may reference, and it is the honest loss number: frames
+                                // never acknowledged are frames the client could not use, measured
+                                // rather than inferred from repair requests.
+                                //
+                                // One acknowledgement per frame, on the media socket, sealed under
+                                // the same key the repair requests use. `on_decoded` answers whether
+                                // this is news, so a duplicate or a reorder is not a packet.
+                                if plane.on_decoded(header.frame_index) {
+                                    if feedback_peer.is_none() {
+                                        feedback_peer = plane.last_sender();
+                                        if let Some(peer) = feedback_peer {
+                                            media_feedback_socket.accept_only_from(peer);
+                                        }
+                                    }
+                                    if feedback_peer.is_some() {
+                                        let ack = x_transport::Feedback::Ack {
+                                            frame_index: header.frame_index,
+                                        };
+                                        let mut sealed = [0u8; x_transport::MAX_FEEDBACK_LEN];
+                                        if let Ok(len) = feedback_sender.seal(&ack, &mut sealed) {
+                                            let _ = media_feedback_socket.send(&sealed[..len]);
+                                            plane.count_ack_sent();
+                                        }
+                                    }
+                                }
                             }
                         }
                         crate::media_plane::MediaPlaneAction::AskForKeyframe { stalled_for } => {

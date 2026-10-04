@@ -408,6 +408,7 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
                 // — it is here so the path that carries it is exercised end to end.
                 is_keyframe: next_frame == 1 || next_frame.is_multiple_of(30),
                 key_epoch: 0,
+                reference_frame: 0,
             };
 
             let mut net = Net {

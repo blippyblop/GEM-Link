@@ -497,6 +497,10 @@ impl ServerCoreContext {
         });
     }
 
+    /// `reference_frame` is the frame index the encoder was told it may reference for this picture,
+    /// or `0` when it did not say. It travels to the client, where it is the difference between one
+    /// lost frame and a hold that lasts until the next keyframe: a frame chained to a confirmed
+    /// reference decodes across a hole.
     pub fn send_video_nal(
         &self,
         frame_index: u64,
@@ -504,6 +508,7 @@ impl ServerCoreContext {
         global_view_params: [ViewParams; 2],
         foveation_center_shifts: Option<[[f32; 2]; 2]>,
         is_idr: bool,
+        reference_frame: u64,
         nal_buffer: Vec<u8>,
     ) {
         dbg_server_core!("send_video_nal");
@@ -541,12 +546,12 @@ impl ServerCoreContext {
                 }
             }
 
-            // ADR-0011, phase one. A frame whose reference the client does not have is not
-            // transmitted at all — not the frame that was lost, and not the P-frames that
-            // follow it, because those are the ones that decode to a plausible-looking
-            // picture that is entirely wrong.
+            // ADR-0011, phase one, with the information the gate needed and never had: what this
+            // frame was encoded against. The encoder references only frames the client has
+            // acknowledged, so a frame that *states* its reference is decodable however the frames
+            // around it fared, and the stream no longer has to stop for a discard. See `SendGate`.
             let mut gate = SEND_GATE.lock();
-            match gate.may_transmit(is_idr) {
+            match gate.may_transmit(is_idr, reference_frame) {
                 x_transport::SendDecision::Transmit => {
                     // The mirror and the rolling-file recording are records of what the
                     // client received, so they live inside the gate, as they did before.
@@ -566,6 +571,7 @@ impl ServerCoreContext {
                                 global_view_params,
                                 foveation_center_shifts,
                                 is_idr,
+                                reference_frame,
                             },
                             payload: nal_buffer,
                         })
@@ -640,6 +646,18 @@ impl ServerCoreContext {
             }
             params
         })
+    }
+
+    /// What the encoder may reference: which frames the client has confirmed it decoded.
+    ///
+    /// Deliberately a separate call from [`Self::get_dynamic_encoder_params`], and deliberately not
+    /// gated on anything. Encoder parameters are a *change* — `None` means "nothing to do" — whereas
+    /// this is a fact about the link that the encoder needs on **every** frame, whether or not any
+    /// parameter changed. Folding it into the parameter struct would have tied it to `updated`, which
+    /// is set once a second at best: the encoder would then reference frames the client lost for as
+    /// long as the bitrate stayed still.
+    pub fn client_ack_state(&self) -> (bool, u64, u64) {
+        self.connection_context.bitrate_manager.lock().client_ack()
     }
 
     pub fn report_composed(&self, target_timestamp: Duration, offset: Duration) {

@@ -94,6 +94,10 @@ pub struct AlvrDeviceConfig {
 pub struct AlvrDynamicEncoderParams {
     bitrate_bps: f32,
     framerate: f32,
+    /// See `BitrateManager::client_ack`. Read on every frame, not only when the bitrate changed.
+    client_acked_frame: u64,
+    client_ack_valid: bool,
+    client_acked_recent_mask: u64,
 }
 
 #[repr(C)]
@@ -518,6 +522,7 @@ pub unsafe extern "C" fn alvr_send_video_nal(
     global_view_params: *const AlvrViewParams,
     foveation_center_shifts: *const [[f32; 2]; 2],
     is_idr: bool,
+    reference_frame: u64,
     buffer_ptr: *mut u8,
     len: i32,
 ) {
@@ -538,6 +543,7 @@ pub unsafe extern "C" fn alvr_send_video_nal(
             // # Safety: the caller provides either null or a valid 2x2 centers array.
             unsafe { foveation_center_shifts.as_ref() }.copied(),
             is_idr,
+            reference_frame,
             buffer.to_vec(),
         );
     }
@@ -548,18 +554,29 @@ pub unsafe extern "C" fn alvr_send_video_nal(
 pub unsafe extern "C" fn alvr_get_dynamic_encoder_params(
     out_params: *mut AlvrDynamicEncoderParams,
 ) -> bool {
-    if let Some(context) = &*SERVER_CORE_CONTEXT.read()
-        && let Some(params) = context.get_dynamic_encoder_params()
-    {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        // The acknowledgement state goes out **whatever** the parameters do, and before the
+        // `return false` below: the encoder needs it on every frame, and a `false` return means only
+        // that no *parameter* changed.
+        let (valid, newest, mask) = context.client_ack_state();
         unsafe {
-            (*out_params).bitrate_bps = params.bitrate_bps;
-            (*out_params).framerate = params.framerate;
+            (*out_params).client_ack_valid = valid;
+            (*out_params).client_acked_frame = newest;
+            (*out_params).client_acked_recent_mask = mask;
         }
 
-        true
-    } else {
-        false
+        if let Some(params) = context.get_dynamic_encoder_params() {
+            unsafe {
+                (*out_params).bitrate_bps = params.bitrate_bps;
+                (*out_params).framerate = params.framerate;
+            }
+
+            return true;
+        }
     }
+
+    false
+    
 }
 
 #[unsafe(no_mangle)]

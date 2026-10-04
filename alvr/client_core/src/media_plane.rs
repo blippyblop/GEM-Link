@@ -270,6 +270,24 @@ impl MediaPlaneReceiver {
         self.plane.stats()
     }
 
+    /// Tell the plane a frame was decoded. See [`VideoPlane::on_decoded`].
+    ///
+    /// On the receiver rather than on the socket, because the plane is what the answer means
+    /// something to: the trust gate consults it for the *next* frame's reference.
+    pub fn on_decoded(&mut self, frame_index: u64) -> bool {
+        self.plane.on_decoded(frame_index)
+    }
+
+    /// Tell the plane the decoder refused a frame. See [`VideoPlane::on_decode_failed`].
+    pub fn on_decode_failed(&mut self, frame_index: u64) {
+        self.plane.on_decode_failed(frame_index);
+    }
+
+    /// Count an acknowledgement the caller sent. See [`VideoPlane::count_ack_sent`].
+    pub fn count_ack_sent(&mut self) {
+        self.plane.count_ack_sent()
+    }
+
     /// The receiver's own account. See [`VideoPlane::receiver_account`].
     pub fn receiver_account(&self) -> String {
         self.plane.receiver_account()
@@ -380,23 +398,35 @@ pub struct PlaneStats {
     pub held_gap: u64,
     pub held_datagram_loss: u64,
     pub held_decoder: u64,
+    /// Frames held because they were chained to a frame this client never decoded. Distinct from
+    /// `held_gap`, and the distinction is the point: a gap can be *routed around* when the sender
+    /// says what the frame is chained to, and this counter is the case where it cannot be.
+    pub held_unconfirmed_reference: u64,
+    /// Frames presented **across a hole** because their reference was one this client had decoded,
+    /// and frames acknowledged decoded. The second is what the sender's encoder needs; the first is
+    /// what it buys, and both are zero on a link with no loss.
+    pub frames_trusted_across_gap: u64,
+    pub acks_sent: u64,
 }
 
 impl PlaneStats {
     pub fn summary(&self) -> String {
         format!(
-            "video plane: {} datagrams in ({} dropped by source, {} rejected), {} frames presented, \
-             {} held ({} no-keyframe, {} gap, {} datagram-loss, {} decoder), {} abandoned, \
+            "video plane: {} datagrams in ({} dropped by source, {} rejected), {} frames presented \
+             ({} across a hole on a confirmed reference), {} held ({} no-keyframe, {} gap, {} \
+             datagram-loss, {} unconfirmed-reference, {} decoder), {} abandoned, \
              {} repaired by FEC, {} keyframe(s) in ({} clean), {} nack(s), {} keyframe request(s), \
-             {} reset(s)",
+             {} reset(s), {} ack(s)",
             self.datagrams_received,
             self.datagrams_dropped_by_source,
             self.datagrams_rejected,
             self.frames_presented,
+            self.frames_trusted_across_gap,
             self.frames_held,
             self.held_no_keyframe,
             self.held_gap,
             self.held_datagram_loss,
+            self.held_unconfirmed_reference,
             self.held_decoder,
             self.frames_abandoned,
             self.frames_repaired,
@@ -405,6 +435,7 @@ impl PlaneStats {
             self.nacks_sent,
             self.keyframe_requests,
             self.resets,
+            self.acks_sent,
         )
     }
 }
@@ -422,6 +453,24 @@ pub struct VideoPlane {
     /// property of the receiver measured over many frames, and a control loop fed per-frame noise is
     /// one that oscillates.
     frames_since_queue_report: u32,
+    /// Which frame indices this client has **decoded**, bounded to the last
+    /// [`x_transport::DecodeHistory::WINDOW`] indices.
+    ///
+    /// This is the client's half of the reference contract: the sender tells each frame what it was
+    /// encoded against, and this is what lets the client answer whether it has that picture. It is
+    /// filled from the decoder's answer, not from the transport's — a frame whose bytes arrived and
+    /// whose decode failed is not one a later frame may be built on.
+    decoded: x_transport::DecodeHistory,
+    /// Frames this client **showed** — released with a payload and trusted by the gate.
+    ///
+    /// Distinct from `decoded`, and the distinction is a batch: a release pass can hand over twenty
+    /// frames at once after a freeze, and every one of them references the frame before it, which is
+    /// in that same batch. Asking the decoder's history would hold nineteen of the twenty for a frame
+    /// the client is going to decode a millisecond later. A frame that was *shown* is what the frames
+    /// behind it need, and a decode that then fails is recorded against it below.
+    shown: x_transport::DecodeHistory,
+    /// Frames the decoder did not take. A frame here is not a reference, whatever it was shown as.
+    failed: x_transport::DecodeHistory,
     /// The receiver's late-datagram count at the last queue report, so each report carries the
     /// delta rather than the running total, and the repair requests the same interval made, so the
     /// delta can be expressed as a share of them 2014 which is the only form the sender can apply
@@ -443,6 +492,9 @@ impl VideoPlane {
             started: now,
             stats: PlaneStats::default(),
             frames_since_queue_report: 0,
+            decoded: x_transport::DecodeHistory::default(),
+            shown: x_transport::DecodeHistory::default(),
+            failed: x_transport::DecodeHistory::default(),
             last_late_reported: 0,
             last_nacks_reported: 0,
         }
@@ -657,14 +709,31 @@ impl VideoPlane {
             self.stats.frames_repaired += 1;
         }
 
+        // The one question the reference field exists to answer: is the picture this frame was
+        // encoded against one this client decoded? A frame whose chain is confirmed is decodable
+        // *across* a hole, so a missing frame stops being a hold — which is what turns one lost frame
+        // from ~140 held frames into one stutter.
+        let reference_decoded = frame.reference_frame != 0
+            && frame.reference_frame < frame.frame_index
+            && self.shown.contains(frame.reference_frame)
+            && !self.failed.contains(frame.reference_frame);
+
         // A frame with a payload has no hole in it, repaired or not — the transport only hands out
         // bytes it could rebuild. A frame without one is the only case that may not be shown.
-        match self
-            .trust
-            .may_present(frame.frame_index, frame.is_keyframe, !usable)
-        {
+        match self.trust.may_present(
+            frame.frame_index,
+            frame.is_keyframe,
+            !usable,
+            frame.reference_frame,
+            reference_decoded,
+        ) {
             FrameTrust::Trusted => {
                 self.stats.frames_presented += 1;
+                self.stats.frames_trusted_across_gap = self.trust.trusted_across_gap();
+                // Shown, so the frames behind it may be built on it. Recorded now rather than when
+                // the decoder answers, because a release pass can hand over a whole batch that
+                // references itself frame by frame — see the note on `shown`.
+                self.shown.record(frame.frame_index);
                 self.stall.progress(now);
                 Decision::Present
             }
@@ -676,11 +745,40 @@ impl VideoPlane {
                     x_transport::UntrustedReason::DatagramLoss => {
                         self.stats.held_datagram_loss += 1
                     }
+                    x_transport::UntrustedReason::UnconfirmedReference { .. } => {
+                        self.stats.held_unconfirmed_reference += 1
+                    }
                     x_transport::UntrustedReason::DecoderRejected => self.stats.held_decoder += 1,
                 }
                 Decision::Held(reason)
             }
         }
+    }
+
+    /// Tell the plane that a frame was decoded and is in the decoder's reference chain.
+    ///
+    /// Called by the caller after the decoder has *accepted* the frame, because that — not the
+    /// datagrams arriving — is what makes a frame a usable reference. Returns whether this is news
+    /// worth sending: the caller acknowledges exactly what this returns true for, so a duplicate or a
+    /// reorder does not turn into a packet.
+    pub fn on_decoded(&mut self, frame_index: u64) -> bool {
+        self.decoded.record(frame_index)
+    }
+
+    /// Tell the plane the decoder did **not** take a frame it was shown.
+    ///
+    /// The frame is then not a reference for anything behind it, whatever it was shown as. Recorded
+    /// rather than forgotten, because the two histories answer different questions: what was shown,
+    /// and what was actually usable.
+    pub fn on_decode_failed(&mut self, frame_index: u64) {
+        self.failed.record(frame_index);
+        self.trust.on_decoder_result(false);
+    }
+
+    /// Count an acknowledgement the caller sealed and sent. Kept here rather than in the caller so
+    /// the plane's summary is the one place the whole exchange is visible.
+    pub fn count_ack_sent(&mut self) {
+        self.stats.acks_sent += 1;
     }
 }
 
@@ -723,6 +821,7 @@ mod tests {
                         target_timestamp_us: frame_index * 11_111,
                         is_keyframe: frame_index == 1 || frame_index.is_multiple_of(keyframe_every),
                         key_epoch: 0,
+                        reference_frame: 0,
                     },
                     &bytes,
                     &mut seq,
@@ -835,6 +934,100 @@ mod tests {
     }
 
     #[test]
+    fn a_hole_does_not_hold_a_frame_chained_to_one_the_client_decoded() {
+        // **The payoff of the reference field, end to end through the plane.**
+        //
+        // Frame 5 is lost entirely. On the old rule every frame after it was held until the next
+        // keyframe — one lost frame, a frozen picture. Here the sender says what each frame was
+        // encoded against, and after the hole the encoder references frame 4, the newest frame the
+        // client acknowledged. The client decoded frame 4, so the frames behind the hole are
+        // presentable: nothing they decode depends on frame 5.
+        let packetizer = Packetizer::new(MTU, ParityPolicy::Off);
+        let bytes = payload(4);
+        let mut seq = 0;
+        let mut datagrams = Vec::new();
+        for frame_index in 1..=40u64 {
+            // What the encoder does with the acknowledgements it has: reference the previous frame,
+            // and across a hole reference the newest frame the client confirmed.
+            let reference = if frame_index <= 4 { frame_index - 1 } else { 4 };
+            let (_, d) = packetizer
+                .fragment(
+                    x_transport::FrameMeta {
+                        frame_index,
+                        target_timestamp_us: frame_index * 11_111,
+                        is_keyframe: frame_index == 1,
+                        key_epoch: 0,
+                        reference_frame: reference,
+                    },
+                    &bytes,
+                    &mut seq,
+                    None,
+                )
+                .unwrap();
+            // Frame 5 never arrives — not one datagram of it.
+            if frame_index != 5 {
+                datagrams.extend(d);
+            }
+        }
+
+        let mut plane = VideoPlane::new(policy(), None, Instant::now());
+        let now = Instant::now();
+
+        // First pass: frames 1..4 are complete, so they are released and shown, and the caller
+        // tells the plane they decoded. This is the sequence a live client produces.
+        {
+            // Only what belongs to frames 1..4, so the pass is exactly what the client sees before
+            // the hole: four clean pictures and no knowledge of what comes next.
+            let mut partial = Vec::new();
+            for datagram in datagrams.iter() {
+                let (header, _) = x_transport::FragmentHeader::decode(datagram).unwrap();
+                if header.frame_index <= 4 {
+                    partial.push(datagram.clone());
+                }
+            }
+            let mut source = ReplaySource::new(partial);
+            plane.pump(&mut source, now, Duration::ZERO);
+        }
+        for event in plane.release(now + Duration::from_millis(20)) {
+            if let PlaneEvent::Present { frame_index, .. } = event {
+                assert!(plane.on_decoded(frame_index), "frame {frame_index} decoded twice");
+            }
+        }
+        assert_eq!(plane.stats().frames_presented, 4);
+        assert_eq!(plane.stats().frames_held, 0);
+
+        // Second pass: everything else. Frame 5 is abandoned (the stream has moved on without it),
+        // and the frames behind it are presented because their reference — frame 4 — is one the
+        // client decoded.
+        let mut source = ReplaySource::new(datagrams);
+        plane.pump(&mut source, now, Duration::ZERO);
+        let events = plane.release(now + Duration::from_millis(80));
+
+        let presented: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                PlaneEvent::Present { frame_index, .. } => Some(*frame_index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            presented.contains(&6) && presented.contains(&40),
+            "the frames behind the hole were held: {presented:?}"
+        );
+        assert!(
+            !presented.contains(&5),
+            "the frame that never arrived was presented"
+        );
+        assert!(
+            plane.stats().frames_trusted_across_gap > 0,
+            "no frame was trusted across the hole: the reference field is not being used"
+        );
+        // There is no keyframe after frame 1 in this stream at all, so a release from the hold *must*
+        // be the reference path — nothing else could have done it.
+        assert_eq!(plane.stats().keyframes_in, 1);
+    }
+
+    #[test]
     fn a_keyframe_after_a_loss_releases_the_hold() {
         // The recovery path end to end, including the wire bit that makes it possible.
         let mut plane = VideoPlane::new(policy(), None, Instant::now());
@@ -851,6 +1044,7 @@ mod tests {
                         // Keyframes at 1 and 30, so a hold can begin after 1 and end at 30.
                         is_keyframe: frame_index == 1 || frame_index == 30,
                         key_epoch: 0,
+                        reference_frame: 0,
                     },
                     &bytes,
                     &mut seq,
@@ -964,7 +1158,7 @@ mod tests {
         let hold = ReleasePolicy {
             straggler_delay: Duration::from_millis(10),
             repair_delay: Duration::from_millis(20),
-            deadline: Duration::from_millis(30),
+            late_hold_frames: 0,
             jitter_frames: 0,
         };
         let mut plane = VideoPlane::new(hold, None, Instant::now());
@@ -978,6 +1172,7 @@ mod tests {
                     target_timestamp_us: 1,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut seq,
@@ -1108,6 +1303,7 @@ mod tests {
                     target_timestamp_us: 123_456,
                     is_keyframe: true,
                     key_epoch: 0,
+                    reference_frame: 0,
                 },
                 &bytes,
                 &mut 0,
@@ -1125,8 +1321,8 @@ mod tests {
         let policy = ReleasePolicy {
             straggler_delay: Duration::ZERO,
             repair_delay: Duration::ZERO,
+            late_hold_frames: 0,
             jitter_frames: 0,
-            deadline: Duration::from_millis(500),
         };
         let mut socket = socket_from(receiver);
         socket.accept_only_from(sender.local_addr().unwrap());
@@ -1199,7 +1395,7 @@ mod tests {
         let policy = ReleasePolicy {
             straggler_delay: Duration::ZERO,
             repair_delay: Duration::from_millis(30),
-            deadline: Duration::from_millis(60),
+            late_hold_frames: 0,
             jitter_frames: 0,
         };
 
@@ -1208,6 +1404,7 @@ mod tests {
                 MTU,
                 ParityPolicy::Ratio { fraction: 0.05 },
                 &policy,
+                interval,
             ),
             x_transport::PacerConfig::for_rate(300_000_000, interval),
             interval,
@@ -1220,6 +1417,7 @@ mod tests {
             global_view_params: [ViewParams::DUMMY; 2],
             foveation_center_shifts: Some([[0.25, 0.5], [0.75, 0.5]]),
             is_idr: true,
+            reference_frame: 0,
         };
         let nal: Vec<u8> = vec![0, 0, 0, 1, 0x26, 0x01, 0xde, 0xad, 0xbe, 0xef];
 
@@ -1235,6 +1433,7 @@ mod tests {
                 target_timestamp_us: header.timestamp.as_micros() as u64,
                 is_keyframe: header.is_idr,
                 key_epoch: 0,
+                reference_frame: 0,
             },
             &frame_bytes,
             Duration::ZERO,

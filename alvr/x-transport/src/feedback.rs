@@ -52,6 +52,29 @@ const TAG_STREAM_RESET: u8 = 3;
 /// fixing the repair path worse than leaving it alone. This is not a fact about a frame; it is a
 /// fact about the receiver, and it is what the sender needs in order to send less.
 const TAG_QUEUE_DELAY: u8 = 4;
+/// **This frame was decoded.** The acknowledgement the sender's encoder needs, and the one signal
+/// that makes a lost frame stop poisoning the stream.
+///
+/// Every other message the client sends is a complaint; this is the only one that says a frame
+/// *worked*. The server cannot infer it: a frame it put on the wire may have been dropped by the
+/// kernel, lost in the queue, refused by the FEC, or never decoded — and from the sender's side all
+/// of those look identical to success until something else breaks.
+///
+/// What the sender does with it, in order of importance:
+///
+/// 1. **It tells the encoder what it may reference.** A frame is encoded against a frame the client
+///    has acknowledged, so the reference chain never includes a frame the client does not have, and
+///    a lost frame no longer corrupts everything behind it. The cost is that references are a little
+///    older, which is a compression cost and not a correctness one.
+/// 2. **It is the honest loss number.** Frames the client never acknowledges are frames it could not
+///    use, and that is a measurement, not an inference from repair requests — which is what the
+///    parity controller had to work with before, and why it read the client's *queueing* as loss.
+/// 3. It stops a repair being sent for a frame that has already been delivered.
+///
+/// Sent per decoded frame rather than as a cursor, because a client that skipped a frame has not
+/// received the ones before it in any useful sense — the indices that matter are the ones that
+/// decoded.
+const TAG_ACK: u8 = 5;
 
 /// One message from the client to the sender.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +117,8 @@ pub enum Feedback {
         /// interval: the sender applies it to its own window's requests.
         late_per_mille: u16,
     },
+    /// This frame was decoded and is in the decoder's reference chain — see [`TAG_ACK`].
+    Ack { frame_index: u64 },
 }
 
 /// Why a feedback datagram could not be read.
@@ -154,6 +179,12 @@ impl Feedback {
                 out.push(TAG_QUEUE_DELAY);
                 out.extend_from_slice(&micros.to_le_bytes());
                 out.extend_from_slice(&late_per_mille.to_le_bytes());
+                out
+            }
+            Feedback::Ack { frame_index } => {
+                let mut out = Vec::with_capacity(9);
+                out.push(TAG_ACK);
+                out.extend_from_slice(&frame_index.to_le_bytes());
                 out
             }
         }
@@ -221,6 +252,9 @@ impl Feedback {
                     late_per_mille,
                 })
             }
+            TAG_ACK => Ok(Feedback::Ack {
+                frame_index: u64_at(0)?,
+            }),
             other => Err(FeedbackError::UnknownTag(other)),
         }
     }
@@ -235,6 +269,7 @@ impl Feedback {
             // check must not get one from here, and `u64::MAX` makes the deadline rule refuse rather
             // than repair something arbitrary.
             Feedback::QueueDelay { .. } => u64::MAX,
+            Feedback::Ack { frame_index } => *frame_index,
         }
     }
 
@@ -244,6 +279,7 @@ impl Feedback {
             Feedback::RequestKeyframe { .. } => "request-keyframe",
             Feedback::StreamReset { .. } => "stream-reset",
             Feedback::QueueDelay { .. } => "queue-delay",
+            Feedback::Ack { .. } => "ack",
         }
     }
 

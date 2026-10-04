@@ -72,11 +72,17 @@ impl SenderConfig {
         mtu: usize,
         parity: ParityPolicy,
         release: &crate::ReleasePolicy,
+        frame_interval: Duration,
     ) -> Self {
         Self {
             mtu,
             parity,
-            repair_window: release.deadline,
+            // How long the client will actually wait for a repair: its repair window plus the grace
+            // it gives a frame before the stream's progress takes the slot away. Sending a repair
+            // after that is sending a datagram the client has already stopped assembling — it would
+            // be counted on both ends as a late arrival, which is bandwidth spent to make the
+            // loss figure look worse.
+            repair_window: release.hold_ceiling(frame_interval),
             cached_frames: 16,
         }
     }
@@ -92,6 +98,7 @@ impl SenderConfig {
             mtu,
             parity,
             &crate::ReleasePolicy::new(jitter_frames, frame_interval),
+            frame_interval,
         )
     }
 }
@@ -129,6 +136,10 @@ pub enum RepairRefusal {
     WouldArriveLate,
     /// Too old to still be cached. The cache is bounded, and this is the cost of that.
     Evicted,
+    /// The client has already told us it decoded this frame. The request crossed its own
+    /// acknowledgement on the wire — answering it would re-send a frame the client has, into the
+    /// congestion that delayed the request in the first place.
+    AlreadyDecoded,
 }
 
 /// What the sender did with one feedback message.
@@ -157,6 +168,19 @@ pub enum FeedbackOutcome {
         /// How long the client took to read a frame after its first shard appeared, EWMA.
         micros: u32,
     },
+    /// **This frame was decoded.** The one message that is not a complaint: the sender now knows a
+    /// frame it sent arrived *and worked*, which is what the encoder needs in order to reference only
+    /// frames the client has, and what the loss estimate needs in order to stop inferring loss from
+    /// repair requests. See [`Feedback::Ack`].
+    Acknowledged {
+        frame_index: u64,
+        /// The newest frame the client has decoded, which is what the encoder may reference. Not
+        /// the same as `frame_index` when acks arrive out of order or one is lost.
+        newest: u64,
+        /// Frames sent before `newest` that the client has now said nothing about, i.e. that it could
+        /// not use. The honest loss number.
+        frames_unusable: u64,
+    },
 }
 
 /// Counters. Same rule as everywhere else in this tree: a path that can lose a datagram has a
@@ -181,6 +205,19 @@ pub struct SenderStats {
     /// The last queueing delay the client reported, in microseconds. See
     /// [`FeedbackOutcome::QueueDelay`].
     pub reported_queue_delay_us: u64,
+    /// Frames the client **acknowledged decoded**, and frames it never acknowledged at all.
+    ///
+    /// The pair replaces inference with measurement. `frames_unacked` is the number of frames the
+    /// client could not use, and on a session where the encoder's references, the FEC and the drain
+    /// are all working it is zero. See [`Feedback::Ack`].
+    pub frames_acked: u64,
+    pub frames_unacked: u64,
+    /// Frames the sender dropped on purpose to lower the frame rate. See
+    /// [`MediaSender::set_frame_divisor`]: the second rung of the degradation ladder, below latency
+    /// and above quality.
+    pub frames_skipped_for_rate: u64,
+    /// Repair requests refused because the client had already acknowledged the frame.
+    pub repairs_refused_delivered: u64,
     pub repairs_refused_expired: u64,
     pub repairs_refused_late: u64,
     pub repairs_refused_evicted: u64,
@@ -212,8 +249,9 @@ impl SenderStats {
         format!(
             "media sender: {} frames ({} datagrams, {} parity = {:.1} % overhead), {} refused by \
              the sink, {} repair request(s) answered with {} datagram(s), {} repair(s) refused \
-             ({} expired, {} too late, {} evicted, {} unknown), {} keyframe request(s), {} reset(s), \
-             {} frame(s) over budget",
+             ({} expired, {} too late, {} evicted, {} unknown, {} already decoded), {} keyframe \
+             request(s), {} reset(s), {} frame(s) over budget; client decoded {} frame(s) and could \
+             not use {}",
             self.frames_sent,
             self.datagrams_sent,
             self.parity_datagrams,
@@ -224,14 +262,18 @@ impl SenderStats {
             self.repairs_refused_expired
                 + self.repairs_refused_late
                 + self.repairs_refused_evicted
-                + self.repairs_refused_unknown,
+                + self.repairs_refused_unknown
+                + self.repairs_refused_delivered,
             self.repairs_refused_expired,
             self.repairs_refused_late,
             self.repairs_refused_evicted,
             self.repairs_refused_unknown,
+            self.repairs_refused_delivered,
             self.keyframes_required,
             self.stream_resets,
             self.over_budget_frames,
+            self.frames_acked,
+            self.frames_unacked,
         )
     }
 }
@@ -264,15 +306,13 @@ struct LossWindow {
 impl LossWindow {
     fn loss(&self) -> f64 {
         if self.datagrams_sent == 0 {
-            0.0
-        } else {
-            // Clamped: a client that asks for the same fragment repeatedly — which a real one does,
-            // see `nack_retry_interval` — would otherwise report a loss above 100 %. Erring high is
-            // the safe direction for a parity estimate, but above 1.0 it is not an estimate at all.
-            let genuinely_missing =
-                self.fragments_requested as f64 * (1.0 - self.late_fraction);
-            (genuinely_missing / self.datagrams_sent as f64).min(1.0)
+            return 0.0;
         }
+        // Clamped: a client that asks for the same fragment repeatedly — which a real one does,
+        // see `nack_retry_interval` — would otherwise report a loss above 100 %. Erring high is
+        // the safe direction for a parity estimate, but above 1.0 it is not an estimate at all.
+        let genuinely_missing = self.fragments_requested as f64 * (1.0 - self.late_fraction);
+        (genuinely_missing / self.datagrams_sent as f64).min(1.0)
     }
 
     fn reset(&mut self) {
@@ -282,6 +322,27 @@ impl LossWindow {
         self.late_fraction = 0.0;
     }
 }
+
+/// The acknowledgement measurement, and why it is its own window.
+///
+/// An acknowledgement arrives about a round trip after the frame it names, so a window of *sent*
+/// frames is filled with frames whose answers are still in flight. Measuring inside it would read
+/// "nothing acknowledged yet" and conclude there was no loss — which is how the first version of this
+/// reported zero while the client was refusing frames. This window closes on **acknowledgements**,
+/// which is the traffic that carries the answer.
+///
+/// The frames the client never mentioned are counted too, and that is the point: they are the frames
+/// it could not use. A frame is written off when a *newer* frame is acknowledged or when the
+/// outstanding list overflows, never merely because time passed.
+#[derive(Debug, Default)]
+struct AckWindow {
+    acked: u64,
+    unacked: u64,
+}
+
+/// Acknowledgements per observation. Eight frames is a tenth of a second at 90 Hz: long enough that
+/// one lost acknowledgement is not read as one lost frame, short enough to react within a burst.
+const ACK_WINDOW_FRAMES: u64 = 8;
 
 /// One frame's datagrams, kept for repair.
 struct CachedFrame {
@@ -329,6 +390,13 @@ impl SenderCrypto {
     }
 }
 
+/// How many frames may be owed an acknowledgement at once.
+///
+/// Four seconds at 90 Hz. Long enough that a client whose acknowledgements are crowded out by its
+/// own repair traffic is not counted as having decoded nothing, short enough that a client which has
+/// genuinely stopped is treated as having stopped rather than as merely quiet.
+const MAX_OUTSTANDING_ACKS: usize = 360;
+
 /// The ratio a fixed policy stands for, for a controller that has to start somewhere.
 ///
 /// `ParityPolicy::Fixed` is a shard *count* rather than a fraction, so it has no fraction to
@@ -367,6 +435,34 @@ pub struct MediaSender {
     /// The last loss the controller was told about, for the summary and for a caller that wants to
     /// know why the ratio moved.
     observed_loss: f64,
+    /// The newest frame the client has acknowledged decoding. **The encoder may reference nothing
+    /// newer than this**, which is the whole of "a lost frame corrupts nothing".
+    client_acked_frame: Option<u64>,    /// Frames sent and not yet acknowledged, oldest first. Bounded: on overflow the oldest is counted
+    /// as one the client could not use, which is the same conclusion the acknowledgement would have
+    /// led to, just reached for want of a packet rather than for want of a decoder.
+    ///
+    /// This is what turns acknowledgements into a *number* rather than a cursor: when frame `n` is
+    /// acknowledged, every frame still in this list older than `n` was never acknowledged and never
+    /// will be.
+    outstanding: VecDeque<u64>,
+    /// The loss measurement taken from acknowledgements, and whether any have ever arrived — which
+    /// decides which of the two measurements owns the parity controller.
+    ack_window: AckWindow,
+    acks_seen: u64,
+    /// How many frames to skip between the ones that go out: 1 sends everything, 2 sends every other
+    /// frame, and so on.
+    ///
+    /// **The frame-rate lever**, and it is only safe because of the acknowledgement loop above: a
+    /// frame that is never sent is a frame the client never acknowledges, so the encoder's next
+    /// reference decision routes around it instead of building on it. The alternative — encoding
+    /// fewer frames — cannot be done here at all (the encoder is in another process); dropping them
+    /// on the wire is the same thing to the client, and the cost is encoder time rather than picture.
+    ///
+    /// The order it belongs to: latency first, then frame rate, then quality, and never integrity.
+    /// A stream at half the frame rate looks fine; one with a hole does not.
+    frame_divisor: u32,
+    /// Frames seen since the last one that went out, for the divisor above.
+    frames_seen: u64,
     send_seq: u32,
     /// Set by a keyframe request; the caller takes it and asks the encoder.
     pending_keyframe: Option<u64>,
@@ -406,6 +502,12 @@ impl MediaSender {
             reported_queue_delay_us: None,
             late_fraction: 0.0,
             observed_loss: 0.0,
+            client_acked_frame: None,
+            outstanding: VecDeque::new(),
+            ack_window: AckWindow::default(),
+            acks_seen: 0,
+            frame_divisor: 1,
+            frames_seen: 0,
             send_seq: 0,
             pending_keyframe: None,
             resume_from: None,
@@ -439,6 +541,20 @@ impl MediaSender {
     /// frame rate has no other clock it can trust.
     pub fn set_loss_window_frames(&mut self, frames: u64) {
         self.loss_window_frames = frames.max(1);
+    }
+
+    /// Skip all but one frame in every `divisor`, to lower the frame rate. See
+    /// [`MediaSender::frame_divisor`].
+    ///
+    /// The caller decides *when*: that is a question about the client's queueing, and this type does
+    /// not have the client's reports — it has its acknowledgements, which say what the client could
+    /// use rather than how far behind it is.
+    pub fn set_frame_divisor(&mut self, divisor: u32) {
+        self.frame_divisor = divisor.max(1);
+    }
+
+    pub fn frame_divisor(&self) -> u32 {
+        self.frame_divisor
     }
 
     /// The loss the controller was last told about.
@@ -480,6 +596,15 @@ impl MediaSender {
         &self.stats
     }
 
+    /// The newest frame index the client has confirmed it decoded, or `None` before the first
+    /// acknowledgement of a session.
+    ///
+    /// This is what the encoder is told it may reference. `None` is not the same as `0`: it means the
+    /// client has confirmed nothing, so the only safe frame is a keyframe.
+    pub fn client_acked_frame(&self) -> Option<u64> {
+        self.client_acked_frame
+    }
+
     pub fn cached_frames(&self) -> usize {
         self.cache.len()
     }
@@ -509,6 +634,39 @@ impl MediaSender {
         now: Duration,
     ) -> FrameSend {
         self.stats.frames_sent += 1;
+        self.frames_seen += 1;
+
+        // The frame-rate lever. A frame that is skipped is not sent, not cached and not owed an
+        // acknowledgement — as far as the client and the encoder's reference loop are concerned it
+        // never existed, which is precisely why skipping is safe here and would not be without the
+        // acknowledgement. Keyframes are never skipped: they are what a hold recovers from.
+        if self.frame_divisor > 1
+            && !meta.is_keyframe
+            && !(self.frames_seen - 1).is_multiple_of(self.frame_divisor as u64)
+        {
+            self.stats.frames_skipped_for_rate += 1;
+            // The pacer is still consulted, so the debt it accumulates reflects the real time this
+            // frame consumed rather than pretending the frame rate fell for free.
+            self.pacer.schedule(0, now);
+            return FrameSend {
+                frame_index: meta.frame_index,
+                datagrams: 0,
+                parity_datagrams: 0,
+                bytes: 0,
+                refused: 0,
+                paced_wait: self.pacer.next_send().saturating_sub(now),
+                over_budget: false,
+                layout: FrameLayout {
+                    frame_index: meta.frame_index,
+                    frame_len: 0,
+                    data_count: 0,
+                    parity_count: 0,
+                    blocks: 0,
+                    parity_per_block: 0,
+                    datagram_len: 0,
+                },
+            };
+        }
 
         let (cipher, epoch) = match &mut self.crypto {
             Some(crypto) => {
@@ -587,6 +745,20 @@ impl MediaSender {
         self.loss_window.datagrams_sent += datagrams.len() as u64;
         self.adapt_parity();
 
+        // Remember that this frame is owed an acknowledgement. The list is bounded because a client
+        // that stops acknowledging — a crash, a black plane — must not grow this process's memory,
+        // and because an acknowledgement that arrives later than this is not about a frame the
+        // encoder could still use.
+        self.outstanding.push_back(meta.frame_index);
+        while self.outstanding.len() > MAX_OUTSTANDING_ACKS {
+            if let Some(forgotten) = self.outstanding.pop_front() {
+                self.stats.frames_unacked += 1;
+                self.ack_window.unacked += 1;
+                let _ = forgotten;
+            }
+        }
+        self.adapt_parity_from_acks();
+
         let paced_wait = self.pacer.next_send().saturating_sub(now);
         let over_budget = paced_wait > self.frame_interval;
         if over_budget {
@@ -626,6 +798,15 @@ impl MediaSender {
             return;
         }
 
+        // Once the client has acknowledged even one frame, it can tell us what it decoded, and that
+        // measurement owns the controller: repair requests are the stand-in for a client that cannot
+        // answer the question. Feeding both would be two observers of one link, and the whole reason
+        // the ratio oscillated is that the stand-in was being believed over the measurement.
+        if self.acks_seen > 0 {
+            self.loss_window.reset();
+            return;
+        }
+
         // The window carries the correction, the sender carries the report. Copy it in before the
         // ratio is computed — the two are separate fields and only one of them was being written.
         self.loss_window.late_fraction = self.late_fraction;
@@ -655,6 +836,53 @@ impl MediaSender {
                 ratio,
                 loss * 100.0,
                 self.stats.retransmit_requests,
+            );
+        }
+    }
+
+    /// The acknowledgement's turn at the controller.
+    ///
+    /// The measured quantity is **frames the client could not use**, over frames it acknowledged plus
+    /// frames it never mentioned. That is the number the code rate is trying to move, and unlike the
+    /// repair-request estimate it cannot be inflated by a client that is merely behind: a frame is
+    /// either in the decoder's reference chain or it is not.
+    fn adapt_parity_from_acks(&mut self) {
+        let Some(_) = self.adaptive else {
+            self.ack_window = AckWindow::default();
+            return;
+        };
+        let observed = self.ack_window.acked + self.ack_window.unacked;
+        if observed < ACK_WINDOW_FRAMES {
+            return;
+        }
+
+        let loss = (self.ack_window.unacked as f64 / observed as f64).min(1.0);
+        self.observed_loss = loss;
+        self.stats.last_loss = loss;
+        self.ack_window = AckWindow::default();
+
+        let Some(adaptive) = &mut self.adaptive else {
+            return;
+        };
+        let change = adaptive.observe(loss);
+        let ratio = adaptive.fraction();
+        self.parity = ParityPolicy::Ratio { fraction: ratio };
+        self.packetizer = Packetizer::new(self.config.mtu, self.parity);
+
+        match change {
+            crate::adaptive::RatioChange::Raised { .. } => self.stats.ratio_raises += 1,
+            crate::adaptive::RatioChange::Lowered { .. } => self.stats.ratio_lowers += 1,
+            crate::adaptive::RatioChange::Unchanged => {}
+        }
+
+        if change.changed() {
+            log::info!(
+                "media sender: FEC ratio {} at {:.2} % of acknowledged frames unusable ({} decoded, \
+                 {} never acknowledged)",
+                ratio,
+                loss * 100.0,
+                self.stats.frames_acked,
+                self.stats.frames_unacked,
             );
         }
     }
@@ -737,6 +965,36 @@ impl MediaSender {
 
                 FeedbackOutcome::QueueDelay { micros: *micros }
             }
+            Feedback::Ack { frame_index } => {
+                let newest = self.client_acked_frame.map_or(*frame_index, |cur| cur.max(*frame_index));
+                self.client_acked_frame = Some(newest);
+                self.stats.frames_acked += 1;
+
+                // Everything older that was still owed an acknowledgement, and that is not this
+                // frame, was never acknowledged: the client decoded a later frame without it. These
+                // are frames it could not use, which is the number the parity is bought against.
+                let mut unusable = 0u64;
+                while let Some(&front) = self.outstanding.front() {
+                    if front > newest {
+                        break;
+                    }
+                    self.outstanding.pop_front();
+                    if front < newest {
+                        unusable += 1;
+                        self.stats.frames_unacked += 1;
+                        self.ack_window.unacked += 1;
+                    }
+                }
+                self.ack_window.acked += 1;
+                self.acks_seen += 1;
+                self.adapt_parity_from_acks();
+
+                FeedbackOutcome::Acknowledged {
+                    frame_index: *frame_index,
+                    newest,
+                    frames_unusable: unusable,
+                }
+            }
         }
     }
 
@@ -750,6 +1008,17 @@ impl MediaSender {
         // One round trip's worth of "that answer is already in flight" — the client's floor for
         // asking again, which is the same number and therefore the honest window to answer in.
         let retry_floor = crate::nack_retry_interval(self.rtt);
+
+        // The request crossed the acknowledgement of its own frame on the wire: the client has the
+        // frame, so re-sending it costs bandwidth inside the congestion that delayed the request —
+        // and the client's own late-arrival report would then count these datagrams as late.
+        if self.client_acked_frame.is_some_and(|acked| frame_index <= acked) {
+            self.stats.repairs_refused_delivered += 1;
+            return FeedbackOutcome::RepairRefused {
+                frame_index,
+                reason: RepairRefusal::AlreadyDecoded,
+            };
+        }
 
         let Some(frame) = self.cache.get_mut(&frame_index) else {
             self.stats.repairs_refused_unknown += 1;
@@ -903,6 +1172,7 @@ mod tests {
             target_timestamp_us: target_us,
             is_keyframe: frame_index == 1,
             key_epoch: 0,
+            reference_frame: frame_index.saturating_sub(1),
         }
     }
 
@@ -1194,14 +1464,17 @@ mod tests {
     }
 
     #[test]
-    fn a_repair_that_would_arrive_after_the_deadline_is_refused_even_though_the_frame_is_live() {
+    fn a_repair_that_would_arrive_after_the_hold_ceiling_is_refused_even_though_the_frame_is_live() {
         let mut sender = sender(ParityPolicy::Off);
         sender.set_rtt(Duration::from_millis(10));
         let mut sink = Collector::new();
-        // Target 100 ms, window = 2 * 11.111 ms = 22.222 ms, so repair_until = 122.222 ms.
+        // Target 100 ms and a one-frame policy, so the client will hold this frame until
+        // 111.111 ms — its repair window with no grace, `late_hold_frames` being zero in the
+        // frame-quantised form. The repair window the sender may spend bandwidth in is that same
+        // instant, not one of its own invention.
         sender.send_frame(&mut sink, meta(9, 100_000), &payload(4), Duration::ZERO);
 
-        // 115 ms: still before the deadline, but 115 + 10 > 122.222.
+        // 105 ms: still before the client gives up, but 105 + 10 > 111.111.
         let mut repairs = Collector::new();
         let outcome = sender.on_feedback(
             &mut repairs,
@@ -1209,7 +1482,7 @@ mod tests {
                 frame_index: 9,
                 fragments: vec![0],
             },
-            Duration::from_millis(115),
+            Duration::from_millis(105),
         );
 
         assert_eq!(
@@ -1221,8 +1494,8 @@ mod tests {
         );
         assert!(repairs.is_empty());
         assert_eq!(sender.stats().repairs_refused_late, 1);
-        assert!(!sender.can_repair(9, Duration::from_millis(115)));
-        assert!(sender.can_repair(9, Duration::from_millis(110)));
+        assert!(!sender.can_repair(9, Duration::from_millis(105)));
+        assert!(sender.can_repair(9, Duration::from_millis(100)));
     }
 
     #[test]
@@ -1471,6 +1744,89 @@ mod tests {
         }
 
         assert_eq!(seen, [0, 1, 1, 2], "epochs did not follow the frame index");
+    }
+
+    #[test]
+    fn an_acknowledgement_is_the_loss_signal_the_repair_requests_only_stood_in_for() {
+        // The controller's input used to be "requests / datagrams sent", which a client that is
+        // behind inflates by asking for fragments that are merely queued. The acknowledgement is a
+        // measurement: frames the client could not use, over frames it could. Here no datagram is
+        // lost at all and no repair is ever requested, and the frames the client never acknowledges
+        // are still counted — which is the case the old estimate could not see.
+        let mut sender = sender(ParityPolicy::Off);
+        sender.set_loss_window_frames(4);
+        let mut sink = Collector::new();
+        for frame in 1..=8 {
+            sender.send_frame(&mut sink, meta(frame, frame * 11_111), &payload(2), Duration::ZERO);
+        }
+
+        // The client decoded everything except frame 4, which it never mentions — and it resolved
+        // that the moment it acknowledged frame 5.
+        for frame in [1u64, 2, 3, 5, 6, 7, 8] {
+            sender.on_feedback(&mut sink, &Feedback::Ack { frame_index: frame }, Duration::ZERO);
+        }
+
+        assert_eq!(sender.stats().frames_acked, 7);
+        assert_eq!(sender.stats().frames_unacked, 1, "frame 4 was never decoded");
+        assert_eq!(
+            sender.client_acked_frame(),
+            Some(8),
+            "the newest frame the encoder may reference"
+        );
+        assert!(
+            (sender.observed_loss() - 1.0 / 8.0).abs() < 1e-9,
+            "the loss is measured, not inferred: {}",
+            sender.observed_loss()
+        );
+        assert_eq!(sender.stats().ratio_lowers + sender.stats().ratio_raises, 1);
+    }
+
+    #[test]
+    fn a_repair_for_a_frame_the_client_has_already_decoded_is_refused() {
+        // A NACK that crosses the acknowledgement of its own frame on the wire. Answering it spends
+        // bandwidth inside the congestion that delayed the request, and — because the client counts
+        // late arrivals — makes the loss figure look worse for having tried to help.
+        let mut sender = sender(ParityPolicy::Off);
+        sender.set_rtt(Duration::from_millis(4));
+        let mut sink = Collector::new();
+        sender.send_frame(&mut sink, meta(3, 100_000), &payload(4), Duration::ZERO);
+        sender.on_feedback(&mut sink, &Feedback::Ack { frame_index: 3 }, Duration::ZERO);
+
+        let mut repairs = Collector::new();
+        let outcome = sender.on_feedback(
+            &mut repairs,
+            &Feedback::Nack {
+                frame_index: 3,
+                fragments: vec![0],
+            },
+            Duration::from_micros(100_500),
+        );
+        assert_eq!(
+            outcome,
+            FeedbackOutcome::RepairRefused {
+                frame_index: 3,
+                reason: RepairRefusal::AlreadyDecoded
+            }
+        );
+        assert!(repairs.is_empty());
+        assert_eq!(sender.stats().repairs_refused_delivered, 1);
+    }
+
+    #[test]
+    fn an_acknowledgement_from_before_a_frame_was_sent_does_not_forgive_it() {
+        // Acks arrive out of order and one may be lost. An ack for frame `n` must not credit a frame
+        // sent *after* it: the list of frames owed an acknowledgement is ordered, and nothing newer
+        // than the acknowledgement is touched.
+        let mut sender = sender(ParityPolicy::Off);
+        let mut sink = Collector::new();
+        sender.send_frame(&mut sink, meta(1, 11_111), &payload(2), Duration::ZERO);
+        sender.send_frame(&mut sink, meta(2, 22_222), &payload(2), Duration::ZERO);
+        sender.on_feedback(&mut sink, &Feedback::Ack { frame_index: 1 }, Duration::ZERO);
+        sender.send_frame(&mut sink, meta(3, 33_333), &payload(2), Duration::ZERO);
+
+        // Frame 2 is still owed an acknowledgement, so it is not yet written off either way.
+        assert_eq!(sender.stats().frames_unacked, 0);
+        assert_eq!(sender.client_acked_frame(), Some(1));
     }
 
     #[test]

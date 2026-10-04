@@ -11,9 +11,51 @@ use std::{
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How far behind the client has to report being, in frame intervals, before the ladder gives up
+/// frame rate rather than waiting.
+///
+/// One frame: a client that is a frame behind is showing frames late, which is the latency rung and
+/// costs nothing but the delay itself. Past that it is not catching up while being fed at this rate.
+const LADDER_FRAMERATE_FROM: f32 = 1.0;
+
+/// The most the frame rate is reduced by: one frame in three. Halving twice is where a stream stops
+/// looking like a stream, and quality — the next rung — is a better thing to spend than smoothness.
+const DEGRADE_MAX_FRAME_DIVISOR: u32 = 3;
+
+/// How much of the configured rate the quality rung may remove. Below a quarter of the rate the
+/// stream is not worth sending, and the honest thing to say is that the ladder is exhausted.
+const QUALITY_FLOOR_FRACTION: f32 = 0.25;
+
 pub struct DynamicEncoderParams {
     pub bitrate_bps: f32,
     pub framerate: f32,
+}
+
+/// What the encoder may reference, and how much of the recent past the client has confirmed.
+///
+/// `valid` is false until the first acknowledgement of a session, and `0`/all-zero are then not
+/// answers to anything. The mask covers the 64 frame indices at or before `newest`, bit `i` meaning
+/// `newest - i` — the encoder's actual question is "was frame X decoded", and a cursor cannot answer
+/// it, because a client that skipped a frame still acknowledges later ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientAck {
+    pub valid: bool,
+    pub newest: u64,
+    pub recent_mask: u64,
+}
+
+impl ClientAck {
+    /// Whether this exact frame index has been confirmed decoded.
+    pub fn contains(&self, frame_index: u64) -> bool {
+        if !self.valid || frame_index == 0 || frame_index > self.newest {
+            return false;
+        }
+        let distance = self.newest - frame_index;
+        if distance >= 64 {
+            return false;
+        }
+        (self.recent_mask >> distance) & 1 != 0
+    }
 }
 
 pub struct BitrateManager {
@@ -39,6 +81,8 @@ pub struct BitrateManager {
     /// The bitrate last handed to the encoder. Used to avoid re-configuring it for a change too
     /// small to matter, and to report what the encoder was actually asked for.
     last_returned_bitrate_bps: Option<f32>,
+    /// What the client has confirmed decoded. See [`ClientAck`].
+    client_ack: ClientAck,
     previous_config: Option<BitrateConfig>,
     update_needed: bool,
 }
@@ -67,6 +111,7 @@ impl BitrateManager {
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
             client_queue_delay_us: None,
             last_returned_bitrate_bps: None,
+            client_ack: ClientAck::default(),
             previous_config: None,
             update_needed: true,
         }
@@ -79,6 +124,37 @@ impl BitrateManager {
     /// Not a frame fact and not a server fact: it is the receiver telling the sender to send less.
     pub fn report_client_queue_delay(&mut self, micros: u32) {
         self.client_queue_delay_us = Some(micros);
+    }
+
+    /// Record that the client decoded a frame. See [`ClientAck`].
+    ///
+    /// The newest index only ever moves forward — acknowledgements arrive in order and the encoder's
+    /// question is about the recent past — but the *mask* is what makes a skipped frame visible, so
+    /// the bits are shifted by however far the cursor moved.
+    pub fn report_client_ack(&mut self, frame_index: u64) {
+        let distance = if self.client_ack.valid {
+            frame_index.saturating_sub(self.client_ack.newest)
+        } else {
+            // First acknowledgement of the session: the history starts here, because nothing before
+            // it was confirmed and nothing before it may be referenced.
+            64
+        };
+        self.client_ack.recent_mask = if distance >= 64 {
+            1
+        } else {
+            (self.client_ack.recent_mask << distance) | 1
+        };
+        self.client_ack.newest = self.client_ack.newest.max(frame_index);
+        self.client_ack.valid = true;
+    }
+
+    /// What the encoder may reference. See [`ClientAck`].
+    pub fn client_ack(&self) -> (bool, u64, u64) {
+        (
+            self.client_ack.valid,
+            self.client_ack.newest,
+            self.client_ack.recent_mask,
+        )
     }
 
     /// The bitrate the encoder was last asked for, and the cap the client's queueing imposed.
@@ -216,6 +292,18 @@ impl BitrateManager {
 
         let mut bitrate_directives = BitrateDirectives::default();
 
+        // What the settings asked for, before any limiter: the reference point the quality rung's
+        // floor is a fraction of, so a client that is starving cannot be talked down to nothing.
+        let nominal_bitrate_bps = match &config.mode {
+            BitrateMode::ConstantMbps(bitrate_mbps) => *bitrate_mbps as f32 * 1e6,
+            BitrateMode::Adaptive {
+                max_throughput_mbps, ..
+            } => match max_throughput_mbps {
+                Switch::Enabled(mbps) => *mbps as f32 * 1e6,
+                Switch::Disabled => 0.0,
+            },
+        };
+
         let mut bitrate_bps = match &config.mode {
             BitrateMode::ConstantMbps(bitrate_mbps) => *bitrate_mbps as f32 * 1e6,
             BitrateMode::Adaptive {
@@ -296,16 +384,36 @@ impl BitrateManager {
         // a shard lost are the same fact from there — which is why nothing else the client can see
         // was usable.
         //
-        // The target is a third of a frame interval, because that is the client's rebuild window: a
-        // client that reads a frame faster than it is given to rebuild one is keeping up. (One frame
-        // interval was the first guess and too loose to ever fire.) Past the target the rate scales by
-        // how far past — proportional, like Steam Link's bandwidth choice against the fraction of the
-        // stream queued above ~60 ms.
+        // ## What is given up, and in what order
+        //
+        // **Latency first, then frame rate, then quality — and integrity never.**
+        //
+        // 1. *Latency.* A client that is a little behind is not in trouble: it is showing the frames
+        //    it has, a few milliseconds late, and that is what the hold is for. So the first thing
+        //    this does about a queueing report is **nothing**, up to a whole frame interval of it.
+        //    (A third of a frame was the first target, and it fired on links that were working.)
+        // 2. *Frame rate.* Past that, the client is not going to catch up while being fed at this
+        //    rate, so send fewer frames. That costs smoothness, and a stream at half the frame rate
+        //    looks fine — which is the whole reason it comes before quality.
+        // 3. *Quality.* Only when the frame rate has been halved twice does the bitrate come down.
+        //
+        // Integrity is not on the list, and it has a floor of its own in
+        // `x_transport::AdaptiveConfig::min`: the parity ratio is never relaxed to zero, whatever the
+        // ladder is doing. A hole is the one outcome that is not allowed to be a trade.
+        let frame_divisor = self.ladder_frame_divisor();
         if let Some(queue_us) = self.client_queue_delay_us {
-            let target_us = self.nominal_frame_interval.as_micros() as f32 / 3.0;
-            if queue_us > 0 && queue_us as f32 > target_us {
+            let latency_budget_us = self.nominal_frame_interval.as_micros() as f32;
+            // Quality is the third rung: it is the bitrate that comes down, and only once the frame
+            // rate has already been reduced to its floor.
+            if frame_divisor >= DEGRADE_MAX_FRAME_DIVISOR && queue_us as f32 > latency_budget_us {
+                let target_us = latency_budget_us / 3.0;
                 let max_bps = bitrate_bps * target_us / queue_us as f32;
-                bitrate_bps = f32::min(bitrate_bps, max_bps);
+                // A quality floor as well: below this the picture is not worth sending at all, and
+                // the honest lever left is the frame rate, which is already at its limit — so the
+                // rate stops here and the log says the ladder is exhausted.
+                let floor_bps = nominal_bitrate_bps * QUALITY_FLOOR_FRACTION;
+                let capped = f32::max(f32::min(bitrate_bps, max_bps), floor_bps.min(bitrate_bps));
+                bitrate_bps = capped;
                 bitrate_directives.client_queue_limiter_bps = Some(max_bps);
             }
         }
@@ -329,9 +437,36 @@ impl BitrateManager {
         Some((
             DynamicEncoderParams {
                 bitrate_bps,
-                framerate: 1.0 / f32::min(frame_interval.as_secs_f32(), 1.0),
+                // The encoder is told the *effective* frame rate: at half the frames, each frame has
+                // twice the bit budget, and a rate controller still modelling the nominal rate would
+                // spend the stream on frames that are not being sent.
+                framerate: 1.0 / f32::min(frame_interval.as_secs_f32(), 1.0) / frame_divisor as f32,
             },
             bitrate_directives,
         ))
+    }
+
+    /// The second rung of the degradation ladder: how many frames to skip for every one sent.
+    ///
+    /// A function of how far behind the client says it is, in units of the frame interval — the only
+    /// unit that means anything to a client whose job is to show one frame per interval. The caller
+    /// applies it to the media sender, which is where a frame can actually be dropped: the encoder is
+    /// in another process, and skipping *there* would encode bits never sent.
+    pub fn ladder_frame_divisor(&self) -> u32 {
+        let Some(queue_us) = self.client_queue_delay_us else {
+            return 1;
+        };
+        let interval_us = self.nominal_frame_interval.as_micros() as f32;
+        if interval_us <= 0.0 {
+            return 1;
+        }
+        let behind = queue_us as f32 / interval_us;
+        if behind < LADDER_FRAMERATE_FROM {
+            1
+        } else if behind < LADDER_FRAMERATE_FROM * 2.0 {
+            2
+        } else {
+            DEGRADE_MAX_FRAME_DIVISOR
+        }
     }
 }

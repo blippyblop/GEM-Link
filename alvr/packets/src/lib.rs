@@ -284,6 +284,14 @@ pub struct VideoPacketHeader {
     /// Centers used to encode this frame, already aligned. Normally absent when FFR is disabled.
     pub foveation_center_shifts: Option<[[f32; 2]; 2]>,
     pub is_idr: bool,
+    /// The frame index this frame's picture was encoded against, or `0` when the sender did not say.
+    ///
+    /// The encoder may only reference frames the client has **acknowledged decoding**, so this field
+    /// is a promise the server can keep: if the client still has `reference_frame`, this frame decodes
+    /// even when the frames between the two are missing. Without it the client must assume the worst
+    /// about every hole and hold — which on hardware cost ~140 frames of frozen picture per lost
+    /// frame. See `Feedback::Ack` and the reference decision in `VideoEncoderNVENC::Transmit`.
+    pub reference_frame: u64,
 }
 
 #[derive(Serialize, Deserialize)]

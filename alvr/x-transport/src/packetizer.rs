@@ -48,6 +48,14 @@ pub struct FrameMeta {
     /// choose a key per datagram would be choosing it from a field an attacker controls. Epoch `0` is
     /// the session's first key, and is the only value a caller that never rotates needs.
     pub key_epoch: u16,
+    /// The frame index this frame was encoded against, or `0` for "the sender did not say".
+    ///
+    /// Set by the sender from the encoder's own answer — it is the index the encoder was told it may
+    /// reference, which is always a frame the client has **confirmed** it decoded. The receiver uses
+    /// it to decide whether a frame is decodable even though earlier frames are missing, which is the
+    /// difference between one hole and a hold that lasts until the next keyframe. See
+    /// [`crate::wire::FragmentHeader::reference_frame`].
+    pub reference_frame: u64,
 }
 
 /// How many repair shards to add.
@@ -310,6 +318,7 @@ impl Packetizer {
                 send_seq: *send_seq,
                 flags,
                 key_epoch: meta.key_epoch,
+                reference_frame: meta.reference_frame,
             };
             *send_seq = send_seq.wrapping_add(1);
 
@@ -382,6 +391,7 @@ mod tests {
             target_timestamp_us: 11_111,
             is_keyframe: false,
             key_epoch: 0,
+            reference_frame: 0,
         }
     }
 

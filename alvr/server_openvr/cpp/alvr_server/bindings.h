@@ -86,6 +86,25 @@ struct FfiDynamicEncoderParams {
     unsigned int updated;
     unsigned long long bitrate_bps;
     float framerate;
+    /// The newest frame index the client has confirmed it **decoded**, whether that means anything
+    /// yet, and which of the frames at or behind it were confirmed.
+    ///
+    /// Read on every frame, not only when `updated` is set: it is not a parameter of the encoder, it
+    /// is a fact about the link, and it changes on the client's schedule rather than the controller's.
+    /// `client_ack_valid == 0` means the client has confirmed nothing — the encoder must then behave
+    /// as if every frame it has sent may have been lost.
+    ///
+    /// `client_acked_recent_mask` answers the exact question the encoder asks — *was frame X
+    /// decoded?* — for X within 64 frames of the newest acknowledgement, with bit `i` meaning the
+    /// frame `client_acked_frame - i`. A cursor alone cannot answer it: a client that skipped a frame
+    /// still acknowledges later ones, so "the newest acknowledged frame is past X" does not mean X
+    /// was decoded.
+    ///
+    /// See `Feedback::Ack` in `x-transport`: a frame encoded against a confirmed frame cannot be
+    /// poisoned by a lost frame, because nothing in its reference chain depends on one.
+    unsigned long long client_acked_frame;
+    unsigned int client_ack_valid;
+    unsigned long long client_acked_recent_mask;
 };
 
 struct FfiFoveatedEncodingParams {
@@ -213,7 +232,8 @@ VideoSend(
     unsigned long long targetTimestampNs,
     unsigned char* buf,
     int len,
-    bool isIdr
+    bool isIdr,
+    unsigned long long chainRoot
 );
 
 // NalParsing.cpp: the sequence number of the frame currently being emitted.
@@ -223,6 +243,18 @@ VideoSend(
 // VideoEncoder::Transmit and its four overrides: the encoder thread is the only
 // writer and the only reader, and this is diagnostic plumbing, not state.
 void SetFrameSequence(unsigned long long frameSequence);
+unsigned long long GetFrameSequence();
+
+// NalParsing.cpp: the frame the picture being emitted was encoded against, or 0 for
+// "the sender does not know".
+//
+// Set by the encoder (VideoEncoderNVENC::Transmit) immediately before it emits NALs, and read
+// by ParseFrameNals. It travels to the client so the client can answer one question: *is the
+// picture this frame depends on one I have already decoded?* — which is what stops a lost frame
+// from poisoning everything behind it. 0 is the fail-closed encoding: a client that sees it
+// treats the frame as unproven, which is the behaviour that existed before the field did.
+void SetFrameChainRoot(unsigned long long chainRoot);
+unsigned long long GetFrameChainRoot();
 extern "C" void
 HapticsSend(unsigned long long path, float duration_s, float frequency, float amplitude);
 extern "C" void ShutdownRuntime();

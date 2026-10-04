@@ -40,6 +40,16 @@ pub struct AdaptiveConfig {
     /// down over the first second of a clean session rather than found upward from a lossy one.
     pub initial: f32,
     /// Never go below this.
+    ///
+    /// **Not zero.** The degradation order is latency, then frame rate, then quality — and integrity
+    /// is not on the list at all. A ratio of zero means every lost datagram is a frame the client
+    /// cannot decode, so the one thing that must never be traded away is traded away silently by the
+    /// controller relaxing. It was `0.0`, and on hardware that showed up as `abandoned` going from
+    /// ~520 frames to 2010 the first time the ratio was allowed to follow the loss down to nothing.
+    ///
+    /// Five percent buys one lost datagram in every twenty shards, which is one recovered frame per
+    /// incident on a link that is otherwise clean — and it costs five percent of the bitrate, which
+    /// is what the *quality* lever is for.
     pub min: f32,
     /// Never go above this. A ratio is overhead on every byte; past this it is cheaper to lower
     /// the source rate than to keep buying repair shards.
@@ -68,7 +78,7 @@ impl Default for AdaptiveConfig {
             // Start protected. A link's loss is unknown at the first frame, and the cost of being
             // wrong upward is bandwidth while the cost of being wrong downward is lost frames.
             initial: 0.25,
-            min: 0.0,
+            min: 0.05,
             // 50 % overhead is the ceiling: beyond it the code rate is below 1.5:1 and the honest
             // move is to send fewer pixels, not more shards.
             max: 0.5,
@@ -254,6 +264,7 @@ mod tests {
         // And from a low ratio the proportional step is what decides.
         let mut c = AdaptiveParity::new(AdaptiveConfig {
             initial: 0.02,
+            min: 0.02,
             ..AdaptiveConfig::default()
         });
         assert_eq!(
@@ -402,8 +413,12 @@ mod tests {
 
     #[test]
     fn a_zero_ratio_is_off_and_off_costs_nothing() {
+        // Zero is still reachable — a caller may ask for it — but it is no longer where the
+        // controller *relaxes to*: see the floor in `AdaptiveConfig::min`. This test pins the
+        // packetiser's behaviour at zero, which the floor must not change.
         let mut c = AdaptiveParity::new(AdaptiveConfig {
             initial: 0.0,
+            min: 0.0,
             ..Default::default()
         });
         for _ in 0..100 {
@@ -411,5 +426,24 @@ mod tests {
         }
         assert_eq!(c.policy(), ParityPolicy::Off);
         assert_eq!(c.policy().parity_for(1000), 0);
+    }
+
+    #[test]
+    fn the_default_floor_never_lets_integrity_be_traded_away() {
+        // The degradation order is latency, then frame rate, then quality — integrity is not on the
+        // list. A controller that relaxes to zero turns every lost datagram into a lost frame, which
+        // is the one thing the FEC exists to prevent, and it did exactly that on hardware.
+        let mut c = controller();
+        for _ in 0..1000 {
+            c.observe(0.0);
+        }
+        let floor = c.fraction();
+        assert!(floor > 0.0, "the default floor is zero: {floor}");
+        assert_eq!(floor, AdaptiveConfig::default().min);
+        assert_eq!(
+            c.policy().parity_for(20),
+            1,
+            "the floor must actually protect a frame: one lost datagram in twenty"
+        );
     }
 }

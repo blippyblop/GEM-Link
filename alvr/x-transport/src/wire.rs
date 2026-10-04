@@ -3,7 +3,7 @@
 //! Fixed width on purpose. This header is on the hot path of every datagram — 300 Mbps at
 //! 1400-byte datagrams is ~27,000 parse/encode pairs per second — and a varint parser is a
 //! branch per field for a saving of about ten bytes on a payload of fourteen hundred. The
-//! whole header is 36 bytes, or 2.6 %, and its layout is one `copy_from_slice`.
+//! whole header is 44 bytes, or 3.1 %, and its layout is one `copy_from_slice`.
 //!
 //! ```text
 //!  0..8    frame_index          monotonic, allocated by the sender (ADR-0011's signal)
@@ -16,13 +16,31 @@
 //! 28..32   send_seq             per-datagram counter, for the receiver's own loss accounting
 //! 32..34   flags
 //! 34..36   key_epoch            which media key sealed this datagram (see `crypto::KeySchedule`)
+//! 36..44   reference_frame      the frame this frame's picture is encoded against, or 0
 //! ```
 //!
-//! The last field was `reserved` and must be zero until this version. It is now the **key epoch**:
-//! it was the only spare authenticated field in the header, it is exactly the right width, and a
-//! receiver that does not know about epochs rejects a non-zero value — which is the correct
+//! ## Why `reference_frame` is on the wire at all
+//!
+//! A frame index tells the receiver a frame is *missing*; it says nothing about whether the
+//! frames that follow it depend on it. The trust gate answered that by assuming the worst — every
+//! hole poisoned the chain until a keyframe — and on hardware that meant ~140 held frames (a black
+//! screen) per hole, because a keyframe is the only thing a P-frame chain rebuilds from.
+//!
+//! The sender knows the truth exactly: the encoder was told which frame index it may reference, and
+//! it may only reference indices the client has **confirmed decoded** (see `Feedback::Ack`). So the
+//! chain root travels with the frame, and the receiver can ask the only question that matters —
+//! *do I still have the picture this frame was encoded against?* — and answer it from its own
+//! decode history. A hole stops poisoning the stream, because nothing depends on it.
+//!
+//! `0` means "the sender did not say". It is the fail-closed encoding: a receiver that sees it
+//! treats the frame as unproven, which is exactly the old behaviour.
+//!
+//! The last-but-one field was `reserved` and must be zero until this version. It is now the **key
+//! epoch**: it was the only spare authenticated field in the header, it is exactly the right width,
+//! and a receiver that does not know about epochs rejects a non-zero value — which is the correct
 //! fail-closed behaviour for a protocol change and the reason there was nothing to gain by leaving
-//! it unused.
+//! it unused. The header grew by eight bytes for `reference_frame` rather than reuse a spare bit,
+//! because "confirmed" without the index is a claim the receiver cannot check.
 //!
 //! The header is also the AEAD's associated data ([`crate::crypto`]), so every field above
 //! is authenticated even though it is not encrypted — a replayed or edited frame index
@@ -31,7 +49,7 @@
 use std::fmt;
 
 /// The fixed header length, in bytes.
-pub const HEADER_LEN: usize = 36;
+pub const HEADER_LEN: usize = 44;
 
 /// Datagram flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,6 +128,15 @@ pub struct FragmentHeader {
     /// Which derived media key sealed this datagram. Authenticated with the rest of the header, so
     /// a datagram cannot be relabelled into another epoch — it would fail the tag.
     pub key_epoch: u16,
+    /// The frame index this frame's picture was encoded against, or `0` when the sender did not
+    /// say. Authenticated, like every other field, so a receiver cannot be *told* that a frame is
+    /// safe by anything other than the sender.
+    ///
+    /// Equal to the frame's own index for a keyframe (it is its own reference), to a *confirmed*
+    /// frame's index for an inter frame encoded against a long-term reference, and to the previous
+    /// frame's index in the ordinary case. A receiver trusts an inter frame whose reference it has
+    /// decoded, which is how a lost frame stops poisoning the frames behind it.
+    pub reference_frame: u64,
 }
 
 /// Why a datagram could not be accepted.
@@ -156,6 +183,7 @@ impl FragmentHeader {
         out[28..32].copy_from_slice(&self.send_seq.to_le_bytes());
         out[32..34].copy_from_slice(&self.flags.0.to_le_bytes());
         out[34..36].copy_from_slice(&self.key_epoch.to_le_bytes());
+        out[36..44].copy_from_slice(&self.reference_frame.to_le_bytes());
         out
     }
 
@@ -214,6 +242,7 @@ impl FragmentHeader {
             send_seq: u32_at(28),
             flags: Flags(u16_at(32)),
             key_epoch: u16_at(34),
+            reference_frame: u64_at(36),
         };
 
         if !header.flags.is_valid() {
@@ -275,6 +304,7 @@ mod tests {
             send_seq: 9_999,
             flags: Flags::NONE,
             key_epoch: 0,
+            reference_frame: 0x0102_0304_0506_0707,
         }
     }
 

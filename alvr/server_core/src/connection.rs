@@ -1157,6 +1157,21 @@ fn connection_pipeline(
                                         .lock()
                                         .report_client_queue_delay(micros);
                                 }
+                                FeedbackOutcome::Acknowledged { frame_index, frames_unusable, .. } => {
+                                    // **The one thing the encoder cannot work out for itself.** A
+                                    // frame the client decoded may be referenced by the frames that
+                                    // follow; a frame it did not, may not — and that is what keeps a
+                                    // lost frame from poisoning everything behind it, and what lets
+                                    // the client present across a hole instead of holding until a
+                                    // keyframe. See `Feedback::Ack`.
+                                    if frames_unusable > 0 {
+                                        debug!(
+                                            "client acknowledged frame {frame_index} and could not \
+                                             use {frames_unusable} before it"
+                                        );
+                                    }
+                                    ctx.bitrate_manager.lock().report_client_ack(frame_index);
+                                }
                                 _ => {}
                             }
                         }
@@ -1206,7 +1221,15 @@ fn connection_pipeline(
                     target_timestamp_us: target.as_micros() as u64,
                     is_keyframe: header.is_idr,
                     key_epoch: 0,
+                    reference_frame: header.reference_frame,
                 };
+
+                // The second rung of the degradation ladder, read per frame because it is a fact about
+                // the client rather than about the encoder: skip frames rather than spend them. Safe
+                // only because the encoder references only acknowledged frames — a frame that is not
+                // sent is a frame the client never confirms, and the chain routes around it.
+                let divisor = ctx.bitrate_manager.lock().ladder_frame_divisor();
+                video_sender.set_frame_divisor(divisor);
 
                 // Timed because the socket write is the *only* place the server can block: the
                 // kernel send buffer fills when the receiver stops draining, and that is the

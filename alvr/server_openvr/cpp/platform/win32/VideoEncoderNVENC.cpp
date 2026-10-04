@@ -66,7 +66,36 @@ void VideoEncoderNVENC::Initialize() {
                 "This GPU does not support H.265 encoding. (NvEncoderCuda NV_ENC_ERR_INVALID_PARAM)"
             );
         }
-        throw MakeException("NvEnc CreateEncoder failed. Code=%d %hs", e.getErrorCode(), e.what());
+        // Long-term references are a request, not a promise: a GPU or a preset may refuse the
+        // configuration. Retry once without them rather than losing the session — the encoder then
+        // behaves exactly as it did before any of this, which is a working stream with a broken
+        // reference chain per lost frame rather than no stream at all.
+        if (!m_ltrSupported) {
+            throw MakeException("NvEnc CreateEncoder failed. Code=%d %hs", e.getErrorCode(), e.what());
+        }
+        Warn(
+            "NVENC refused long-term references (%hs); retrying without them. A lost frame will then "
+            "break the reference chain until a keyframe, rather than being routed around.",
+            e.what()
+        );
+        m_ltrAllowed = false;
+        NV_ENC_INITIALIZE_PARAMS retryParams = { NV_ENC_INITIALIZE_PARAMS_VER };
+        NV_ENC_CONFIG retryConfig = { NV_ENC_CONFIG_VER };
+        retryParams.encodeConfig = &retryConfig;
+        FillEncodeConfig(
+            retryParams,
+            m_refreshRate,
+            m_renderWidth,
+            m_renderHeight,
+            m_bitrateInMBits * 1'000'000L
+        );
+        try {
+            m_NvNecoder->CreateEncoder(&retryParams);
+        } catch (NVENCException e2) {
+            throw MakeException(
+                "NvEnc CreateEncoder failed. Code=%d %hs", e2.getErrorCode(), e2.what()
+            );
+        }
     }
 
     Debug("CNvEncoder is successfully initialized.\n");
@@ -113,8 +142,97 @@ void VideoEncoderNVENC::Transmit(
         NV_ENC_RECONFIGURE_PARAMS reconfigureParams = { NV_ENC_RECONFIGURE_PARAMS_VER };
         reconfigureParams.reInitEncodeParams = initializeParams;
         m_NvNecoder->Reconfigure(&reconfigureParams);
+
+        // A reconfigure can reset the encoder's picture buffer, and a long-term reference that is no
+        // longer there is worse than none: the frame that names it cannot be decoded. Forgetting
+        // which frames are marked means the next unconfirmed frame rebuilds the chain instead of
+        // referencing something that may not exist. It costs a keyframe per parameter change and
+        // nothing else.
+        for (int slot = 0; slot < LTR_SLOTS; slot++) {
+            m_ltrFrameIndex[slot] = 0;
+        }
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Loss stops poisoning the stream. (The reference decision, per frame.)
+    //
+    // A P-frame references its predecessor. If that predecessor never reached the client, every
+    // frame behind it decodes to a plausible-looking, entirely wrong picture — which is why the
+    // client's trust gate held, and asked for a keyframe, and why a single lost frame cost ~140
+    // frames of black on hardware.
+    //
+    // The client now tells us which frames it **decoded** (`Feedback::Ack`), so the encoder can
+    // reference only those: mark each frame as a long-term reference, and when the previous frame is
+    // unconfirmed, encode against the newest confirmed one instead. Nothing then depends on a frame
+    // the client does not have. The cost is that references are older — a compression cost, not a
+    // correctness one — and that is the whole trade.
+    //
+    // Three decisions, in order of preference:
+    //   1. The previous frame is confirmed: ordinary P-frame, reference it. This is the common case.
+    //   2. The previous frame is not confirmed, but a confirmed frame is still an LTR: encode
+    //      against that LTR alone. No keyframe, no burst, and the client can decode it.
+    //   3. Nothing confirmed is available: a keyframe is the only thing that can rebuild the chain.
+    //      When intra refresh is enabled a *sweep* is preferred to an IDR — it spreads the same cost
+    //      over several frames instead of emitting one frame several times the size, which is
+    //      exactly the burst that fills the queue we are trying to drain.
+    //
+    // `client_ack_valid == 0` (no acknowledgement yet, or a client that does not acknowledge) means
+    // no frame is confirmed, so the decision falls through to the keyframe path — the behaviour that
+    // existed before this, unchanged.
+    // -----------------------------------------------------------------------------------------
+    const unsigned long long frameIndex = GetFrameSequence();
+    const bool ackValid = params.client_ack_valid != 0;
+    const unsigned long long ackedFrame = params.client_acked_frame;
+
+    // Was this exact frame decoded by the client? A cursor is not enough to answer it: a client that
+    // skipped a frame still acknowledges later ones. The mask covers the 64 frames behind the newest
+    // acknowledgement, which is many round trips of slack.
+    auto wasAcked = [&](unsigned long long index) -> bool {
+        if (!ackValid || index == 0 || index > ackedFrame) {
+            return false;
+        }
+        const unsigned long long delta = ackedFrame - index;
+        if (delta >= 64) {
+            return false;
+        }
+        return ((params.client_acked_recent_mask >> delta) & 1ULL) != 0;
+    };
+
+    // The newest long-term reference slot whose frame the client has confirmed, if any.
+    int confirmSlot = -1;
+    if (m_ltrSupported) {
+        for (int slot = 0; slot < LTR_SLOTS; slot++) {
+            if (wasAcked(m_ltrFrameIndex[slot])
+                && (confirmSlot < 0 || m_ltrFrameIndex[slot] > m_ltrFrameIndex[confirmSlot])) {
+                confirmSlot = slot;
+            }
+        }
+    }
+
+    // Reference this frame against the previous frame (the common case, best compression), or
+    // against a confirmed older frame (a small compression cost, and nothing depends on a frame the
+    // client does not have), or not at all — in which case the chain is rebuilt.
+    const bool usePrevious = !insertIDR && wasAcked(m_lastEncodedFrameIndex);
+    const bool useConfirmedLtr = !insertIDR && !usePrevious && confirmSlot >= 0;
+    unsigned long long chainRoot = 0;
+    if (insertIDR) {
+        chainRoot = 0; // a keyframe is its own root; the client needs no reference for it
+    } else if (usePrevious) {
+        chainRoot = m_lastEncodedFrameIndex;
+    } else if (useConfirmedLtr) {
+        chainRoot = m_ltrFrameIndex[confirmSlot];
+    } else {
+        // Nothing confirmed: the chain is rebuilt. `chainRoot` stays 0 — "the sender does not say" —
+        // so the client treats the frame as unproven rather than trusting it on the strength of a
+        // keyframe flag that a lost datagram can invalidate anyway.
+        insertIDR = true;
+    }
+
+    SetFrameChainRoot(chainRoot);
+
+    // -----------------------------------------------------------------------------------------
+    // The datagram copy. Unchanged, and still probed: see the grey-frame note below.
+    // -----------------------------------------------------------------------------------------
     std::vector<std::vector<uint8_t>> vPacket;
 
     const NvEncInputFrame* encoderInputFrame = m_NvNecoder->GetNextInputFrame();
@@ -167,10 +285,88 @@ void VideoEncoderNVENC::Transmit(
 
     NV_ENC_PIC_PARAMS picParams = {};
     if (insertIDR) {
-        Debug("Inserting IDR frame.\n");
-        picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+        // A sweep rebuilds the chain *progressively*, which needs a picture buffer to refresh from.
+        // The first frame of a session has none — the decoder has not even seen the parameter sets —
+        // so it is always a real IDR, whatever the settings say.
+        if (m_intraRefreshSweepFrames > 0 && m_lastEncodedFrameIndex != 0) {
+            // Rebuild the chain with a sweep rather than an IDR where the encoder supports it: the
+            // same recovery, spread over several frames instead of one frame several times the size.
+            // A keyframe-sized burst on a link that is already behind is the congestion that lost the
+            // frame in the first place.
+            m_intraRefreshFramesLeft = m_intraRefreshSweepFrames;
+            m_sweepsStarted++;
+        } else {
+            Debug("Inserting IDR frame.\n");
+            picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+        }
     }
+    if (m_intraRefreshFramesLeft > 0) {
+        m_intraRefreshFramesLeft--;
+        switch (m_codec) {
+        case ALVR_CODEC_H264:
+            picParams.codecPicParams.h264PicParams.forceIntraRefreshWithFrameCnt
+                = (uint32_t)m_intraRefreshSweepFrames;
+            break;
+        case ALVR_CODEC_HEVC:
+            picParams.codecPicParams.hevcPicParams.forceIntraRefreshWithFrameCnt
+                = (uint32_t)m_intraRefreshSweepFrames;
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Mark this frame as a long-term reference and, when the chain is being carried by one, use it.
+    // The LTR is the mechanism that makes "reference only confirmed frames" possible at all: the
+    // encoder is not required to run the chain through the frames in between.
+    if (m_ltrSupported && (m_codec == ALVR_CODEC_H264 || m_codec == ALVR_CODEC_HEVC)) {
+        const uint32_t slot = (uint32_t)(frameIndex % (unsigned long long)LTR_SLOTS);
+        if (m_codec == ALVR_CODEC_H264) {
+            picParams.codecPicParams.h264PicParams.ltrMarkFrame = 1;
+            picParams.codecPicParams.h264PicParams.ltrMarkFrameIdx = slot;
+            if (useConfirmedLtr) {
+                picParams.codecPicParams.h264PicParams.ltrUseFrames = 1;
+                picParams.codecPicParams.h264PicParams.ltrUseFrameBitmap
+                    = 1u << (uint32_t)confirmSlot;
+            }
+        } else {
+            picParams.codecPicParams.hevcPicParams.ltrMarkFrame = 1;
+            picParams.codecPicParams.hevcPicParams.ltrMarkFrameIdx = slot;
+            if (useConfirmedLtr) {
+                picParams.codecPicParams.hevcPicParams.ltrUseFrames = 1;
+                picParams.codecPicParams.hevcPicParams.ltrUseFrameBitmap
+                    = 1u << (uint32_t)confirmSlot;
+            }
+        }
+        // The slot now holds this frame. It is not confirmed yet — the client has not seen it — and
+        // it will only ever be referenced if an acknowledgement for this index arrives.
+        m_ltrFrameIndex[slot] = frameIndex;
+    }
+
+    if (!m_loggedFirstRecovery && !usePrevious) {
+        m_loggedFirstRecovery = true;
+        Info(
+            "NVENC reference: frame %llu encoded against %s (client confirmed %llu of %llu, "
+            "valid=%d, ltr=%d)",
+            frameIndex,
+            insertIDR ? "a keyframe" : "an older confirmed frame",
+            ackedFrame,
+            frameIndex,
+            (int)ackValid,
+            (int)m_ltrSupported
+        );
+    }
+
     m_NvNecoder->EncodeFrame(vPacket, &picParams);
+
+    m_lastEncodedFrameIndex = frameIndex;
+    if (usePrevious) {
+        m_framesReferencingPrevious++;
+    } else if (!insertIDR) {
+        m_framesReferencingConfirmed++;
+    } else {
+        m_framesForcedKey++;
+    }
 
     for (std::vector<uint8_t>& packet : vPacket) {
         uint8_t* buf = packet.data();
@@ -412,6 +608,60 @@ void VideoEncoderNVENC::FillEncodeConfig(
 
     if (Settings_Instance()->m_nvencPFrameStrategy != -1) {
         encodeConfig.frameIntervalP = Settings_Instance()->m_nvencPFrameStrategy;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Long-term references: how "reference only frames the client confirmed" is implemented.
+    //
+    // NVENC's P-frame references its predecessor. To reference an *older* frame instead, the frame
+    // has to have been marked as a long-term reference, and the current picture has to be told to
+    // use it (`ltrUseFrames` + a bitmap). LTR Per Picture mode is the documented-preferred mode and
+    // is what this uses: `ltrTrustMode = 0`, and each picture marked with `ltrMarkFrame = 1` as it
+    // is encoded. See the reference decision in Transmit for how the choice is made.
+    //
+    // Requires no B-frames (`frameIntervalP == 1`), which this pipeline already assumes, and is
+    // unavailable for AV1 — for AV1 `m_ltrSupported` stays false and the encoder falls back to
+    // keyframes, which is the previous behaviour.
+    // -----------------------------------------------------------------------------------------
+    m_ltrSupported = m_ltrAllowed && encodeConfig.frameIntervalP == 1
+        && (m_codec == ALVR_CODEC_H264 || m_codec == ALVR_CODEC_HEVC);
+    if (m_ltrSupported) {
+        if (m_codec == ALVR_CODEC_H264) {
+            encodeConfig.encodeCodecConfig.h264Config.enableLTR = 1;
+            encodeConfig.encodeCodecConfig.h264Config.ltrNumFrames = LTR_SLOTS;
+            encodeConfig.encodeCodecConfig.h264Config.ltrTrustMode = 0;
+        } else {
+            encodeConfig.encodeCodecConfig.hevcConfig.enableLTR = 1;
+            encodeConfig.encodeCodecConfig.hevcConfig.ltrNumFrames = LTR_SLOTS;
+            encodeConfig.encodeCodecConfig.hevcConfig.ltrTrustMode = 0;
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Rolling intra refresh: how the chain is rebuilt when it does have to be rebuilt.
+    //
+    // A keyframe is one frame several times the size of every other frame. On a link that is already
+    // behind, that burst is the congestion that lost the frame in the first place — so recovery
+    // spreads the same cost over a sweep of frames instead. The sweep length is the setting's own
+    // intra-refresh length, which is what it is documented as meaning.
+    // -----------------------------------------------------------------------------------------
+    m_intraRefreshSweepFrames = 0;
+    if (Settings_Instance()->m_nvencEnableIntraRefresh) {
+        const long long count = Settings_Instance()->m_nvencIntraRefreshCount;
+        const long long period = Settings_Instance()->m_nvencIntraRefreshPeriod;
+        long long sweep = 8;
+        if (count > 0) {
+            sweep = count;
+        } else if (period > 0) {
+            sweep = period / 8;
+        }
+        if (sweep < 1) {
+            sweep = 1;
+        }
+        if (sweep > 64) {
+            sweep = 64;
+        }
+        m_intraRefreshSweepFrames = (int)sweep;
     }
 
     switch (Settings_Instance()->m_rateControlMode) {
