@@ -220,9 +220,11 @@ impl MediaPlaneReceiver {
     ) -> (Vec<MediaPlaneAction>, bool) {
         let open = self.plane.pump(&mut self.source, now, budget);
 
-        let actions = self
-            .plane
-            .release(now)
+        // The prompt pass's events (repair requests) come first, then the release pass's.
+        let mut events = self.plane.take_pending();
+        events.extend(self.plane.release(now));
+
+        let actions = events
             .into_iter()
             .filter_map(|event| match event {
                 PlaneEvent::Present {
@@ -374,6 +376,12 @@ impl PlaneStats {
 /// on its way.
 const NACK_ROUND_TRIP: Duration = Duration::from_millis(6);
 
+/// How often the prompt repair sweep runs while `pump` is reading.
+///
+/// Cheap because of the gates in [`VideoPlane::ask_for_repairs`] — the sweep itself is a scan, and
+/// what a frame costs is bounded by `nack_retry_interval`, not by this.
+const REPAIR_SWEEP_INTERVAL: Duration = Duration::from_millis(1);
+
 /// The client's video receive path.
 pub struct VideoPlane {
     receiver: Receiver,
@@ -382,8 +390,11 @@ pub struct VideoPlane {
     started: Instant,
     stats: PlaneStats,
     /// When each still-incomplete frame was last asked for, so the ask is made **once per round
-    /// trip** rather than once per release pass. See the note in [`VideoPlane::release`].
+    /// trip** rather than once per pass. See [`VideoPlane::ask_for_repairs`].
     nacked_at: std::collections::HashMap<u64, Duration>,
+    /// Repair requests produced by the prompt pass, which runs while `pump` is reading rather than
+    /// when the release pass next happens to come round. Drained by [`MediaPlaneReceiver::poll`].
+    pending: Vec<PlaneEvent>,
 }
 
 impl VideoPlane {
@@ -399,7 +410,73 @@ impl VideoPlane {
             started: now,
             stats: PlaneStats::default(),
             nacked_at: std::collections::HashMap::new(),
+            pending: Vec::new(),
         }
+    }
+
+    /// Ask for the fragments of anything still incomplete — **once per round trip per frame, and
+    /// as soon as a hole is real**.
+    ///
+    /// Three rules, and each one is here because its absence was measured:
+    ///
+    /// 1. Only frames past their **straggler window** ([`Receiver::repairable_frames`]). A frame
+    ///    that arrived a moment ago is incomplete because its own datagrams are still in flight,
+    ///    and naming those shards is useless — it was most of the traffic when the sweep asked for
+    ///    every incomplete frame.
+    /// 2. At most once per [`x_transport::nack_retry_interval`] **per frame**, tracked per frame.
+    ///    Re-asking on every pass sends the same request for the same fragments, and the sender
+    ///    dutifully answers each one: the repair traffic becomes load on a link that is already
+    ///    losing, and the loss it reacts to is the loss it causes. (The sender refuses to answer the
+    ///    same request twice inside the same window too — see `MediaSender::repair`.)
+    /// 3. Promptly — from `pump`, while the reading is happening. Waiting for the release pass
+    ///    means waiting for the read budget to expire, which is longer than the repair window the
+    ///    request was supposed to be saved inside.
+    fn ask_for_repairs(&mut self, clock: Duration) -> Vec<PlaneEvent> {
+        let retry_floor = x_transport::nack_retry_interval(NACK_ROUND_TRIP);
+        let due = self.receiver.repairable_frames(clock);
+
+        // Frames that have left the receiver's hands will never be asked for again.
+        let in_flight = self.receiver.incomplete_frames();
+        self.nacked_at
+            .retain(|index, _| in_flight.contains(index));
+
+        let mut events = Vec::new();
+        for frame_index in due {
+            let retry_due = self
+                .nacked_at
+                .get(&frame_index)
+                .is_none_or(|last| clock.saturating_sub(*last) >= retry_floor);
+            if !retry_due {
+                continue;
+            }
+
+            let fragments = self.receiver.nack(frame_index);
+            if fragments.is_empty() {
+                continue;
+            }
+
+            self.nacked_at.insert(frame_index, clock);
+            self.stats.nacks_sent += fragments.len() as u64;
+            events.push(PlaneEvent::Nack {
+                frame_index,
+                fragments,
+            });
+        }
+
+        events
+    }
+
+    /// The prompt pass, on its own millisecond cadence inside `pump`. See [`Self::ask_for_repairs`].
+    fn sweep_nacks(&mut self) {
+        let clock = self.clock(Instant::now());
+        let events = self.ask_for_repairs(clock);
+        self.pending.extend(events);
+    }
+
+    /// Take the events the prompt pass produced; the caller reports them alongside the release
+    /// pass's.
+    fn take_pending(&mut self) -> Vec<PlaneEvent> {
+        std::mem::take(&mut self.pending)
     }
 
     pub fn stats(&self) -> &PlaneStats {
@@ -431,6 +508,7 @@ impl VideoPlane {
         } else {
             Some(Instant::now() + budget)
         };
+        let mut next_sweep = Instant::now();
 
         loop {
             match source.recv(&mut buffer, Duration::ZERO) {
@@ -446,6 +524,16 @@ impl VideoPlane {
                 SourceEvent::Timeout => break,
                 SourceEvent::Closed => return false,
             }
+
+            // Repair requests go out on their own cadence, **while the reading is happening**. Tying
+            // them to the read budget (or to the release pass) means a hole waits longer than its
+            // repair window to be asked for. See `ask_for_repairs`.
+            let wall = Instant::now();
+            if wall >= next_sweep {
+                next_sweep = wall + REPAIR_SWEEP_INTERVAL;
+                self.sweep_nacks();
+            }
+
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
@@ -497,43 +585,9 @@ impl VideoPlane {
             }
         }
 
-        // Ask for the fragments of anything still incomplete. The receiver knows which ones are
-        // missing; this is the round trip that saves a frame instead of a keyframe.
-        //
-        // **Once per round trip, not once per pass.** A frame stays incomplete across many passes,
-        // and re-asking on each of them asks for the same fragments again — which the sender
-        // dutifully answers. The repair traffic then becomes load on a link that is already losing
-        // datagrams, and the loss it is reacting to is the loss it is causing. `nack_retry_interval`
-        // is the cadence the other end assumes, so it is the only cadence that can be right. (The
-        // sender refuses to answer the same request twice inside the same window: see
-        // `MediaSender::repair`.)
-        let incomplete = self.receiver.incomplete_frames();
-        // Frames that have left the receiver's hands will never be asked for again.
-        self.nacked_at
-            .retain(|index, _| incomplete.contains(index));
-
-        let retry_floor = x_transport::nack_retry_interval(NACK_ROUND_TRIP);
-        for frame_index in incomplete {
-            let retry_due = self
-                .nacked_at
-                .get(&frame_index)
-                .is_none_or(|last| clock.saturating_sub(*last) >= retry_floor);
-            if !retry_due {
-                continue;
-            }
-
-            let fragments = self.receiver.nack(frame_index);
-            if fragments.is_empty() {
-                continue;
-            }
-
-            self.nacked_at.insert(frame_index, clock);
-            self.stats.nacks_sent += fragments.len() as u64;
-            events.push(PlaneEvent::Nack {
-                frame_index,
-                fragments,
-            });
-        }
+        // Ask for the fragments of anything still incomplete. See `ask_for_repairs` — the release
+        // pass is only one of the two places this happens, and not the prompt one.
+        events.extend(self.ask_for_repairs(clock));
 
         events
     }
@@ -839,12 +893,16 @@ mod tests {
         // The reference client re-requests; so do we. A frame that is one datagram short and gets
         // it back is a frame that never needed a keyframe.
         //
-        // A policy with a real hold, because that is the state a NACK exists in: a frame the
+        // A policy with a real *hold*, because that is the state a NACK exists in: a frame the
         // receiver is still holding and still missing pieces of. With no hold at all the frame is
-        // released the instant it is not repairable, and there is nothing left to ask for — which
-        // is correct behaviour and simply not this test.
+        // released the instant it is not repairable and there is nothing left to ask for.
+        //
+        // The straggler window is zero so the prompt sweep — which asks about *now*, on a
+        // millisecond cadence — does not need the test to sleep: a zero window means "believe a
+        // hole the moment you see one". In a session it is a few milliseconds, which is what stops
+        // the sweep naming shards that are simply still in flight.
         let hold = ReleasePolicy {
-            straggler_delay: Duration::from_millis(10),
+            straggler_delay: Duration::ZERO,
             repair_delay: Duration::from_millis(20),
             deadline: Duration::from_millis(30),
             jitter_frames: 0,
@@ -878,16 +936,29 @@ mod tests {
         let now = Instant::now();
         plane.pump(&mut source, now, Duration::ZERO);
 
-        // Nothing is released yet — the frame is incomplete — but it must be named.
-        let events = plane.release(now + Duration::from_millis(1));
-        let nacked = events.iter().find_map(|e| match e {
-            PlaneEvent::Nack { fragments, .. } => Some(fragments.clone()),
-            _ => None,
-        });
-        assert_eq!(
-            nacked,
-            Some(vec![0]),
-            "the missing fragment was not named for re-request: {events:?}"
+        // The request is made by the prompt sweep **inside `pump`**, not by the release pass: waiting
+        // for the release pass means waiting for the read budget, which is longer than the frame's
+        // repair window. Nothing is released yet — the frame is incomplete — and it must already
+        // have been named.
+        let events = plane.take_pending();
+        assert!(
+            events.iter().any(|e| {
+                matches!(e, PlaneEvent::Nack { fragments, .. } if fragments.contains(&0))
+            }),
+            "the fragment that never arrived was not named for re-request: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, PlaneEvent::Present { .. })),
+            "an incomplete frame must not be presented: {events:?}"
+        );
+
+        // ...and the release pass is not where it comes from.
+        assert!(
+            !plane
+                .release(now + Duration::from_millis(1))
+                .iter()
+                .any(|e| matches!(e, PlaneEvent::Nack { .. })),
+            "a repair request must not wait for the release pass"
         );
     }
 

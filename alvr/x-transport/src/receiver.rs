@@ -502,6 +502,24 @@ impl Receiver {
             .collect()
     }
 
+    /// Frames a repair request is **about**: still incomplete, but past the point where the
+    /// stragglers were expected to finish arriving.
+    ///
+    /// Not the same set as [`Self::incomplete_frames`], and the difference is the whole point of
+    /// having two. A frame that arrived a moment ago is incomplete because its own datagrams are
+    /// still in flight; naming those shards is useless, and — at the cadence a prompt sweep needs —
+    /// it is most of the traffic.
+    pub fn repairable_frames(&self, now: Duration) -> Vec<u64> {
+        self.partial
+            .iter()
+            .filter(|(_, f)| {
+                !f.has_all_data()
+                    && now.saturating_sub(f.first_arrival) >= self.policy.straggler_delay
+            })
+            .map(|(index, _)| *index)
+            .collect()
+    }
+
     /// Release everything that is ready, oldest frame first, **stopping at the first frame that is
     /// not** — so what comes out is always in frame order.
     ///
