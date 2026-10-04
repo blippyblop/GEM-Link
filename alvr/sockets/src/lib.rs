@@ -232,6 +232,16 @@ fn negotiate_media_key(
             .send(&ServerControlPacket::MediaKeyHandshake(message))
             .to_con()?;
 
+        // **XX is three messages and the initiator sends the last one**, so for that final message
+        // (`-> s, se`) there is nothing coming back. Without this check the loop blocks in `recv` on
+        // a handshake that has already completed, and the session dies on the timeout — with *both*
+        // ends reporting a timeout, which points at the network rather than at the message that will
+        // never arrive. The check has to be here, after the send: the closing message still has to go
+        // out, it just does not have an answer.
+        if exchange.is_finished() {
+            break;
+        }
+
         match control_socket.recv::<ClientControlPacket>(timeout)? {
             ClientControlPacket::MediaKeyHandshake(reply) => {
                 match exchange.advance(&reply).to_con()? {
@@ -539,5 +549,68 @@ mod tests {
             (dscp_to_tos(DscpTos::ExpeditedForwarding) << 2) as u32,
             0b1011_1000
         );
+    }
+
+    /// The two ends of the media-key exchange, over a **real socket**, with the real loop in
+    /// [`negotiate_media_key`] and [`negotiate_media_key_as_client`].
+    ///
+    /// This guards the loop rather than the cryptography: the server's loop sent the initiator's
+    /// *last* message and then waited for a reply, but XX ends on `-> s, se` and never sends one —
+    /// so it blocked until the timeout, the client finished its half and then blocked waiting for
+    /// `StartStream`, and **both ends reported a timeout**. That is indistinguishable from a lossy
+    /// link, and it cost a live two-end run to find: no single-ended test could see it, because each
+    /// end on its own is a well-formed message sequence.
+    #[test]
+    fn the_media_key_exchange_completes_between_two_real_ends() {
+        /// `ConnectionError` is deliberately `Display` and not `Debug` (it wraps socket errors that
+        /// should never be dumped with `{:?}`), so the failure has to be rendered, not unwrapped.
+        fn ok<T>(result: ConResult<T>, what: &str) -> T {
+            match result {
+                Ok(value) => value,
+                Err(e) => panic!("{what}: {e}"),
+            }
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let timeout = Duration::from_secs(2);
+
+        let client = std::thread::spawn(move || {
+            let (mut socket, _) = ok(
+                ProtoControlSocket::connect_to_port(timeout, PeerType::Server(&listener), port),
+                "the client end could not connect",
+            );
+            ok(
+                negotiate_media_key_as_client(&mut socket, timeout),
+                "the client half of the key exchange did not finish",
+            )
+        });
+
+        let (mut socket, _) = ok(
+            ProtoControlSocket::connect_to_port(
+                timeout,
+                PeerType::AnyClient(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+                port,
+            ),
+            "the server end could not connect",
+        );
+        let server_keys = ok(
+            negotiate_media_key(&mut socket, timeout),
+            "the server half of the key exchange did not finish",
+        );
+
+        let client_keys = client.join().unwrap();
+
+        // The *same* key, shown by sealing on one end and opening on the other. Comparing the
+        // schedules would only show that both are non-empty.
+        let sealed = server_keys
+            .cipher_for_feedback()
+            .seal(0, 0, b"aad", b"the session key")
+            .unwrap();
+        let opened = client_keys
+            .cipher_for_feedback()
+            .open(0, 0, b"aad", &sealed)
+            .unwrap();
+        assert_eq!(opened, b"the session key");
     }
 }
