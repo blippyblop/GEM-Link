@@ -518,10 +518,14 @@ impl BitrateManager {
         Some((
             DynamicEncoderParams {
                 bitrate_bps,
-                // The encoder is told the *effective* frame rate: at half the frames, each frame has
-                // twice the bit budget, and a rate controller still modelling the nominal rate would
-                // spend the stream on frames that are not being sent.
-                framerate: 1.0 / f32::min(frame_interval.as_secs_f32(), 1.0) / frame_divisor as f32,
+                // **The frame rate the encoder will actually run at**, not the rate the wire will
+                // carry. The two differ once the ladder is dropping frames, and telling the encoder
+                // the wire rate is not a harmless approximation: the C++ side derives its VBV and its
+                // per-frame budget as `bitrate / framerate`, so a frame rate divided by twelve gave
+                // every frame twelve times the bits — 39 538 bytes per frame from an encoder asked for
+                // 2.07 Mbps, exactly its VBV, and a stream that fitted the queue no better than
+                // before. The divisor is a wire decision and belongs on the wire.
+                framerate: 1.0 / f32::min(frame_interval.as_secs_f32(), 1.0),
             },
             bitrate_directives,
         ))
