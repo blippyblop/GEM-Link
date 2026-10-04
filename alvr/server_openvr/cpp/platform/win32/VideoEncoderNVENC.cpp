@@ -211,22 +211,50 @@ void VideoEncoderNVENC::Transmit(
 
     // Reference this frame against the previous frame (the common case, best compression), or
     // against a confirmed older frame (a small compression cost, and nothing depends on a frame the
-    // client does not have), or not at all — in which case the chain is rebuilt.
-    const bool usePrevious = !insertIDR && wasAcked(m_lastEncodedFrameIndex);
-    const bool useConfirmedLtr = !insertIDR && !usePrevious && confirmSlot >= 0;
+    // client does not have), or rebuild the chain.
+    const bool prevConfirmed = wasAcked(m_lastEncodedFrameIndex);
+    bool usePrevious = false;
+    bool useConfirmedLtr = false;
+    bool rebuild = false;
+    if (m_lastEncodedFrameIndex == 0 || insertIDR) {
+        // The first picture of a session, or the caller asked (stream start, or the client's own
+        // keyframe request). Nothing to refresh from and nothing to reference: a real IDR.
+        rebuild = true;
+    } else if (prevConfirmed) {
+        usePrevious = true;
+    } else if (confirmSlot >= 0) {
+        useConfirmedLtr = true;
+    } else if (ackValid && recoveryAllowed()) {
+        // The client is talking to us and has confirmed nothing for a while, so the chain really is
+        // lost. Rate-limited, because a burst of keyframes is the congestion that lost the frame in
+        // the first place — and this is measured, not hypothetical: an earlier version of this code
+        // rebuilt on *every* unconfirmed frame, which turned a session into 77 KB keyframes at
+        // 44 Mbps, a client that could not read them, no acknowledgements, and therefore no way out.
+        rebuild = true;
+    } else {
+        // **No acknowledgement has ever arrived, so carry on as before.** This is the fail-safe
+        // branch, and it is the one that keeps the loop from closing on itself: without evidence
+        // that the client can hear anything, forcing a keyframe per frame is a keyframe storm, and a
+        // stream of ordinary P-frames is what this encoder produced before any of this existed. The
+        // frame still reports what it was built on, so a client that did not decode that frame holds
+        // — which is the old behaviour, reached by the client's own decision rather than the
+        // encoder's guess.
+        usePrevious = true;
+    }
+
     unsigned long long chainRoot = 0;
-    if (insertIDR) {
-        chainRoot = 0; // a keyframe is its own root; the client needs no reference for it
-    } else if (usePrevious) {
+    if (usePrevious) {
         chainRoot = m_lastEncodedFrameIndex;
     } else if (useConfirmedLtr) {
         chainRoot = m_ltrFrameIndex[confirmSlot];
     } else {
-        // Nothing confirmed: the chain is rebuilt. `chainRoot` stays 0 — "the sender does not say" —
-        // so the client treats the frame as unproven rather than trusting it on the strength of a
-        // keyframe flag that a lost datagram can invalidate anyway.
-        insertIDR = true;
+        // A rebuild: `0` means "the sender does not say". A keyframe is its own reference and needs
+        // no claim; a forced intra sweep is a rebuild in progress, and the frames inside it are
+        // exactly the ones the client should not trust yet.
+        chainRoot = 0;
     }
+
+    insertIDR = rebuild;
 
     SetFrameChainRoot(chainRoot);
 
@@ -343,8 +371,7 @@ void VideoEncoderNVENC::Transmit(
         m_ltrFrameIndex[slot] = frameIndex;
     }
 
-    if (!m_loggedFirstRecovery && !usePrevious) {
-        m_loggedFirstRecovery = true;
+    if (!m_loggedFirstRecovery && !usePrevious) {        m_loggedFirstRecovery = true;
         Info(
             "NVENC reference: frame %llu encoded against %s (client confirmed %llu of %llu, "
             "valid=%d, ltr=%d)",
@@ -399,8 +426,16 @@ void VideoEncoderNVENC::Transmit(
     }
 }
 
-void VideoEncoderNVENC::FillEncodeConfig(
-    NV_ENC_INITIALIZE_PARAMS& initializeParams,
+bool VideoEncoderNVENC::recoveryAllowed() {
+    const unsigned long long now = GetTickCount64();
+    if (now - m_lastRebuildMs < RECOVERY_MIN_INTERVAL_MS) {
+        return false;
+    }
+    m_lastRebuildMs = now;
+    return true;
+}
+
+void VideoEncoderNVENC::FillEncodeConfig(    NV_ENC_INITIALIZE_PARAMS& initializeParams,
     int refreshRate,
     int renderWidth,
     int renderHeight,

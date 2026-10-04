@@ -720,9 +720,14 @@ impl Receiver {
         };
 
         // The client's own queueing delay, measured on the frame the display path is about to see.
-        // Only usable frames: a frame that could not be rebuilt says nothing about the drain, it
-        // says the frame was given up on.
-        if outcome.is_usable() {
+        //
+        // **Only frames that completed on their own.** A frame that was held late and rescued is a
+        // frame whose *repair* took a round trip: its spread measures the repair path, not the drain,
+        // and folding the two together is how a run where the drain was 3 ms reported 139 ms of
+        // queueing delay and drove the sender's ladder to its floor for no reason. A frame that was
+        // abandoned says nothing at all. Between the two, an EWMA over frames that arrived when they
+        // were supposed to is the honest measure of how far behind the reader is.
+        if outcome.is_usable() && frame.held_late_at.is_none() {
             let spread = frame
                 .last_arrival
                 .saturating_sub(frame.first_arrival)

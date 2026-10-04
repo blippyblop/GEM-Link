@@ -16,6 +16,14 @@ enum AdaptiveQuantizationMode { SpatialAQ = 1, TemporalAQ = 2 };
 /// why the code does not assume a slot exists merely because it is in range.
 const int LTR_SLOTS = 4;
 
+/// The least time between two forced rebuilds of the reference chain, in milliseconds.
+///
+/// The caller's own IDR scheduler has used 100 ms since it was written; the encoder's recovery path
+/// had no limit at all, and the first live run with it produced a keyframe for every frame — 77 KB
+/// pictures at 44 Mbps on a link whose receiver could read a fraction of that. A rebuild is a
+/// response to congestion, so it must not be able to become congestion.
+const unsigned long long RECOVERY_MIN_INTERVAL_MS = 100;
+
 // Video encoder for NVIDIA NvEnc.
 class VideoEncoderNVENC : public VideoEncoder {
 public:
@@ -40,6 +48,10 @@ private:
         int renderHeight,
         uint64_t bitrate_bps
     );
+
+    /// Whether a forced rebuild of the reference chain is allowed right now, and the record that it
+    /// happened. See `RECOVERY_MIN_INTERVAL_MS`.
+    bool recoveryAllowed();
 
     std::ofstream fpOut;
     std::shared_ptr<NvEncoder> m_NvNecoder;
@@ -80,6 +92,12 @@ private:
     unsigned long long m_framesReferencingConfirmed = 0;
     unsigned long long m_framesForcedKey = 0;
     unsigned long long m_sweepsStarted = 0;
+    /// When the last forced rebuild happened, in milliseconds since the process started.
+    ///
+    /// Keyframes are rate-limited for the same reason the caller has always rate-limited them
+    /// (`IDRScheduler::MIN_IDR_FRAME_INTERVAL`): a burst of them is congestion, and here the burst
+    /// would be a response to congestion, which is how a feedback loop is built.
+    unsigned long long m_lastRebuildMs = 0;
     /// One log line per session on the first reference decision that is not the ordinary one.
     bool m_loggedFirstRecovery = false;
 };
