@@ -1529,6 +1529,13 @@ fn connection_pipeline(
                         }
                         ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
                     }
+                    ClientControlPacket::MediaKeyHandshake(_) => {
+                        // The media key is agreed during the socket connection's own handshake,
+                        // before a single media datagram exists. A handshake message arriving here
+                        // is out of place, and re-keying a live plane mid-stream would black it out
+                        // rather than repair it, so it is refused rather than obeyed.
+                        warn!("Ignoring a media key handshake after the session was keyed");
+                    }
                     ClientControlPacket::LocalViewParams(params) => {
                         ctx.events_sender
                             .send(ServerCoreEvent::LocalViewParams(params))
