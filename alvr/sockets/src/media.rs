@@ -35,6 +35,15 @@ use x_transport::{DatagramSink, DatagramSource, SinkError, SourceEvent};
 /// datagram and is refused.
 const MAX_DATAGRAM_SIZE: usize = 4096;
 
+/// How long `send` waits for room in a full kernel buffer before giving the datagram up.
+///
+/// A send that meets a full buffer is backpressure, not an error: the socket is non-blocking
+/// because the *receive* path needs it to be (see [`MediaSocket::send`]), and dropping a fragment
+/// out of the middle of a frame is a frame that can never be assembled. The limit exists only so a
+/// socket that can never drain cannot park the send thread forever.
+const SEND_BLOCK_STEP: Duration = Duration::from_micros(250);
+const SEND_BLOCK_LIMIT: Duration = Duration::from_millis(50);
+
 /// One media-plane socket: a sink and a source over the same endpoint.
 pub struct MediaSocket {
     socket: UdpSocket,
@@ -42,6 +51,9 @@ pub struct MediaSocket {
     peer: Option<SocketAddr>,
     datagrams_sent: u64,
     send_failures: u64,
+    /// How many sends had to wait for room in the kernel buffer. A non-zero value is the link
+    /// applying backpressure, which is a fact worth being able to see rather than infer.
+    send_waits: u64,
     datagrams_received: u64,
     datagrams_from_elsewhere: u64,
     datagrams_oversized: u64,
@@ -136,6 +148,7 @@ impl MediaSocket {
             peer: None,
             datagrams_sent: 0,
             send_failures: 0,
+            send_waits: 0,
             datagrams_received: 0,
             datagrams_from_elsewhere: 0,
             datagrams_oversized: 0,
@@ -186,6 +199,11 @@ impl MediaSocket {
         self.send_failures
     }
 
+    /// Sends that had to wait for room in the kernel buffer — the link applying backpressure.
+    pub fn send_waits(&self) -> u64 {
+        self.send_waits
+    }
+
     pub fn datagrams_received(&self) -> u64 {
         self.datagrams_received
     }
@@ -207,21 +225,44 @@ impl DatagramSink for MediaSocket {
         // is learned. Sending to "any port" is meaningless, so it is treated as no peer at all, and
         // the connected send that follows fails loudly rather than going somewhere arbitrary.
         let peer = self.peer.filter(|peer| peer.port() != 0);
-        let result = match peer {
-            Some(peer) => self.socket.send_to(datagram, peer),
-            None => self.socket.send(datagram),
-        };
 
-        match result {
-            Ok(_) => {
-                self.datagrams_sent += 1;
-                Ok(())
+        // **Wait for room rather than dropping a datagram.**
+        //
+        // The receive path puts this socket in non-blocking mode — a poll has to be non-blocking,
+        // because `SO_RCVTIMEO` is ignored on one — and the mode is a property of the *socket*, not
+        // of this handle: `try_clone` shares it. So a send that is not expecting to be non-blocking
+        // meets a full kernel buffer with `WouldBlock`, and a sender that treats that as a refusal
+        // drops **one fragment out of the middle of a frame**. The frame can then never be
+        // assembled, and it presents as packet loss on a link that is merely busy.
+        //
+        // Waiting is the backpressure at the right granularity: the caller's bounded video queue
+        // then drops whole frames, which is a decision it is able to make and can count.
+        let mut waited = Duration::ZERO;
+        loop {
+            let result = match peer {
+                Some(peer) => self.socket.send_to(datagram, peer),
+                None => self.socket.send(datagram),
+            };
+
+            match result {
+                Ok(_) => {
+                    self.datagrams_sent += 1;
+                    return Ok(());
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && waited < SEND_BLOCK_LIMIT =>
+                {
+                    self.send_waits += 1;
+                    waited += SEND_BLOCK_STEP;
+                    std::thread::sleep(SEND_BLOCK_STEP);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.send_failures += 1;
+                    return Err(SinkError::WouldBlock);
+                }
+                Err(_) => return Err(SinkError::Closed),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                self.send_failures += 1;
-                Err(SinkError::WouldBlock)
-            }
-            Err(_) => Err(SinkError::Closed),
         }
     }
 }
