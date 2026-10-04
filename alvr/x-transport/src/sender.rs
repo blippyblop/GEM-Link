@@ -167,6 +167,8 @@ pub enum FeedbackOutcome {
     QueueDelay {
         /// How long the client took to read a frame after its first shard appeared, EWMA.
         micros: u32,
+        /// What share of each frame's declared shards never arrived, in tenths of a percent.
+        missing_per_mille: u16,
     },
     /// **This frame was decoded.** The one message that is not a complaint: the sender now knows a
     /// frame it sent arrived *and worked*, which is what the encoder needs in order to reference only
@@ -426,6 +428,10 @@ pub struct MediaSender {
     /// The window the loss estimate is taken over, in frames.
     loss_window_frames: u64,
     loss_window: LossWindow,
+    /// What share of each frame's declared shards the client says never arrived, in tenths of a
+    /// percent. See [`Feedback::QueueDelay`] — the signal a client that reports a comfortable
+    /// drain delay can still be drowning under.
+    reported_missing_permille: u64,
     /// The last queueing delay the client reported, if any. See
     /// [`FeedbackOutcome::QueueDelay`] — the caller turns this into a rate, because only the
     /// caller knows what the encoder's floor is.
@@ -501,6 +507,7 @@ impl MediaSender {
             loss_window_frames: 8,
             loss_window: LossWindow::default(),
             reported_queue_delay_us: None,
+            reported_missing_permille: 0,
             late_fraction: 0.0,
             observed_loss: 0.0,
             client_acked_frame: None,
@@ -943,9 +950,14 @@ impl MediaSender {
                     last_presented: *last_presented,
                 }
             }
-            Feedback::QueueDelay { micros, late_per_mille } => {
+            Feedback::QueueDelay {
+                micros,
+                late_per_mille,
+                missing_per_mille,
+            } => {
                 self.stats.queue_delay_reports += 1;
                 self.stats.reported_queue_delay_us = *micros as u64;
+                self.reported_missing_permille = *missing_per_mille as u64;
                 self.reported_queue_delay_us = Some(*micros);
 
                 // **The correction that keeps the parity controller honest, as a rate.**
@@ -964,7 +976,10 @@ impl MediaSender {
                 // pinned at the layout's 50 % ceiling, repairing 3 frames in 4200.
                 self.late_fraction = (*late_per_mille as f64 / 1000.0).min(1.0);
 
-                FeedbackOutcome::QueueDelay { micros: *micros }
+                FeedbackOutcome::QueueDelay {
+                    micros: *micros,
+                    missing_per_mille: *missing_per_mille,
+                }
             }
             Feedback::Ack { frame_index } => {
                 let newest = self.client_acked_frame.map_or(*frame_index, |cur| cur.max(*frame_index));
@@ -1090,6 +1105,11 @@ impl MediaSender {
     /// The caller — not this module — decides what to do with it, because the actuator is the
     /// encoder's bitrate and that is the caller's to set. This module's job was to make the fact
     /// available; leaving it unread was the same mistake as the feedback that had no carrier.
+    /// What share of each frame's declared shards the client last said never arrived.
+    pub fn reported_missing_permille(&self) -> u64 {
+        self.reported_missing_permille
+    }
+
     pub fn reported_queue_delay_us(&self) -> Option<u32> {
         self.reported_queue_delay_us
     }
@@ -1282,6 +1302,7 @@ mod tests {
             &Feedback::QueueDelay {
                 micros: 18_000,
                 late_per_mille: 1000,
+                missing_per_mille: 0,
             },
             Duration::from_millis(110),
         );
@@ -1333,6 +1354,7 @@ mod tests {
             &Feedback::QueueDelay {
                 micros: 18_000,
                 late_per_mille: 333,
+                missing_per_mille: 0,
             },
             Duration::from_millis(110),
         );

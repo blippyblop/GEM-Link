@@ -280,6 +280,16 @@ pub struct ReceiverStats {
     /// attempts to fix the repair path made it worse instead.
     pub queue_delay_us: u64,
     pub queue_delay_max_us: u64,
+    /// How much of each frame's **declared** shards actually arrived, in tenths of a percent missing,
+    /// as an EWMA over every frame that finished — usable or not.
+    ///
+    /// The measurement the queue delay cannot make, and the live run is why it exists. The drain
+    /// spread is only measurable on frames that completed, and a client that is losing half of every
+    /// frame completes *only small frames* — so it reports a comfortable 21 ms of queueing delay
+    /// while receiving a third of the stream. This counts what the frame said it was against what
+    /// arrived, which no amount of reading faster can flatter, and it is the same number on a frame
+    /// that was rebuilt and on one that was thrown away.
+    pub missing_permille: u32,
 }
 
 impl ReceiverStats {
@@ -682,6 +692,25 @@ impl Receiver {
 
     fn finish(&mut self, index: u64, frame: &mut PartialFrame, now: Duration) -> DeliveredFrame {
         let missing = frame.missing_data();
+
+        // What the frame declared against what arrived — **before** the FEC is consulted, because
+        // the question is what the client read, not what it could rebuild from. Counted for every
+        // finished frame, including the ones that could not be rebuilt: those are the frames the
+        // drain is actually failing on.
+        {
+            let total = frame.data_count as u64 + frame.parity_count as u64;
+            if total > 0 {
+                let present = frame.shards.iter().filter(|s| s.is_some()).count() as u64;
+                let permille = ((total - present) * 1000 / total) as u32;
+                // A slow EWMA: this is a property of the link over seconds, not of a frame.
+                let ewma = &mut self.stats.missing_permille;
+                *ewma = if *ewma == 0 {
+                    permille
+                } else {
+                    (*ewma * 7 + permille) / 8
+                };
+            }
+        }
 
         let outcome = if missing.is_empty() {
             FrameOutcome::Complete

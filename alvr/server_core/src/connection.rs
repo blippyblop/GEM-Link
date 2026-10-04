@@ -1149,14 +1149,17 @@ fn connection_pipeline(
                                 | FeedbackOutcome::Resume { .. } => {
                                     ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
                                 }
-                                FeedbackOutcome::QueueDelay { micros } => {
+                                FeedbackOutcome::QueueDelay {
+                                    micros,
+                                    missing_per_mille,
+                                } => {
                                     // The client is behind and has said so. The lever is the
                                     // encoder's bitrate — fewer bits is fewer datagrams, which is
                                     // the only thing that actually drains the queue — and the
                                     // bitrate manager is what owns it.
-                                    ctx.bitrate_manager
-                                        .lock()
-                                        .report_client_queue_delay(micros);
+                                    let mut manager = ctx.bitrate_manager.lock();
+                                    manager.report_client_queue_delay(micros);
+                                    manager.report_client_missing(missing_per_mille);
                                 }
                                 FeedbackOutcome::Acknowledged { frame_index, frames_unusable, .. } => {
                                     // **The one thing the encoder cannot work out for itself.** A

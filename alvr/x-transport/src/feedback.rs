@@ -105,6 +105,14 @@ pub enum Feedback {
     /// many frames, and a control loop fed per-frame noise is a control loop that oscillates.
     QueueDelay {
         micros: u32,
+        /// What share of each frame's **declared** shards never arrived, in tenths of a percent.
+        ///
+        /// The measurement the queueing delay cannot make: a drain spread is only observable on
+        /// frames that completed, and a client losing half of every frame completes only the small
+        /// ones. Measured on the live rig, that client reported 21 ms of "queueing delay" — one and a
+        /// half frames behind, the mildest rung of the ladder — while receiving a third of every
+        /// frame. This is what the sender has to send less *of*.
+        missing_per_mille: u16,
         /// What share of the fragments the client asked for, since the last report, **arrived late
         /// rather than never** — in tenths of a percent, so it fits in a `u16` with room to spare.
         ///
@@ -174,11 +182,16 @@ impl Feedback {
                 out.extend_from_slice(&last_presented.to_le_bytes());
                 out
             }
-            Feedback::QueueDelay { micros, late_per_mille } => {
-                let mut out = Vec::with_capacity(11);
+            Feedback::QueueDelay {
+                micros,
+                late_per_mille,
+                missing_per_mille,
+            } => {
+                let mut out = Vec::with_capacity(13);
                 out.push(TAG_QUEUE_DELAY);
                 out.extend_from_slice(&micros.to_le_bytes());
                 out.extend_from_slice(&late_per_mille.to_le_bytes());
+                out.extend_from_slice(&missing_per_mille.to_le_bytes());
                 out
             }
             Feedback::Ack { frame_index } => {
@@ -247,9 +260,16 @@ impl Feedback {
                         .try_into()
                         .expect("2 bytes"),
                 );
+                let missing_per_mille = u16::from_le_bytes(
+                    body.get(6..8)
+                        .ok_or(FeedbackError::Truncated)?
+                        .try_into()
+                        .expect("2 bytes"),
+                );
                 Ok(Feedback::QueueDelay {
                     micros,
                     late_per_mille,
+                    missing_per_mille,
                 })
             }
             TAG_ACK => Ok(Feedback::Ack {
@@ -453,7 +473,11 @@ mod tests {
             Feedback::StreamReset {
                 last_presented: 1_000_000,
             },
-            Feedback::QueueDelay { micros: 41_000, late_per_mille: 123 },
+            Feedback::QueueDelay {
+                micros: 41_000,
+                late_per_mille: 123,
+                missing_per_mille: 7,
+            },
         ];
 
         for message in messages {

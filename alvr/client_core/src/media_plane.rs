@@ -257,9 +257,15 @@ impl MediaPlaneReceiver {
                     Some(MediaPlaneAction::AskForKeyframe { stalled_for })
                 }
                 PlaneEvent::Reset { stalled_for } => Some(MediaPlaneAction::Reset { stalled_for }),
-                PlaneEvent::QueueDelay { micros, late_per_mille } => {
-                    Some(MediaPlaneAction::QueueDelay { micros, late_per_mille })
-                }
+                PlaneEvent::QueueDelay {
+                    micros,
+                    late_per_mille,
+                    missing_per_mille,
+                } => Some(MediaPlaneAction::QueueDelay {
+                    micros,
+                    late_per_mille,
+                    missing_per_mille,
+                }),
             })
             .collect();
 
@@ -682,11 +688,19 @@ impl VideoPlane {
                 ((late * 1000) / nacks).min(1000) as u16
             };
 
-            if micros > 0 || late_per_mille > 0 {
+            // The share of each frame's declared shards that never arrived. This is the number the
+            // drain delay is blind to: measured only on frames that completed, it flatters a client
+            // that is losing the large ones — 21 ms of "queueing" on a client reading a third of the
+            // stream, which on the live rig left the ladder on its mildest rung while every frame
+            // became a hole.
+            let missing_per_mille = self.receiver.stats().missing_permille.min(1000) as u16;
+
+            if micros > 0 || late_per_mille > 0 || missing_per_mille > 0 {
                 self.stats.queue_delay_reports += 1;
                 events.push(PlaneEvent::QueueDelay {
                     micros: micros.min(u32::MAX as u64) as u32,
                     late_per_mille,
+                    missing_per_mille,
                 });
             }
         }

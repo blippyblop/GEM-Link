@@ -18,6 +18,10 @@ const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// costs nothing but the delay itself. Past that it is not catching up while being fed at this rate.
 const LADDER_FRAMERATE_FROM: f32 = 1.0;
 
+/// The share of a frame's declared shards that may go missing before the ladder gives up frame rate
+/// on that evidence. Two percent is already a hole in most frames; above it, one step per two percent.
+const LADDER_MISSING_FROM_PERMILLE: u32 = 20;
+
 /// The most the frame rate is reduced by: one frame in six.
 ///
 /// Measured, not chosen: the emulated client reads ~300 datagrams/s, so at 72 Hz it can take about
@@ -79,6 +83,9 @@ pub struct BitrateManager {
     last_frame_instant: Instant,
     last_update_instant: Instant,
     dynamic_decoder_max_bytes_per_frame: f32,
+    /// What share of each frame's declared shards the client says never arrived, in tenths of a
+    /// percent. See [`Self::report_client_missing`].
+    client_missing_permille: Option<u16>,
     /// The client's own queueing delay, as it last reported it. See
     /// [`alvr_events::BitrateDirectives::client_queue_limiter_bps`].
     ///
@@ -118,6 +125,7 @@ impl BitrateManager {
             last_update_instant: Instant::now(),
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
             client_queue_delay_us: None,
+            client_missing_permille: None,
             last_returned_bitrate_bps: None,
             client_ack: ClientAck::default(),
             previous_config: None,
@@ -132,6 +140,17 @@ impl BitrateManager {
     /// Not a frame fact and not a server fact: it is the receiver telling the sender to send less.
     pub fn report_client_queue_delay(&mut self, micros: u32) {
         self.client_queue_delay_us = Some(micros);
+    }
+
+    /// Record what share of each frame's declared shards the client says never arrived.
+    ///
+    /// The number the queueing delay cannot supply, and the live rig is the measurement: a client
+    /// losing two thirds of every frame completes only the small ones, so its *drain spread* — the
+    /// delay measured on frames that completed — read 21 ms, one and a half frames behind, the
+    /// mildest rung of the ladder, while every frame was becoming a hole. Missing shards cannot be
+    /// flattered by reading faster, because the frame declares what it should have been.
+    pub fn report_client_missing(&mut self, permille: u16) {
+        self.client_missing_permille = Some(permille.min(1000));
     }
 
     /// Record that the client decoded a frame. See [`ClientAck`].
@@ -410,7 +429,7 @@ impl BitrateManager {
             let latency_budget_us = self.nominal_frame_interval.as_micros() as f32;
             // Quality is the third rung: it is the bitrate that comes down, and only once the frame
             // rate has already been reduced to its floor.
-            if frame_divisor >= DEGRADE_MAX_FRAME_DIVISOR && queue_us as f32 > latency_budget_us {
+            if queue_us as f32 > latency_budget_us {
                 let target_us = latency_budget_us / 3.0;
                 let max_bps = bitrate_bps * target_us / queue_us as f32;
                 // A quality floor as well: below this the picture is not worth sending at all, and
@@ -458,20 +477,39 @@ impl BitrateManager {
     /// applies it to the media sender, which is where a frame can actually be dropped: the encoder is
     /// in another process, and skipping *there* would encode bits never sent.
     pub fn ladder_frame_divisor(&self) -> u32 {
-        let Some(queue_us) = self.client_queue_delay_us else {
-            return 1;
+        // Two independent reasons to send fewer frames, and the larger answer wins.
+        //
+        // 1. **The client is behind**: it is reading slowly enough that the queue is backing up.
+        //    One step per frame interval of queueing, from "nothing" to the cap: the rung is a dial
+        //    rather than a switch, so a client two frames behind is not treated like one six behind.
+        let by_queue = match self.client_queue_delay_us {
+            Some(queue_us) => {
+                let interval_us = self.nominal_frame_interval.as_micros() as f32;
+                if interval_us <= 0.0 {
+                    1
+                } else {
+                    let behind = queue_us as f32 / interval_us;
+                    if behind < LADDER_FRAMERATE_FROM {
+                        1
+                    } else {
+                        (behind.floor() as u32).min(DEGRADE_MAX_FRAME_DIVISOR)
+                    }
+                }
+            }
+            None => 1,
         };
-        let interval_us = self.nominal_frame_interval.as_micros() as f32;
-        if interval_us <= 0.0 {
-            return 1;
-        }
-        // One step per frame interval of queueing, from "nothing" to the cap: the second rung is a
-        // dial rather than a switch, so a client that is two frames behind is not treated the same as
-        // one that is six behind.
-        let behind = queue_us as f32 / interval_us;
-        if behind < LADDER_FRAMERATE_FROM {
-            return 1;
-        }
-        (behind.floor() as u32).min(DEGRADE_MAX_FRAME_DIVISOR)
+
+        // 2. **The client is missing shards.** A client that is not behind but is not receiving is a
+        //    client being sent more than it can take, and the queue delay cannot see it: the frames
+        //    it completes are the small ones, and it completes them promptly. Two percent of a frame
+        //    missing is enough to leave a hole; the ladder steps once per two percent beyond that.
+        let by_missing = match self.client_missing_permille {
+            Some(missing) if missing as u32 > LADDER_MISSING_FROM_PERMILLE => {
+                ((missing as u32 - LADDER_MISSING_FROM_PERMILLE) / 20 + 2).min(DEGRADE_MAX_FRAME_DIVISOR)
+            }
+            _ => 1,
+        };
+
+        by_queue.max(by_missing)
     }
 }
