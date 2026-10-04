@@ -149,12 +149,8 @@ impl BitrateManager {
     }
 
     /// What the encoder may reference. See [`ClientAck`].
-    pub fn client_ack(&self) -> (bool, u64, u64) {
-        (
-            self.client_ack.valid,
-            self.client_ack.newest,
-            self.client_ack.recent_mask,
-        )
+    pub fn client_ack(&self) -> ClientAck {
+        self.client_ack
     }
 
     /// The bitrate the encoder was last asked for, and the cap the client's queueing imposed.

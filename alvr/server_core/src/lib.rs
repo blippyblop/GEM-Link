@@ -682,7 +682,8 @@ impl ServerCoreContext {
     /// is set once a second at best: the encoder would then reference frames the client lost for as
     /// long as the bitrate stayed still.
     pub fn client_ack_state(&self) -> (bool, u64, u64) {
-        self.connection_context.bitrate_manager.lock().client_ack()
+        let ack = self.connection_context.bitrate_manager.lock().client_ack();
+        (ack.valid, ack.newest, ack.recent_mask)
     }
 
     pub fn report_composed(&self, target_timestamp: Duration, offset: Duration) {
