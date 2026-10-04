@@ -1104,6 +1104,7 @@ fn connection_pipeline(
     let mut timebase = TimebaseOffset::new(Duration::from_secs(1));
     let mut over_budget_frames = 0u64;
     let mut frames_this_run = 0u64;
+    let mut bytes_this_run = 0u64;
 
     let video_send_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
@@ -1172,6 +1173,11 @@ fn connection_pipeline(
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
+
+                // What came out of the encoder, before the per-frame header is prepended. This is
+                // the number the rate control had to work with, and the one to compare against what
+                // the encoder was asked for.
+                let encoded_len = payload.len() as u64;
                 crate::send_probe::dequeued();
 
                 ctx.tracking_manager
@@ -1233,8 +1239,27 @@ fn connection_pipeline(
                 // session — and a repair path that answers the same question repeatedly, or answers
                 // none of them, looks identical from the client's side.
                 frames_this_run += 1;
+                bytes_this_run += encoded_len;
                 if frames_this_run.is_multiple_of(150) {
                     let stats = video_sender.stats();
+                    // **The bisect: bytes per frame out of the encoder, next to the number the
+                    // encoder was given.** Bytes unchanged means the value is not reaching it or it
+                    // is ignoring it; bytes changed while datagrams per frame stay the same means
+                    // packetisation, not rate control. Without both numbers on one line the two are
+                    // indistinguishable, which is how a cap can look like it is working.
+                    let mean_bytes = bytes_this_run as f64 / frames_this_run as f64;
+                    let mean_mbps = mean_bytes * 8.0 * fps as f64 / 1e6;
+                    let asked_mbps = ctx
+                        .bitrate_manager
+                        .lock()
+                        .effective_bitrate_bps()
+                        .unwrap_or(0.0)
+                        as f64
+                        / 1e6;
+                    info!(
+                        "encoder: {mean_bytes:.0} B/frame ({mean_mbps:.2} Mbps at {fps:.0} fps), asked \
+                         for {asked_mbps:.2} Mbps"
+                    );
                     info!(
                         "media sender: {} frame(s) sent, {} datagram(s) ({} parity), {} requested, {} \
                          retransmitted, {} coalesced, refusals {}/{}/{}/{}",

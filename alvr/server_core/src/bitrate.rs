@@ -36,6 +36,9 @@ pub struct BitrateManager {
     /// knows what the frame interval is — and one frame interval is the target: a client more than a
     /// frame behind is a client whose frames will be released before they have been read.
     client_queue_delay_us: Option<u32>,
+    /// The bitrate last handed to the encoder. Used to avoid re-configuring it for a change too
+    /// small to matter, and to report what the encoder was actually asked for.
+    last_returned_bitrate_bps: Option<f32>,
     previous_config: Option<BitrateConfig>,
     update_needed: bool,
 }
@@ -63,6 +66,7 @@ impl BitrateManager {
             last_update_instant: Instant::now(),
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
             client_queue_delay_us: None,
+            last_returned_bitrate_bps: None,
             previous_config: None,
             update_needed: true,
         }
@@ -75,6 +79,16 @@ impl BitrateManager {
     /// Not a frame fact and not a server fact: it is the receiver telling the sender to send less.
     pub fn report_client_queue_delay(&mut self, micros: u32) {
         self.client_queue_delay_us = Some(micros);
+    }
+
+    /// The bitrate the encoder was last asked for, and the cap the client's queueing imposed.
+    ///
+    /// The bisect this exists for: mean encoded bytes per frame next to the number the encoder was
+    /// given. Bytes unchanged means the number is not reaching it, or it is ignoring it (this
+    /// session's encoder is CBR on content that never approaches the target, so it can ignore it
+    /// while looking healthy); bytes changed and datagrams unchanged means packetisation.
+    pub fn effective_bitrate_bps(&self) -> Option<f32> {
+        self.last_returned_bitrate_bps
     }
 
     pub fn report_frame_present(&mut self, config: &Switch<BitrateAdaptiveFramerateConfig>) {
@@ -168,13 +182,26 @@ impl BitrateManager {
     ) -> Option<(DynamicEncoderParams, BitrateDirectives)> {
         let now = Instant::now();
 
-        if self.previous_config.as_ref() != Some(config) {
+        let config_changed = self.previous_config.as_ref() != Some(config);
+        if config_changed {
             self.previous_config = Some(config.clone());
-            // Continue method. Always update bitrate in this case
-        } else if !self.update_needed
+            // Continue: always update the bitrate when the settings changed.
+        } else if self.client_queue_delay_us.is_none()
+            && !self.update_needed
             && (now < self.last_update_instant + UPDATE_INTERVAL
                 || matches!(config.mode, BitrateMode::ConstantMbps(_)))
         {
+            // **This early return is why the queue-delay cap never reached the encoder.**
+            //
+            // `None` here is what the FFI turns into `updated: 0`, and `updated` is the only thing
+            // the C++ side looks at (`VideoEncoderNVENC::Transmit` reconfigures the encoder only
+            // when it is set) — so in a constant-rate session the encoder was reconfigured once, at
+            // init, and never again. That is precisely the session where nothing else will lower the
+            // bitrate, and it is the second time this path has hidden the cap: the first was the
+            // limiter's position inside the adaptive arm.
+            //
+            // A queue-delay report now bypasses it. The materiality check below is what keeps that
+            // from meaning a reconfigure every frame.
             return None;
         }
 
@@ -282,6 +309,20 @@ impl BitrateManager {
                 bitrate_directives.client_queue_limiter_bps = Some(max_bps);
             }
         }
+
+        // A reconfigure is a **full encoder re-initialisation** on the C++ side, so a value the
+        // encoder already has is not worth sending — and now that the cap can make this function run
+        // every frame in a constant-rate session, that matters. The adaptive path is left exactly as
+        // it was: its own update cadence is what decides there.
+        if matches!(config.mode, BitrateMode::ConstantMbps(_)) && !config_changed {
+            let material = self
+                .last_returned_bitrate_bps
+                .is_none_or(|last| last <= 0.0 || (last - bitrate_bps).abs() > last * 0.02);
+            if !material {
+                return None;
+            }
+        }
+        self.last_returned_bitrate_bps = Some(bitrate_bps);
 
         bitrate_directives.requested_bitrate_bps = bitrate_bps;
 

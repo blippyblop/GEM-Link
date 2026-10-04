@@ -80,7 +80,18 @@ pub enum Feedback {
     ///
     /// Sent on its own slow cadence, not per frame: it is a property of the receiver measured over
     /// many frames, and a control loop fed per-frame noise is a control loop that oscillates.
-    QueueDelay { micros: u32 },
+    QueueDelay {
+        micros: u32,
+        /// How many datagrams arrived **after** their frame had been released, since the last
+        /// report.
+        ///
+        /// These are the NACKs that were answered too late to help, and they are **not loss**. The
+        /// sender subtracts them from the loss it feeds the parity controller, because otherwise —
+        /// and this is what was measured — it reads a queued receiver as a lossy link, answers with
+        /// more parity, and the parity queues behind the same backlog: 50 % of the fresh traffic, at
+        /// the layout's ceiling, repairing almost nothing.
+        late: u32,
+    },
 }
 
 /// Why a feedback datagram could not be read.
@@ -136,10 +147,11 @@ impl Feedback {
                 out.extend_from_slice(&last_presented.to_le_bytes());
                 out
             }
-            Feedback::QueueDelay { micros } => {
-                let mut out = Vec::with_capacity(5);
+            Feedback::QueueDelay { micros, late } => {
+                let mut out = Vec::with_capacity(9);
                 out.push(TAG_QUEUE_DELAY);
                 out.extend_from_slice(&micros.to_le_bytes());
+                out.extend_from_slice(&late.to_le_bytes());
                 out
             }
         }
@@ -196,7 +208,13 @@ impl Feedback {
                         .try_into()
                         .expect("4 bytes"),
                 );
-                Ok(Feedback::QueueDelay { micros })
+                let late = u32::from_le_bytes(
+                    body.get(4..8)
+                        .ok_or(FeedbackError::Truncated)?
+                        .try_into()
+                        .expect("4 bytes"),
+                );
+                Ok(Feedback::QueueDelay { micros, late })
             }
             other => Err(FeedbackError::UnknownTag(other)),
         }
@@ -394,7 +412,7 @@ mod tests {
             Feedback::StreamReset {
                 last_presented: 1_000_000,
             },
-            Feedback::QueueDelay { micros: 41_000 },
+            Feedback::QueueDelay { micros: 41_000, late: 1_234 },
         ];
 
         for message in messages {

@@ -695,10 +695,24 @@ impl MediaSender {
                     last_presented: *last_presented,
                 }
             }
-            Feedback::QueueDelay { micros } => {
+            Feedback::QueueDelay { micros, late } => {
                 self.stats.queue_delay_reports += 1;
                 self.stats.reported_queue_delay_us = *micros as u64;
                 self.reported_queue_delay_us = Some(*micros);
+
+                // **The correction that keeps the parity controller honest.**
+                //
+                // A NACK is the only loss signal the sender has, and a client that is behind NACKs
+                // fragments that are not lost — they are queued behind it. Nothing distinguishes the
+                // two locally, which is why the client reports the late arrivals it can count:
+                // requests that *were* answered, after the frame was gone. Subtract them, then let
+                // the controller look at what is left. Without this it read a queued receiver as a
+                // lossy link and answered with parity, which queued behind the same backlog — 50 %
+                // of the fresh traffic at the layout's ceiling, repairing 3 frames in 4 200.
+                self.loss_window.fragments_requested =
+                    self.loss_window.fragments_requested.saturating_sub(*late as u64);
+                self.adapt_parity();
+
                 FeedbackOutcome::QueueDelay { micros: *micros }
             }
         }

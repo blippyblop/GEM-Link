@@ -173,7 +173,7 @@ pub enum MediaPlaneAction {
     Reset { stalled_for: Duration },
     /// The client's own queueing delay, to be carried back to the sender. The only message either
     /// end sends that is about the *receiver* rather than a frame.
-    QueueDelay { micros: u32 },
+    QueueDelay { micros: u32, late: u32 },
 }
 
 /// The client's video receive path, driven by a socket.
@@ -257,8 +257,8 @@ impl MediaPlaneReceiver {
                     Some(MediaPlaneAction::AskForKeyframe { stalled_for })
                 }
                 PlaneEvent::Reset { stalled_for } => Some(MediaPlaneAction::Reset { stalled_for }),
-                PlaneEvent::QueueDelay { micros } => {
-                    Some(MediaPlaneAction::QueueDelay { micros })
+                PlaneEvent::QueueDelay { micros, late } => {
+                    Some(MediaPlaneAction::QueueDelay { micros, late })
                 }
             })
             .collect();
@@ -339,7 +339,7 @@ pub enum PlaneEvent {
     Reset { stalled_for: Duration },
     /// How far behind the client is reading, for the sender. See
     /// [`FeedbackOutcome::QueueDelay`](x_transport::FeedbackOutcome::QueueDelay).
-    QueueDelay { micros: u32 },
+    QueueDelay { micros: u32, late: u32 },
 }
 
 /// Counters, because a receive path whose behaviour is only visible in the picture cannot be
@@ -422,6 +422,9 @@ pub struct VideoPlane {
     /// property of the receiver measured over many frames, and a control loop fed per-frame noise is
     /// one that oscillates.
     frames_since_queue_report: u32,
+    /// The receiver's late-datagram count at the last queue report, so each report carries the
+    /// delta rather than the running total.
+    last_late_reported: u64,
 }
 
 impl VideoPlane {
@@ -437,6 +440,7 @@ impl VideoPlane {
             started: now,
             stats: PlaneStats::default(),
             frames_since_queue_report: 0,
+            last_late_reported: 0,
         }
     }
 
@@ -606,10 +610,18 @@ impl VideoPlane {
         if self.frames_since_queue_report >= QUEUE_REPORT_FRAMES {
             self.frames_since_queue_report = 0;
             let micros = self.receiver.queue_delay_us();
-            if micros > 0 {
+            // The late count since the last report: fragments that arrived *after* their frame was
+            // released. They were asked for, they came, and they were discarded — so they are the
+            // part of the sender's loss signal that is not loss. See `Feedback::QueueDelay`.
+            let late_total = self.receiver.stats().datagrams_late;
+            let late = late_total.saturating_sub(self.last_late_reported);
+            self.last_late_reported = late_total;
+
+            if micros > 0 || late > 0 {
                 self.stats.queue_delay_reports += 1;
                 events.push(PlaneEvent::QueueDelay {
                     micros: micros.min(u32::MAX as u64) as u32,
+                    late: late.min(u32::MAX as u64) as u32,
                 });
             }
         }
