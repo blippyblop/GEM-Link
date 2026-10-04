@@ -26,6 +26,21 @@ const LADDER_MISSING_FROM_PERMILLE: u32 = 20;
 /// that takes it away, so the two do not meet in the middle and oscillate.
 const LADDER_MISSING_RECOVER_PERMILLE: u32 = 5;
 
+/// The frame the bootstrap is willing to send, in bytes: about eighteen datagrams, which at the
+/// measured read rate of this rig is under a tenth of a second of reading.
+const BOOTSTRAP_FRAME_BYTES: usize = 24_000;
+
+/// How much smaller each bootstrap retry asks for.
+const BOOTSTRAP_SHRINK: f64 = 0.6;
+
+/// How much of the measured read rate the sender plans to use. See
+/// [`BitrateManager::delivery_budget_per_sec`]: under one, because the sensor is a lower bound.
+const DELIVERY_BUDGET_FRACTION: f64 = 0.7;
+
+/// The smallest frame worth sending, in bytes. Below it a frame is a few shards of nothing, and the
+/// honest lever is fewer frames per second rather than an unreadable picture.
+const MIN_FRAME_BYTES: f64 = 6_000.0;
+
 /// The share of a frame missing at which the client is 'drowning' — the point at which asking it to
 /// repair its own frames is asking it to add to the congestion that is losing them.
 const NACK_DROWNING_PERMILLE: u32 = 100;
@@ -101,6 +116,30 @@ pub struct BitrateManager {
     /// on it. Coming down is proportional to the deficit; going back up is one step per clean report,
     /// because that is the half where being slow costs nothing.
     degrade_bitrate_bps: Option<f32>,
+    /// **The delivery budget: datagrams per second the client can actually read.**
+    ///
+    /// One number, derived from the read-rate sensor the client reports, and everything else is solved
+    /// from it: how many bytes a frame may be, how many datagrams a frame may take, how many frames
+    /// per second fit, and whether a keyframe is even sendable. It replaces the proportional bitrate
+    /// cap, which could not bind because it was derived from a queueing delay that a client completing
+    /// nothing never produces.
+    ///
+    /// Seventy percent of what the client has shown it can read, because the sensor is a **lower
+    /// bound**: it only ever measured a client being offered exactly what it could take. Planning at
+    /// the measured rate would plan at the offered load and stay there.
+    delivery_budget_per_sec: Option<f64>,
+    /// What the client measured, kept for reporting: the sensor's own number, before the margin.
+    read_ceiling_per_sec: u32,
+    /// The media plane's shape, without which a datagram budget cannot be turned into bytes: how many
+    /// payload bytes a shard carries, and the fraction of extra shards the FEC adds.
+    shard_bytes: usize,
+    parity_ratio: f32,
+    /// Whether the stream is in its bootstrap, and how big the frame it is willing to send may be.
+    /// See [`BitrateManager::set_bootstrap`].
+    bootstrap: bool,
+    bootstrap_target_bytes: usize,
+    /// The last read-rate report's age, so a budget built on a stale measurement can be distrusted.
+    read_report_at: Option<Instant>,
     /// How many frames the ladder is currently dropping for every one it sends.
     ///
     /// **State, not a function of the last report.** The deficit says how much too much is being
@@ -149,6 +188,13 @@ impl BitrateManager {
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
             client_queue_delay_us: None,
             client_missing_permille: None,
+            delivery_budget_per_sec: None,
+            read_ceiling_per_sec: 0,
+            read_report_at: None,
+            shard_bytes: 1_360,
+            parity_ratio: 0.0,
+            bootstrap: false,
+            bootstrap_target_bytes: BOOTSTRAP_FRAME_BYTES,
             degrade_bitrate_bps: None,
             degrade_divisor: 1,
             last_returned_bitrate_bps: None,
@@ -165,6 +211,69 @@ impl BitrateManager {
     /// Not a frame fact and not a server fact: it is the receiver telling the sender to send less.
     pub fn report_client_queue_delay(&mut self, micros: u32) {
         self.client_queue_delay_us = Some(micros);
+    }
+
+    /// Record what the client says it read: the sensor the whole budget is built on.
+    ///
+    /// The maximum over the client's window, so a burst is not averaged away. Deliberately not
+    /// smoothed here as well: the client already reports a maximum over a quarter of a second, and a
+    /// second smoothing would make the budget a memory of a link rather than a measurement of one.
+    pub fn report_client_read_rate(&mut self, per_sec: u32) {
+        self.read_ceiling_per_sec = per_sec;
+        self.read_report_at = Some(Instant::now());
+        if per_sec > 0 {
+            self.delivery_budget_per_sec = Some(per_sec as f64 * DELIVERY_BUDGET_FRACTION);
+        }
+    }
+
+    /// Tell the manager the media plane's shape, so a datagram budget can become a byte budget.
+    ///
+    /// Not derivable here: the shard size comes from the packet size on the wire and the ratio from
+    /// the FEC policy the sender is currently running, and both live with the sender.
+    pub fn set_media_shape(&mut self, shard_bytes: usize, parity_ratio: f32) {
+        self.shard_bytes = shard_bytes.max(1);
+        self.parity_ratio = parity_ratio.max(0.0);
+    }
+
+    /// Enter or leave the **bootstrap**, in which the encoder is asked for one small intra frame at a
+    /// time. See [`MediaSender::set_stop_and_wait`](x_transport::MediaSender::set_stop_and_wait) for
+    /// the wire half of it; this is the half that sizes the frame.
+    pub fn set_bootstrap(&mut self, on: bool) {
+        self.bootstrap = on;
+    }
+
+    pub fn is_bootstrap(&self) -> bool {
+        self.bootstrap
+    }
+
+    /// How many bytes the bootstrap frame may be.
+    ///
+    /// Default: about eighteen datagrams. A frame the client can read in under a tenth of a second at
+    /// the rate it has shown — measured, a 77 KB keyframe is 64 datagrams and 220 ms of pure reading,
+    /// which is why the stream never started.
+    pub fn bootstrap_target_bytes(&self) -> usize {
+        self.bootstrap_target_bytes
+    }
+
+    /// Ask for a smaller bootstrap frame after one was lost, and return the new size.
+    ///
+    /// The retry the bootstrap needs: a frame that did not arrive in the time its size implied was
+    /// too big for the client, and repeating the same one repeats the failure. Shrinking is
+    /// multiplicative for the same reason the FEC ratio's step is.
+    pub fn shrink_bootstrap(&mut self) -> usize {
+        let smaller = (self.bootstrap_target_bytes as f64 * BOOTSTRAP_SHRINK) as usize;
+        self.bootstrap_target_bytes = smaller.max(MIN_FRAME_BYTES as usize);
+        self.bootstrap_target_bytes
+    }
+
+    /// The delivery budget in datagrams per second, or `None` before the client has measured one.
+    pub fn delivery_budget_per_sec(&self) -> Option<f64> {
+        self.delivery_budget_per_sec
+    }
+
+    /// What the client measured before the margin. Zero until it has measured anything.
+    pub fn read_ceiling_per_sec(&self) -> u32 {
+        self.read_ceiling_per_sec
     }
 
     /// Record what share of each frame's declared shards the client says never arrived.
@@ -522,6 +631,39 @@ impl BitrateManager {
             }
         }
 
+        // ---------------------------------------------------------------------------------------
+        // **The budget, and the one number everything is solved from.**
+        //
+        // The client reports the fastest it has read datagrams; the budget is seventy percent of that
+        // (the measurement is a lower bound, so planning at it would plan at the offered load). From
+        // the budget: the frame rate that keeps a frame above the size at which it is a picture, and
+        // then the bytes that frame may be. The encoder is asked for a rate whose *per-frame* share is
+        // that many bytes — the C++ side derives its VBV from `bitrate / framerate`, so the frame size
+        // is controlled exactly by what is asked for here.
+        //
+        // This replaces the proportional bitrate cap. That cap could not bind: it was derived from a
+        // queueing delay, and a client that completes nothing never produces one. A datagram count
+        // measured off the socket is true even when every frame in the window was thrown away.
+        //
+        // In the bootstrap the same arithmetic is done against one small frame instead: the frame the
+        // whole stream is waiting for must be readable, not good.
+        // ---------------------------------------------------------------------------------------
+        let nominal_fps = 1.0 / frame_interval.as_secs_f32().max(1e-6);
+        if self.bootstrap {
+            let target_bytes = self.bootstrap_target_bytes as f32;
+            bitrate_bps = target_bytes * 8.0 * nominal_fps;
+            bitrate_directives.bootstrap_frame_bytes = Some(self.bootstrap_target_bytes);
+        } else if let Some(budget) = self.delivery_budget_per_sec {
+            let target_fps = self.frame_rate_for_budget(nominal_fps);
+            let bytes = self
+                .frame_bytes_budget(target_fps)
+                .unwrap_or(MIN_FRAME_BYTES as usize) as f32;
+            bitrate_bps = bytes * 8.0 * nominal_fps;
+            bitrate_directives.delivery_budget_per_sec = Some(budget as f32);
+            bitrate_directives.frame_bytes_budget = Some(bytes as usize);
+            bitrate_directives.target_frames_per_sec = Some(target_fps);
+        }
+
         // A reconfigure is a **full encoder re-initialisation** on the C++ side, so a value the
         // encoder already has is not worth sending — and now that the cap can make this function run
         // every frame in a constant-rate session, that matters. The adaptive path is left exactly as
@@ -554,6 +696,44 @@ impl BitrateManager {
         ))
     }
 
+    /// How many bytes a frame may be, given the budget and the frame rate that is being asked for.
+    ///
+    /// Parity counts *inside* the budget: a frame of N datagrams includes its repair shards, because
+    /// the repair shards are datagrams the client has to read, and a budget that forgot them would be
+    /// overrun by exactly the ratio the FEC is configured for.
+    pub fn frame_bytes_budget(&self, frames_per_sec: f32) -> Option<usize> {
+        let budget = self.delivery_budget_per_sec?;
+        if frames_per_sec <= 0.0 {
+            return None;
+        }
+        // A frame's share of the budget, converted to bytes with the shard size and the overhead the
+        // parity policy charges.
+        let datagrams_per_frame = budget / frames_per_sec as f64;
+        let payload_datagrams = datagrams_per_frame / (1.0 + self.parity_ratio as f64);
+        Some((payload_datagrams * self.shard_bytes as f64) as usize)
+    }
+
+    /// The frame rate to send at, given the budget: the nominal rate while each frame can still hold
+    /// enough bytes to be worth showing, then halved, and so on down to the floor.
+    ///
+    /// **Frame rate is the actuator, not the bitrate**, because it is the only one that keeps a frame
+    /// above the size at which it can be read at all. At a 190 datagram/s budget and 72 frames/s a
+    /// frame gets two and a half datagrams; at 15 frames/s it gets eleven, which is a picture. The
+    /// order the ladder owes — latency, then frame rate, then quality — is the same order this takes.
+    pub fn frame_rate_for_budget(&self, nominal_fps: f32) -> f32 {
+        let Some(_) = self.delivery_budget_per_sec else {
+            return nominal_fps;
+        };
+        let mut fps = nominal_fps;
+        while fps > 15.0 {
+            match self.frame_bytes_budget(fps) {
+                Some(bytes) if bytes as f64 >= MIN_FRAME_BYTES => break,
+                _ => fps /= 2.0,
+            }
+        }
+        fps.max(15.0)
+    }
+
     /// The second rung of the degradation ladder: how many frames to skip for every one sent.
     ///
     /// A function of how far behind the client says it is, in units of the frame interval — the only
@@ -561,6 +741,18 @@ impl BitrateManager {
     /// applies it to the media sender, which is where a frame can actually be dropped: the encoder is
     /// in another process, and skipping *there* would encode bits never sent.
     pub fn ladder_frame_divisor(&self) -> u32 {
+        // **From the budget.** The frame rate is the actuator: the budget says how many datagrams the
+        // client can read, and a frame needs a minimum number of them to be a picture, so the rate is
+        // whatever fits. Everything else the ladder used to do here — a queueing delay, an
+        // inferred deficit — was a proxy for a number the client can now simply report.
+        if self.delivery_budget_per_sec.is_some() {
+            let nominal_fps = 1.0 / self.nominal_frame_interval.as_secs_f32().max(1e-6);
+            let target_fps = self.frame_rate_for_budget(nominal_fps);
+            if target_fps > 0.0 {
+                return ((nominal_fps / target_fps).round() as u32).clamp(1, DEGRADE_MAX_FRAME_DIVISOR);
+            }
+        }
+
         // Two independent reasons to send fewer frames, and the larger answer wins.
         //
         // 1. **The client is behind**: it is reading slowly enough that the queue is backing up.

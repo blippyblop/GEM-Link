@@ -177,6 +177,7 @@ pub enum MediaPlaneAction {
         micros: u32,
         late_per_mille: u16,
         missing_per_mille: u16,
+        read_per_sec: u32,
     },
 }
 
@@ -265,10 +266,12 @@ impl MediaPlaneReceiver {
                     micros,
                     late_per_mille,
                     missing_per_mille,
+                    read_per_sec,
                 } => Some(MediaPlaneAction::QueueDelay {
                     micros,
                     late_per_mille,
                     missing_per_mille,
+                    read_per_sec,
                 }),
             })
             .collect();
@@ -296,6 +299,11 @@ impl MediaPlaneReceiver {
     /// Count an acknowledgement the caller sent. See [`VideoPlane::count_ack_sent`].
     pub fn count_ack_sent(&mut self) {
         self.plane.count_ack_sent()
+    }
+
+    /// The newest decoded frame and its bitmap. See [`VideoPlane::decoded_snapshot`].
+    pub fn decoded_snapshot(&self) -> Option<(u64, u64)> {
+        self.plane.decoded_snapshot()
     }
 
     /// The receiver's own account. See [`VideoPlane::receiver_account`].
@@ -371,6 +379,7 @@ pub enum PlaneEvent {
         micros: u32,
         late_per_mille: u16,
         missing_per_mille: u16,
+        read_per_sec: u32,
     },
 }
 
@@ -424,6 +433,9 @@ pub struct PlaneStats {
     /// what it buys, and both are zero on a link with no loss.
     pub frames_trusted_across_gap: u64,
     pub acks_sent: u64,
+    /// The newest read rate the client measured, for the summary. See
+    /// [`x_transport::Receiver::read_per_sec`].
+    pub read_per_sec: u32,
 }
 
 impl PlaneStats {
@@ -433,7 +445,7 @@ impl PlaneStats {
              ({} across a hole on a confirmed reference), {} held ({} no-keyframe, {} gap, {} \
              datagram-loss, {} unconfirmed-reference, {} decoder), {} abandoned, \
              {} repaired by FEC, {} keyframe(s) in ({} clean), {} nack(s) ({} suppressed while \
-             drowning), {} keyframe request(s), {} reset(s), {} ack(s)",
+             drowning), {} keyframe request(s), {} reset(s), {} ack(s); read {} datagram(s)/s",
             self.datagrams_received,
             self.datagrams_dropped_by_source,
             self.datagrams_rejected,
@@ -454,11 +466,22 @@ impl PlaneStats {
             self.keyframe_requests,
             self.resets,
             self.acks_sent,
+            self.read_per_sec,
         )
     }
 }
 
-const QUEUE_REPORT_FRAMES: u32 = 30;
+/// How often the client reports on itself. A quarter of a second: short enough that the sender's
+/// budget follows a changing link, long enough that the numbers are about the link rather than about
+/// one frame — and, unlike a frame count, it does not become infinite when frames stop completing.
+const REPORT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the read-rate sensor takes to close a window.
+///
+/// A quarter of the second the sender hears about, and the same period on purpose: the number in a
+/// report is then the fastest the client read in the interval the report covers, rather than a
+/// maximum carried over from an older one.
+const READ_SENSOR_WINDOW: Duration = Duration::from_millis(250);
 
 /// Above this share of a frame's declared shards missing, the client stops asking for repairs.
 ///
@@ -481,10 +504,15 @@ pub struct VideoPlane {
     stall: StuckDetector,
     started: Instant,
     stats: PlaneStats,
-    /// Frames released since the last queue-delay report. The report is deliberately slow: it is a
-    /// property of the receiver measured over many frames, and a control loop fed per-frame noise is
-    /// one that oscillates.
+    /// Frames released since the last report, kept for the summary's shape rather than for cadence:
+    /// the report itself is on a clock, so that a client completing nothing still reports.
     frames_since_queue_report: u32,
+    /// When the last report went out.
+    last_report: Instant,
+    /// Whether this plane has ever reported. The first report is sent **immediately**, not after a
+    /// quarter of a second: it is the one that tells the sender what the client can read, and every
+    /// mechanism downstream — the budget, the frame size, the stop-and-wait retry — is waiting for it.
+    never_reported: bool,
     /// Which frame indices this client has **decoded**, bounded to the last
     /// [`x_transport::DecodeHistory::WINDOW`] indices.
     ///
@@ -524,6 +552,8 @@ impl VideoPlane {
             started: now,
             stats: PlaneStats::default(),
             frames_since_queue_report: 0,
+            last_report: now,
+            never_reported: true,
             decoded: x_transport::DecodeHistory::default(),
             shown: x_transport::DecodeHistory::default(),
             failed: x_transport::DecodeHistory::default(),
@@ -601,6 +631,10 @@ impl VideoPlane {
             match source.recv(&mut buffer, Duration::ZERO) {
                 SourceEvent::Datagram => {
                     self.stats.datagrams_received += 1;
+                    // Every datagram feeds the read-rate sensor *and* the receiver: the sensor is of
+                    // what was read, which is a fact about datagrams that were late, duplicated or
+                    // foreign as much as about the ones that went into a frame.
+                    self.receiver.observe_read_rate(clock, READ_SENSOR_WINDOW);
                     match self.receiver.on_datagram(&buffer, clock) {
                         RecvEvent::Rejected(_) => self.stats.datagrams_rejected += 1,
                         // Duplicates and late arrivals are counted by the receiver's own stats;
@@ -703,12 +737,17 @@ impl VideoPlane {
             });
         }
 
-        // Tell the sender how far behind the client is reading. This is the one signal that lets the
-        // sender fix the problem instead of the receiver working around it: everything the client can
-        // see about a *frame* is ambiguous (lost, or merely queued), but the drain spread is not.
+        // Tell the sender how far behind the client is reading, and how fast it can read at all.
+        //
+        // **Time-based, not frame-based.** The cadence was thirty frames, which is a different real
+        // interval on every link and *infinite* on a client that completes nothing — and a client that
+        // completes nothing is exactly the one the sender needs to hear from. A quarter of a second is
+        // a quarter of a second whether or not a frame made it.
         self.frames_since_queue_report += 1;
-        if self.frames_since_queue_report >= QUEUE_REPORT_FRAMES {
-            self.frames_since_queue_report = 0;
+        let due = now.saturating_duration_since(self.last_report) >= REPORT_INTERVAL;
+        if due || self.never_reported {
+            self.never_reported = false;
+            self.last_report = now;
             let micros = self.receiver.queue_delay_us();
             // The late count since the last report: fragments that arrived *after* their frame was
             // released. They were asked for, they came, and they were discarded — so they are the
@@ -732,15 +771,18 @@ impl VideoPlane {
             // stream, which on the live rig left the ladder on its mildest rung while every frame
             // became a hole.
             let missing_per_mille = self.receiver.stats().missing_permille.min(1000) as u16;
+            // The sensor that works when nothing completes. Taken as the maximum over the interval
+            // just ended, so a burst of traffic is not averaged away by the quiet around it.
+            let read_per_sec = self.receiver.take_read_rate();
+            self.stats.read_per_sec = read_per_sec;
 
-            if micros > 0 || late_per_mille > 0 || missing_per_mille > 0 {
-                self.stats.queue_delay_reports += 1;
-                events.push(PlaneEvent::QueueDelay {
-                    micros: micros.min(u32::MAX as u64) as u32,
-                    late_per_mille,
-                    missing_per_mille,
-                });
-            }
+            self.stats.queue_delay_reports += 1;
+            events.push(PlaneEvent::QueueDelay {
+                micros: micros.min(u32::MAX as u64) as u32,
+                late_per_mille,
+                missing_per_mille,
+                read_per_sec,
+            });
         }
 
         events
@@ -805,6 +847,12 @@ impl VideoPlane {
                 Decision::Held(reason)
             }
         }
+    }
+
+    /// The newest frame this plane has decoded and the bitmap behind it, for an acknowledgement.
+    /// See [`x_transport::DecodeHistory::snapshot`].
+    pub fn decoded_snapshot(&self) -> Option<(u64, u64)> {
+        self.decoded.snapshot()
     }
 
     /// Tell the plane that a frame was decoded and is in the decoder's reference chain.
@@ -1177,22 +1225,37 @@ mod tests {
         let mut plane = VideoPlane::new(policy(), None, Instant::now());
         let now = Instant::now();
 
-        assert!(plane.release(now).is_empty());
+        // The plane reports on itself the moment it exists — a quarter of a second later would be a
+        // quarter of a second in which the sender knows nothing about a client that may be able to
+        // read far less than it thinks.
+        let first = plane.release(now);
+        assert!(
+            matches!(first.as_slice(), [PlaneEvent::QueueDelay { .. }]),
+            "a new plane does not introduce itself: {first:?}"
+        );
         assert_eq!(plane.stats().keyframe_requests, 0);
 
         let asked = plane.release(now + crate::stall::ASK_FOR_KEYFRAME_AFTER);
         assert!(
-            matches!(asked.as_slice(), [PlaneEvent::AskForKeyframe { .. }]),
+            asked
+                .iter()
+                .any(|e| matches!(e, PlaneEvent::AskForKeyframe { .. })),
             "no keyframe request after the ask threshold: {asked:?}"
         );
         assert_eq!(plane.stats().keyframe_requests, 1);
 
-        assert!(plane.release(now + Duration::from_millis(500)).is_empty());
-        assert_eq!(plane.stats().keyframe_requests, 1, "it asked twice");
+        assert!(
+            !plane
+                .release(now + Duration::from_millis(500))
+                .iter()
+                .any(|e| matches!(e, PlaneEvent::AskForKeyframe { .. })),
+            "it asked twice"
+        );
+        assert_eq!(plane.stats().keyframe_requests, 1);
 
         let reset = plane.release(now + crate::stall::HARD_RESET_AFTER);
         assert!(
-            matches!(reset.as_slice(), [PlaneEvent::Reset { .. }]),
+            reset.iter().any(|e| matches!(e, PlaneEvent::Reset { .. })),
             "no reset after the reset threshold: {reset:?}"
         );
         assert_eq!(plane.stats().resets, 1);

@@ -590,12 +590,19 @@ fn connection_pipeline(
                                             media_feedback_socket.accept_only_from(peer);
                                         }
                                     }
-                                    if feedback_peer.is_some() {
-                                        let ack = x_transport::Feedback::Ack {
-                                            frame_index: header.frame_index,
-                                        };
+                                    // **Sent twice, and it carries the bitmap.** The acknowledgement is
+                                    // the single point of failure of the reference scheme: the encoder
+                                    // may only reference frames this client has confirmed, so one lost
+                                    // datagram must not read as a client that decoded nothing. Two
+                                    // copies cost two datagrams, and the bitmap means the second one
+                                    // repairs the first even if it arrives alone.
+                                    if let Some((newest, mask)) = plane.decoded_snapshot()
+                                        && feedback_peer.is_some()
+                                    {
+                                        let ack = x_transport::Feedback::Ack { newest, mask };
                                         let mut sealed = [0u8; x_transport::MAX_FEEDBACK_LEN];
                                         if let Ok(len) = feedback_sender.seal(&ack, &mut sealed) {
+                                            let _ = media_feedback_socket.send(&sealed[..len]);
                                             let _ = media_feedback_socket.send(&sealed[..len]);
                                             plane.count_ack_sent();
                                         }
@@ -661,6 +668,7 @@ fn connection_pipeline(
                             micros,
                             late_per_mille,
                             missing_per_mille,
+                            read_per_sec,
                         } => {
                             // The client's own queueing delay, carried back so the sender can send
                             // *less*. Every other message either end sends is about a frame; this is
@@ -681,12 +689,26 @@ fn connection_pipeline(
                                 micros,
                                 late_per_mille,
                                 missing_per_mille,
+                                read_per_sec,
                             };
                             let mut sealed = [0u8; x_transport::MAX_FEEDBACK_LEN];
                             let Ok(len) = feedback_sender.seal(&feedback, &mut sealed) else {
                                 continue;
                             };
                             let _ = media_feedback_socket.send(&sealed[..len]);
+
+                            // **And the acknowledgement again, on the clock.** A client that has just
+                            // stopped completing frames has the most to say and the fewest
+                            // opportunities to say it: this is the same bitmap, repeated, so that a
+                            // quiet client is distinguishable from a dead one — and so that a burst of
+                            // lost acknowledgements is repaired by the next report rather than by the
+                            // next decoded frame, which may never come.
+                            if let Some((newest, mask)) = plane.decoded_snapshot() {
+                                let ack = x_transport::Feedback::Ack { newest, mask };
+                                if let Ok(len) = feedback_sender.seal(&ack, &mut sealed) {
+                                    let _ = media_feedback_socket.send(&sealed[..len]);
+                                }
+                            }
                         }
                     }
                 }

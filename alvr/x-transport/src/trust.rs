@@ -249,6 +249,17 @@ impl DecodeHistory {
     pub fn newest(&self) -> Option<u64> {
         self.anything.then_some(self.newest)
     }
+
+    /// The newest index and the bitmap behind it, for an acknowledgement.
+    ///
+    /// **Both, because an acknowledgement has to be able to repair a lost one.** The bitmap says what
+    /// the last sixty-four frames did, so an acknowledgement that arrives after one was dropped
+    /// restores the whole picture rather than only the frame it names — which is what keeps a single
+    /// lost datagram from looking like a client that decoded nothing, and the client's decoded frames
+    /// from being written off by the sender's encoder.
+    pub fn snapshot(&self) -> Option<(u64, u64)> {
+        self.anything.then_some((self.newest, self.bits))
+    }
 }
 
 /// Decides what the client may present.

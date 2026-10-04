@@ -280,6 +280,22 @@ pub struct ReceiverStats {
     /// attempts to fix the repair path made it worse instead.
     pub queue_delay_us: u64,
     pub queue_delay_max_us: u64,
+    /// **Datagrams read per second**, as a maximum over the reporting window, and the raw counters it
+    /// comes from.
+    ///
+    /// The sensor that works when nothing else does. Every other number here is a property of a frame
+    /// — the drain spread needs one that completed, the missing share needs one that was released —
+    /// and a client that cannot read a single keyframe produces neither. This counts datagrams off the
+    /// socket, which is a fact even when every frame in the window was thrown away.
+    ///
+    /// A **lower bound** on capacity, because a reader that is never offered more than it can take
+    /// reads exactly what it is offered: the sender is expected to overshoot occasionally so that this
+    /// finds a ceiling rather than a description of its own pacing.
+    pub read_per_sec: u32,
+    /// Datagrams and microseconds since the last sensor window closed, so the window's rate can be
+    /// taken and the maximum kept.
+    pub window_datagrams: u64,
+    pub window_started_us: u64,
     /// How much of each frame's **declared** shards actually arrived, in tenths of a percent missing,
     /// as an EWMA over every frame that finished — usable or not.
     ///
@@ -428,6 +444,10 @@ impl PartialFrame {
     }
 }
 
+/// The read rate assumed before the client has measured one. Low on purpose: it makes the first hold
+/// generous, and a hold that is too long costs latency while one that is too short costs the frame.
+const MIN_READ_RATE_PER_SEC: u64 = 50;
+
 /// Reassembles frames from datagrams.
 pub struct Receiver {
     policy: ReleasePolicy,
@@ -471,6 +491,56 @@ impl Receiver {
         self.stats.queue_delay_us
     }
 
+    /// The reading-rate sensor: close the window if it is due, and return the maximum rate seen.
+    ///
+    /// Called on **every** datagram, before anything is decided about it, because the whole point is
+    /// to count what was read rather than what was usable. `window` is how long a window lasts; the
+    /// caller reports the maximum to the sender and the sender plans against it.
+    pub fn observe_read_rate(&mut self, now: Duration, window: Duration) -> u32 {
+        let started = self.stats.window_started_us;
+        let now_us = now.as_micros() as u64;
+        if now_us.saturating_sub(started) < window.as_micros() as u64 {
+            return self.stats.read_per_sec;
+        }
+        let elapsed_us = now_us.saturating_sub(started).max(1);
+        let rate = (self.stats.window_datagrams as f64 * 1_000_000.0 / elapsed_us as f64) as u32;
+        // The maximum, not the mean: a window in which the sender offered more than usual is the only
+        // one that says anything about capacity, and a mean over a mostly-idle link reads as a slow
+        // client.
+        self.stats.read_per_sec = self.stats.read_per_sec.max(rate);
+        self.stats.window_datagrams = 0;
+        self.stats.window_started_us = now_us;
+        self.stats.read_per_sec
+    }
+
+    /// Close the sensor window and start a fresh maximum, for a caller that has reported the current
+    /// one. The maximum is per reporting interval, so a burst is not averaged away by the minutes
+    /// around it.
+    pub fn take_read_rate(&mut self) -> u32 {
+        std::mem::take(&mut self.stats.read_per_sec)
+    }
+
+    /// How long this frame needs to be read at the rate the client has been able to sustain.
+    ///
+    /// **The window a frame's own size implies.** A fixed release window is a statement about a frame
+    /// of average size, and the frame that matters — the one that must complete for anything to work
+    /// — is the biggest one there is: measured, a 77 KB keyframe is about sixty-four datagrams, and at
+    /// 285 datagrams/s that is 220 ms of pure reading against windows of 6, 12 and 66 ms. So the
+    /// hold is derived per frame from what it declares: shards divided by the read rate, plus half
+    /// again as margin for the stragglers and the round trip the *repair* will take.
+    pub fn hold_for_frame(&self, declared_shards: usize) -> Duration {
+        if self.stats.read_per_sec == 0 {
+            // No reading has been measured yet, so there is nothing to derive a window from. The
+            // policy's own window is then the only honest answer, and it is what the caller falls
+            // back to. (A default rate here would be a guess dressed as a measurement, and the guess
+            // would be wrong in whichever direction the link is unlike the one it was written for.)
+            return Duration::ZERO;
+        }
+        let read = (self.stats.read_per_sec as u64).max(MIN_READ_RATE_PER_SEC);
+        let reading_us = declared_shards as u64 * 1_000_000 / read;
+        Duration::from_micros(reading_us + reading_us / 2 + 5_000)
+    }
+
     /// Take the counters, resetting them. For a session logger that reports deltas.
     pub fn take_stats(&mut self) -> ReceiverStats {
         std::mem::take(&mut self.stats)
@@ -484,6 +554,9 @@ impl Receiver {
     /// Take one datagram.
     pub fn on_datagram(&mut self, datagram: &[u8], now: Duration) -> RecvEvent {
         self.stats.datagrams_received += 1;
+        // Counted before it is judged: the sensor is of what was *read*, and a datagram that is late,
+        // duplicated, malformed or foreign still cost the time it took to read.
+        self.stats.window_datagrams += 1;
 
         let (header, body) = match FragmentHeader::decode(datagram) {
             Ok(parsed) => parsed,
@@ -638,12 +711,21 @@ impl Receiver {
             let waited = now.saturating_sub(frame.first_arrival);
             let stragglers_over = waited >= self.policy.straggler_delay;
 
+            // How long this frame may have, from its own size and the rate the client has shown it can
+            // read at. Never less than the policy's window: a frame small enough to read instantly
+            // still gets the round trip a repair needs.
+            let hold = self
+                .policy
+                .repair_delay
+                .max(self.hold_for_frame(frame.data_count as usize + frame.parity_count as usize));
+            let hold_over = waited >= hold;
+
             // Complete: nothing to wait for.
             // FEC can rebuild it: the data is here, so stop waiting for the stragglers.
             // Otherwise: hold it, unless the stream has moved on without it.
             let due = frame.has_all_data()
                 || (stragglers_over && frame.fec_repairable())
-                || (waited >= self.policy.repair_delay
+                || (hold_over
                     && self.newer_frames_behind(*index) >= self.policy.late_hold_frames as usize);
 
             if due {

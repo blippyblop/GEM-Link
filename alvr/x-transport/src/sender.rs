@@ -169,19 +169,17 @@ pub enum FeedbackOutcome {
         micros: u32,
         /// What share of each frame's declared shards never arrived, in tenths of a percent.
         missing_per_mille: u16,
+        /// Datagrams per second the client read in its last window, at its fastest. See
+        /// [`Feedback::QueueDelay`] in `x_transport::feedback` — the sensor that survives a client
+        /// which completes nothing, and the number a delivery budget can be built from.
+        read_per_sec: u32,
     },
-    /// **This frame was decoded.** The one message that is not a complaint: the sender now knows a
-    /// frame it sent arrived *and worked*, which is what the encoder needs in order to reference only
-    /// frames the client has, and what the loss estimate needs in order to stop inferring loss from
-    /// repair requests. See [`Feedback::Ack`].
+    /// **This frame was decoded**, and which of the frames behind it were. See [`Feedback::Ack`].
     Acknowledged {
-        frame_index: u64,
-        /// The newest frame the client has decoded, which is what the encoder may reference. Not
-        /// the same as `frame_index` when acks arrive out of order or one is lost.
+        /// The newest frame the client has decoded, which is what the encoder may reference.
         newest: u64,
-        /// Frames sent before `newest` that the client has now said nothing about, i.e. that it could
-        /// not use. The honest loss number.
-        frames_unusable: u64,
+        /// Which of the frames at or behind `newest` were decoded, bit `i` meaning `newest - i`.
+        mask: u64,
     },
 }
 
@@ -218,6 +216,16 @@ pub struct SenderStats {
     /// [`MediaSender::set_frame_divisor`]: the second rung of the degradation ladder, below latency
     /// and above quality.
     pub frames_skipped_for_rate: u64,
+    /// Acknowledgements that ended a stop-and-wait bootstrap, and waits that expired instead.
+    ///
+    /// The pair is the bootstrap's whole report: one of them means the stream started, and a run of
+    /// timeouts with no acknowledgements means the frame being sent is still too big for the client
+    /// to read, which is a number worth having rather than an error to hide.
+    pub bootstrap_acks: u64,
+    pub bootstrap_timeouts: u64,
+    /// Frames not sent because the bootstrap was waiting for the one before. Normally zero outside a
+    /// bootstrap, and large inside one — the wait is the mechanism.
+    pub frames_held_for_bootstrap: u64,
     /// Repair requests refused because the client had already acknowledged the frame.
     pub repairs_refused_delivered: u64,
     pub repairs_refused_expired: u64,
@@ -404,6 +412,15 @@ const MAX_OUTSTANDING_ACKS: usize = 360;
 /// A quarter of a second is several round trips on any link this plane is built for.
 const ACK_FRESHNESS: Duration = Duration::from_millis(250);
 
+/// How long a stop-and-wait bootstrap frame is given before it is written off and a smaller one is
+/// asked for.
+///
+/// The frame is sized so that this is generous for a client reading at the rate it has shown: a
+/// twenty-datagram frame at 285 datagrams/s is 70 ms of reading, and the round trip for its
+/// acknowledgement is tens of milliseconds on this link class. A timeout that fires too early costs a
+/// retry; one that fires too late costs the bootstrap, which is the whole stream.
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_millis(400);
+
 /// The ratio a fixed policy stands for, for a controller that has to start somewhere.
 ///
 /// `ParityPolicy::Fixed` is a shard *count* rather than a fraction, so it has no fraction to
@@ -482,6 +499,35 @@ pub struct MediaSender {
     /// dropping safe is a *live* acknowledgement loop — the encoder can only route around a hole it
     /// has been told about.
     last_ack_at: Option<Duration>,
+    /// The newest acknowledgement's bitmap, for answering "was this exact frame decoded". A cursor
+    /// cannot answer it: a client that skipped a frame still acknowledges later ones.
+    acked_recent: u64,
+    acked_recent_newest: u64,
+    /// How many datagrams per second the client last said it read.
+    reported_read_per_sec: u32,
+    /// **Stop-and-wait, while nothing has ever been acknowledged.**
+    ///
+    /// Some frame index, and the frame it names is in flight: nothing else may be sent until it is
+    /// answered or its wait expires. This is the bootstrap, and it exists because everything else in
+    /// this plane assumes at least one acknowledgement — the encoder references confirmed frames, the
+    /// ladder reduces on the client's deficit, and the trust gate presents across holes — so a client
+    /// that completes nothing never reaches any of it.
+    ///
+    /// Measured on the rig: 2038 frames completed, 2 presented, 0 acknowledgements, because the
+    /// keyframe that would have bootstrapped the stream was ~64 datagrams and 220 ms of reading
+    /// against release windows of 6, 12 and 66 ms with the stream still sending behind it.
+    bootstrap_waiting: Option<u64>,
+    /// When the stop-and-wait began, so a caller can time it out and ask for something smaller.
+    bootstrap_started: Option<Duration>,
+    /// How long to wait for the bootstrap frame before giving up on it.
+    bootstrap_timeout: Duration,
+    /// Frames the bootstrap did not send because it was waiting for the one before.
+    frames_held_for_bootstrap: u64,
+    /// Whether the stop-and-wait bootstrap is armed. See the note in `send_frame`.
+    stop_and_wait: bool,
+    /// Set when a bootstrap wait expired, for the caller to take and act on — the action being
+    /// "ask the encoder for a smaller intra frame", because the one that was sent did not arrive.
+    bootstrap_timed_out: bool,
     send_seq: u32,
     /// Set by a keyframe request; the caller takes it and asks the encoder.
     pending_keyframe: Option<u64>,
@@ -529,6 +575,15 @@ impl MediaSender {
             frame_divisor: 1,
             frames_seen: 0,
             last_ack_at: None,
+            acked_recent: 0,
+            acked_recent_newest: 0,
+            reported_read_per_sec: 0,
+            bootstrap_waiting: None,
+            bootstrap_started: None,
+            bootstrap_timeout: BOOTSTRAP_TIMEOUT,
+            frames_held_for_bootstrap: 0,
+            stop_and_wait: false,
+            bootstrap_timed_out: false,
             send_seq: 0,
             pending_keyframe: None,
             resume_from: None,
@@ -617,6 +672,56 @@ impl MediaSender {
         &self.stats
     }
 
+    /// Whether the stream is in its bootstrap. See [`MediaSender::set_stop_and_wait`].
+    pub fn stop_and_wait(&self) -> bool {
+        self.stop_and_wait
+    }
+
+    /// Arm or disarm the stop-and-wait bootstrap.
+    ///
+    /// The caller owns the *policy* — this is armed while nothing has ever been acknowledged, and
+    /// again after the reference chain is lost — because that judgement is about the stream rather
+    /// than about the wire, and this type only knows what has been acknowledged.
+    pub fn set_stop_and_wait(&mut self, on: bool) {
+        if on && !self.stop_and_wait {
+            // Entering: whatever was in flight is not something to wait for.
+            self.bootstrap_waiting = None;
+            self.bootstrap_started = None;
+        }
+        self.stop_and_wait = on;
+    }
+
+    /// Take the fact that a bootstrap wait expired, for the caller to act on by asking the encoder
+    /// for a *smaller* intra frame.
+    pub fn take_bootstrap_timeout(&mut self) -> bool {
+        std::mem::take(&mut self.bootstrap_timed_out)
+    }
+
+    /// Whether this exact frame index has been acknowledged decoded.
+    ///
+    /// From the bitmap the client sends, not from a cursor: a client that skipped a frame still
+    /// acknowledges later ones, so "the newest acknowledgement is past this index" is not the same
+    /// question and does not have the same answer.
+    pub fn was_acked(&self, frame_index: u64) -> bool {
+        if self.client_acked_frame.is_none()
+            || frame_index == 0
+            || frame_index > self.acked_recent_newest
+        {
+            return false;
+        }
+        let distance = self.acked_recent_newest - frame_index;
+        if distance >= 64 {
+            return false;
+        }
+        (self.acked_recent >> distance) & 1 != 0
+    }
+
+    /// Datagrams per second the client last said it read. See
+    /// [`Feedback::QueueDelay::read_per_sec`](crate::Feedback::QueueDelay).
+    pub fn reported_read_per_sec(&self) -> u32 {
+        self.reported_read_per_sec
+    }
+
     /// The newest frame index the client has confirmed it decoded, or `None` before the first
     /// acknowledgement of a session.
     ///
@@ -656,6 +761,57 @@ impl MediaSender {
     ) -> FrameSend {
         self.stats.frames_sent += 1;
         self.frames_seen += 1;
+
+        // ---------------------------------------------------------------------------------------
+        // **The bootstrap: stop and wait.**
+        //
+        // Everything in this plane assumes at least one frame was acknowledged — the encoder
+        // references confirmed frames, the ladder reduces on the client's deficit, the trust gate
+        // presents across holes — and a client that completes nothing never gets there. So while
+        // nothing has been acknowledged, exactly one frame is in flight at a time: it is the only
+        // frame under pressure (so no later frame can take the slot away from it), the client's hold
+        // for it can be derived from its own size, and its acknowledgement is the thing the whole
+        // stream is waiting for.
+        //
+        // This is not a general mode. It is entered when there is nothing to lose — no
+        // acknowledgement has ever arrived — and left the moment one does.
+        // ---------------------------------------------------------------------------------------
+        if self.stop_and_wait {
+            if let Some(waiting) = self.bootstrap_waiting {
+                let waited = self.bootstrap_started.map_or(Duration::ZERO, |at| {
+                    now.saturating_sub(at)
+                });
+                if waited < self.bootstrap_timeout {
+                    self.frames_held_for_bootstrap += 1;
+                    self.pacer.schedule(0, now);
+                    return FrameSend {
+                        frame_index: meta.frame_index,
+                        datagrams: 0,
+                        parity_datagrams: 0,
+                        bytes: 0,
+                        refused: 0,
+                        paced_wait: self.pacer.next_send().saturating_sub(now),
+                        over_budget: false,
+                        layout: FrameLayout {
+                            frame_index: meta.frame_index,
+                            frame_len: 0,
+                            data_count: 0,
+                            parity_count: 0,
+                            blocks: 0,
+                            parity_per_block: 0,
+                            datagram_len: 0,
+                        },
+                    };
+                }
+                // The wait expired: the frame died, and the caller has been told (see
+                // `take_bootstrap_timeout`) to ask the encoder for something smaller. Count it here
+                // too, so a summary shows the retry even if nobody asked.
+                self.stats.bootstrap_timeouts += 1;
+                self.bootstrap_waiting = None;
+                self.bootstrap_timed_out = true;
+                let _ = waiting;
+            }
+        }
 
         // The frame-rate lever. A frame that is skipped is not sent, not cached and not owed an
         // acknowledgement — as far as the client and the encoder's reference loop are concerned it
@@ -780,7 +936,11 @@ impl MediaSender {
         // and because an acknowledgement that arrives later than this is not about a frame the
         // encoder could still use.
         self.outstanding.push_back(meta.frame_index);
-        while self.outstanding.len() > MAX_OUTSTANDING_ACKS {
+        // The bootstrap's one frame is now in flight, and nothing else goes until it is answered.
+        if self.stop_and_wait {
+            self.bootstrap_waiting = Some(meta.frame_index);
+            self.bootstrap_started = Some(now);
+        }        while self.outstanding.len() > MAX_OUTSTANDING_ACKS {
             if let Some(forgotten) = self.outstanding.pop_front() {
                 self.stats.frames_unacked += 1;
                 self.ack_window.unacked += 1;
@@ -976,6 +1136,7 @@ impl MediaSender {
                 micros,
                 late_per_mille,
                 missing_per_mille,
+                read_per_sec,
             } => {
                 self.stats.queue_delay_reports += 1;
                 self.stats.reported_queue_delay_us = *micros as u64;
@@ -1001,37 +1162,46 @@ impl MediaSender {
                 FeedbackOutcome::QueueDelay {
                     micros: *micros,
                     missing_per_mille: *missing_per_mille,
+                    read_per_sec: *read_per_sec,
                 }
             }
-            Feedback::Ack { frame_index } => {
+            Feedback::Ack { newest: acked, mask } => {
                 self.last_ack_at = Some(now);
-                let newest = self.client_acked_frame.map_or(*frame_index, |cur| cur.max(*frame_index));
+                let newest = self
+                    .client_acked_frame
+                    .map_or(*acked, |current| current.max(*acked));
                 self.client_acked_frame = Some(newest);
+                self.acked_recent = *mask;
+                self.acked_recent_newest = *acked;
                 self.stats.frames_acked += 1;
 
-                // Everything older that was still owed an acknowledgement, and that is not this
-                // frame, was never acknowledged: the client decoded a later frame without it. These
-                // are frames it could not use, which is the number the parity is bought against.
-                let mut unusable = 0u64;
+                // An acknowledgement ends the stop-and-wait, whatever it names: the frame that was
+                // being waited for has been answered, and getting *an* answer was the whole point.
+                if self.bootstrap_waiting.take().is_some() {
+                    self.stats.bootstrap_acks += 1;
+                }
+
+                // Every frame the client has now confirmed is delivered, whether or not this message
+                // named it — the bitmap is the repair for an acknowledgement that was lost, which is
+                // why it travels.
                 while let Some(&front) = self.outstanding.front() {
                     if front > newest {
                         break;
                     }
                     self.outstanding.pop_front();
-                    if front < newest {
-                        unusable += 1;
+                    if self.was_acked(front) {
+                        self.ack_window.acked += 1;
+                    } else {
                         self.stats.frames_unacked += 1;
                         self.ack_window.unacked += 1;
                     }
                 }
-                self.ack_window.acked += 1;
                 self.acks_seen += 1;
                 self.adapt_parity_from_acks();
 
                 FeedbackOutcome::Acknowledged {
-                    frame_index: *frame_index,
                     newest,
-                    frames_unusable: unusable,
+                    mask: *mask,
                 }
             }
         }
@@ -1326,6 +1496,7 @@ mod tests {
                 micros: 18_000,
                 late_per_mille: 1000,
                 missing_per_mille: 0,
+                read_per_sec: 300,
             },
             Duration::from_millis(110),
         );
@@ -1378,6 +1549,7 @@ mod tests {
                 micros: 18_000,
                 late_per_mille: 333,
                 missing_per_mille: 0,
+                read_per_sec: 0,
             },
             Duration::from_millis(110),
         );
@@ -1809,7 +1981,10 @@ mod tests {
         // The client decoded everything except frame 4, which it never mentions — and it resolved
         // that the moment it acknowledged frame 5.
         for frame in [1u64, 2, 3, 5, 6, 7, 8] {
-            sender.on_feedback(&mut sink, &Feedback::Ack { frame_index: frame }, Duration::ZERO);
+            sender.on_feedback(&mut sink, &Feedback::Ack {
+                newest: frame,
+                mask: 1,
+            }, Duration::ZERO);
         }
 
         assert_eq!(sender.stats().frames_acked, 7);
@@ -1836,7 +2011,10 @@ mod tests {
         sender.set_rtt(Duration::from_millis(4));
         let mut sink = Collector::new();
         sender.send_frame(&mut sink, meta(3, 100_000), &payload(4), Duration::ZERO);
-        sender.on_feedback(&mut sink, &Feedback::Ack { frame_index: 3 }, Duration::ZERO);
+        sender.on_feedback(&mut sink, &Feedback::Ack {
+                newest: 3,
+                mask: 1,
+            }, Duration::ZERO);
 
         let mut repairs = Collector::new();
         let outcome = sender.on_feedback(
@@ -1867,7 +2045,10 @@ mod tests {
         let mut sink = Collector::new();
         sender.send_frame(&mut sink, meta(1, 11_111), &payload(2), Duration::ZERO);
         sender.send_frame(&mut sink, meta(2, 22_222), &payload(2), Duration::ZERO);
-        sender.on_feedback(&mut sink, &Feedback::Ack { frame_index: 1 }, Duration::ZERO);
+        sender.on_feedback(&mut sink, &Feedback::Ack {
+                newest: 1,
+                mask: 1,
+            }, Duration::ZERO);
         sender.send_frame(&mut sink, meta(3, 33_333), &payload(2), Duration::ZERO);
 
         // Frame 2 is still owed an acknowledgement, so it is not yet written off either way.

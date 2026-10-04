@@ -237,12 +237,21 @@ void VideoEncoderNVENC::Transmit(
         usePrevious = true;
     } else if (confirmSlot >= 0) {
         useConfirmedLtr = true;
-    } else if (ackValid && recoveryAllowed() && params.degrade_starving == 0) {
-        // The client is talking to us and has confirmed nothing for a while, so the chain really is
-        // lost. Rate-limited, because a burst of keyframes is the congestion that lost the frame in
-        // the first place — and this is measured, not hypothetical: an earlier version of this code
-        // rebuilt on *every* unconfirmed frame, which turned a session into 77 KB keyframes at
-        // 44 Mbps, a client that could not read them, no acknowledgements, and therefore no way out.
+    } else if ((!ackValid || params.degrade_starving == 0) && recoveryAllowed()) {
+        // Nothing confirmed. Two cases, and they want the same thing:
+        //
+        //   * **Nothing has ever been acknowledged.** This is the bootstrap's own frame: the stream
+        //     cannot start without an intra frame the client can decode, so it is produced on demand.
+        //     The keyframe storm this branch once caused came from sending one per *composed* frame
+        //     with no wait in between; the sender now holds everything until this frame is answered,
+        //     so at most one is in flight.
+        //   * **The client is talking and the chain is lost.** A rebuild is the answer, rate-limited to
+        //     one per 100 ms, because a burst of keyframes on a link that is already behind is the
+        //     congestion that lost the frame in the first place.
+        //
+        // The one case that is *not* served here is a client that is starving while acknowledgements
+        // are flowing: a keyframe is several times any other frame, and spending one on a client that
+        // cannot receive the frames it is already being sent reclaims nothing.
         rebuild = true;
     } else {
         // **No acknowledgement has ever arrived, or the client is starving, so carry on as
@@ -334,10 +343,12 @@ void VideoEncoderNVENC::Transmit(
 
     NV_ENC_PIC_PARAMS picParams = {};
     if (insertIDR) {
-        // A sweep rebuilds the chain *progressively*, which needs a picture buffer to refresh from.
-        // The first frame of a session has none — the decoder has not even seen the parameter sets —
-        // so it is always a real IDR, whatever the settings say.
-        if (m_intraRefreshSweepFrames > 0 && m_lastEncodedFrameIndex != 0) {
+        // A sweep rebuilds the chain *progressively*, which needs two things the bootstrap does not
+        // have: a picture buffer to refresh from, and a client that has already seen one keyframe. Its
+        // frame has to be a real IDR — and the wire calls it a keyframe (`is_idr` is the *requested*
+        // flag, not the encoder's own answer), so a sweep here would be labelled a keyframe while the
+        // bitstream referenced a picture the client has never had.
+        if (m_intraRefreshSweepFrames > 0 && m_lastEncodedFrameIndex != 0 && ackValid) {
             // Rebuild the chain with a sweep rather than an IDR where the encoder supports it: the
             // same recovery, spread over several frames instead of one frame several times the size.
             // A keyframe-sized burst on a link that is already behind is the congestion that lost the

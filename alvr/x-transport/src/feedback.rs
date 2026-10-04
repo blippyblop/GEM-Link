@@ -105,6 +105,19 @@ pub enum Feedback {
     /// many frames, and a control loop fed per-frame noise is a control loop that oscillates.
     QueueDelay {
         micros: u32,
+        /// **Datagrams read per second**, as a maximum over the reporting window.
+        ///
+        /// The only sensor that survives a client which completes nothing. The queueing delay and the
+        /// missing-shard share are both properties of *frames* — they need frames to complete, or at
+        /// least to be released, and a client that cannot read a keyframe produces neither. This is
+        /// counting what came off the socket, which is true even when every frame in the window was
+        /// thrown away.
+        ///
+        /// It is a **lower bound** on capacity, not a measurement of it: a reader that is never
+        /// offered more than it can take reads exactly what it is offered. The sender is expected to
+        /// occasionally offer more than it should — a short back-to-back burst — precisely so that
+        /// this number finds the ceiling rather than the offered load.
+        read_per_sec: u32,
         /// What share of each frame's **declared** shards never arrived, in tenths of a percent.
         ///
         /// The measurement the queueing delay cannot make: a drain spread is only observable on
@@ -126,7 +139,19 @@ pub enum Feedback {
         late_per_mille: u16,
     },
     /// This frame was decoded and is in the decoder's reference chain — see [`TAG_ACK`].
-    Ack { frame_index: u64 },
+    ///
+    /// **A cursor and a bitmap, not one index.** The acknowledgement is the single point of failure
+    /// of the whole reference scheme: the encoder may only reference frames the client has confirmed,
+    /// so one lost acknowledgement must not look like a client that decoded nothing. With a bitmap a
+    /// later acknowledgement repairs an earlier loss — it says what the last sixty-four frames did,
+    /// not just the newest one — and the client sends the newest one twice, and once more on a timer
+    /// even when nothing new completed, so a quiet client is distinguishable from a dead one.
+    Ack {
+        /// The newest frame index the client decoded.
+        newest: u64,
+        /// Bit `i` set means frame `newest - i` was decoded. Bit 0 is therefore always set.
+        mask: u64,
+    },
 }
 
 /// Why a feedback datagram could not be read.
@@ -186,18 +211,21 @@ impl Feedback {
                 micros,
                 late_per_mille,
                 missing_per_mille,
+                read_per_sec,
             } => {
-                let mut out = Vec::with_capacity(13);
+                let mut out = Vec::with_capacity(17);
                 out.push(TAG_QUEUE_DELAY);
                 out.extend_from_slice(&micros.to_le_bytes());
                 out.extend_from_slice(&late_per_mille.to_le_bytes());
                 out.extend_from_slice(&missing_per_mille.to_le_bytes());
+                out.extend_from_slice(&read_per_sec.to_le_bytes());
                 out
             }
-            Feedback::Ack { frame_index } => {
-                let mut out = Vec::with_capacity(9);
+            Feedback::Ack { newest, mask } => {
+                let mut out = Vec::with_capacity(17);
                 out.push(TAG_ACK);
-                out.extend_from_slice(&frame_index.to_le_bytes());
+                out.extend_from_slice(&newest.to_le_bytes());
+                out.extend_from_slice(&mask.to_le_bytes());
                 out
             }
         }
@@ -266,15 +294,30 @@ impl Feedback {
                         .try_into()
                         .expect("2 bytes"),
                 );
+                let read_per_sec = u32::from_le_bytes(
+                    body.get(8..12)
+                        .ok_or(FeedbackError::Truncated)?
+                        .try_into()
+                        .expect("4 bytes"),
+                );
                 Ok(Feedback::QueueDelay {
                     micros,
                     late_per_mille,
                     missing_per_mille,
+                    read_per_sec,
                 })
             }
-            TAG_ACK => Ok(Feedback::Ack {
-                frame_index: u64_at(0)?,
-            }),
+            TAG_ACK => {
+                let newest = u64_at(0)?;
+                let mask = u64_at(8)?;
+                if mask & 1 == 0 {
+                    // Bit 0 is the newest frame itself: an acknowledgement that does not include the
+                    // frame it names is not one, and guessing which of the two is wrong would put a
+                    // frame the client does not have into the encoder's reference set.
+                    return Err(FeedbackError::Length);
+                }
+                Ok(Feedback::Ack { newest, mask })
+            }
             other => Err(FeedbackError::UnknownTag(other)),
         }
     }
@@ -289,7 +332,7 @@ impl Feedback {
             // check must not get one from here, and `u64::MAX` makes the deadline rule refuse rather
             // than repair something arbitrary.
             Feedback::QueueDelay { .. } => u64::MAX,
-            Feedback::Ack { frame_index } => *frame_index,
+            Feedback::Ack { newest, .. } => *newest,
         }
     }
 
@@ -473,10 +516,15 @@ mod tests {
             Feedback::StreamReset {
                 last_presented: 1_000_000,
             },
+            Feedback::Ack {
+                newest: 500,
+                mask: 0b1011,
+            },
             Feedback::QueueDelay {
                 micros: 41_000,
                 late_per_mille: 123,
                 missing_per_mille: 7,
+                read_per_sec: 5_200,
             },
         ];
 

@@ -48,6 +48,15 @@ pub struct BitrateDirectives {
     /// it should be told: while it is set, a keyframe is a burst the client cannot take, so the
     /// recovery is suppressed rather than requested.
     pub degrade_starving: Option<bool>,
+    /// The delivery budget everything is solved from: datagrams per second the client can read.
+    pub delivery_budget_per_sec: Option<f32>,
+    /// How many bytes a frame may be at the rate being asked for. See
+    /// [`BitrateManager::frame_bytes_budget`](crate::bitrate::BitrateManager::frame_bytes_budget).
+    pub frame_bytes_budget: Option<usize>,
+    /// The frame rate the budget pays for, which is what the frame-rate rung implements.
+    pub target_frames_per_sec: Option<f32>,
+    /// How big the bootstrap frame is being asked to be, while the stream has nothing acknowledged.
+    pub bootstrap_frame_bytes: Option<usize>,
     pub requested_bitrate_bps: f32,
 }
 

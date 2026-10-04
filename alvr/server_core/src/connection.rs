@@ -1152,6 +1152,7 @@ fn connection_pipeline(
                                 FeedbackOutcome::QueueDelay {
                                     micros,
                                     missing_per_mille,
+                                    read_per_sec,
                                 } => {
                                     // The client is behind and has said so. The lever is the
                                     // encoder's bitrate — fewer bits is fewer datagrams, which is
@@ -1160,6 +1161,10 @@ fn connection_pipeline(
                                     let mut manager = ctx.bitrate_manager.lock();
                                     manager.report_client_queue_delay(micros);
                                     manager.report_client_missing(missing_per_mille);
+                                    // **The budget's source.** Everything the sender does about rate
+                                    // is solved from this one number, and it is the only one that
+                                    // survives a client which completes nothing.
+                                    manager.report_client_read_rate(read_per_sec);
                                 }
                                 FeedbackOutcome::Acknowledged { frame_index, frames_unusable, .. } => {
                                     // **The one thing the encoder cannot work out for itself.** A
@@ -1232,8 +1237,37 @@ fn connection_pipeline(
                 // the client rather than about the encoder: skip frames rather than spend them. Safe
                 // only because the encoder references only acknowledged frames — a frame that is not
                 // sent is a frame the client never confirms, and the chain routes around it.
-                let divisor = ctx.bitrate_manager.lock().ladder_frame_divisor();
-                video_sender.set_frame_divisor(divisor);
+                //
+                // **And the bootstrap, which is the state before any of that works.** While nothing
+                // has ever been acknowledged, exactly one frame is in flight: it is the only frame
+                // under pressure, so no later frame can take its slot, and what it is sized to is a
+                // frame the client can actually read. Measured, on this rig: 2038 frames completed, 2
+                // presented and 0 acknowledgements, because a 64-datagram keyframe needs 220 ms of
+                // reading against release windows of 6, 12 and 66 ms with the stream still sending.
+                let acknowledged = video_sender.client_acked_frame().is_some();
+                let observed_parity = video_sender.stats().overhead_fraction() as f32;
+                video_sender.set_stop_and_wait(!acknowledged);
+                video_sender.set_frame_divisor({
+                    let mut manager = ctx.bitrate_manager.lock();
+                    manager.set_media_shape(
+                        (initial_settings.connection.packet_size as usize)
+                            .saturating_sub(x_transport::HEADER_LEN),
+                        observed_parity,
+                    );
+                    manager.set_bootstrap(!acknowledged);
+                    manager.ladder_frame_divisor()
+                });
+
+                // A bootstrap frame that did not arrive in the time its own size implied was too big
+                // for this client: ask for a smaller one, and for a keyframe, because the next frame
+                // the encoder produces will otherwise be a P-frame referencing the frame that was lost.
+                if video_sender.take_bootstrap_timeout() {
+                    let bytes = ctx.bitrate_manager.lock().shrink_bootstrap();
+                    info!(
+                        "the bootstrap frame did not arrive; asking for one of {bytes} bytes instead"
+                    );
+                    ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
+                }
 
                 // Timed because the socket write is the *only* place the server can block: the
                 // kernel send buffer fills when the receiver stops draining, and that is the
