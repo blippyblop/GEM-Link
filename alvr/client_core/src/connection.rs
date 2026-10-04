@@ -463,8 +463,19 @@ fn connection_pipeline(
             let mut last_report = Instant::now();
 
             while is_streaming(&ctx) {
-                let (actions, open) =
-                    plane.poll(&mut trace, Instant::now(), Duration::from_millis(20));
+                // **Small enough that a repair request goes out inside the repair window.**
+                //
+                // `release` is what asks the receiver for the missing fragments of anything still
+                // incomplete, and it runs once per `poll`. With a 20 ms budget under a backlog, a
+                // hole could wait the whole 20 ms to be asked for — longer than the ~12 ms repair
+                // window it was supposed to be saved inside — so every retransmit arrived for a
+                // frame the client had already let go. Measured on the rig: ~14 500 repair requests,
+                // `0 repaired by FEC`, and most frames released incomplete.
+                //
+                // The budget only bounds how long `pump` keeps reading before `release` gets a turn;
+                // a quiet socket's own `Timeout` still ends the poll immediately.
+                const POLL_BUDGET: Duration = Duration::from_millis(2);
+                let (actions, open) = plane.poll(&mut trace, Instant::now(), POLL_BUDGET);
                 if !open {
                     warn!("The video media socket can no longer be read from; ending the stream");
                     return;
