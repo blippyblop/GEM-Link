@@ -1,4 +1,12 @@
 mod c_api;
+#[cfg(unix)]
+mod display;
+/// This client targets Android and Linux, both `unix`. The workspace still has to *compile* on a
+/// platform it does not target (Windows, WASI), and the desktop implementation resolves
+/// `libwayland-client` through `dlopen`/`dlsym` — POSIX calls that do not exist there. Rather than
+/// scatter `cfg`s through one file, the non-unix build gets a stub: see `display_unsupported.rs`.
+#[cfg(not(unix))]
+#[path = "display_unsupported.rs"]
 mod display;
 mod extra_extensions;
 mod graphics;
