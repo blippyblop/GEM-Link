@@ -233,6 +233,15 @@ pub struct ReceiverStats {
     pub failed_waited_us: u64,
     pub failed_shards_present: u64,
     pub failed_shards_total: u64,
+    /// The **drain spread** of a usable frame — how long the client took to read the frame after
+    /// its first shard appeared — as an EWMA and a worst case, in microseconds.
+    ///
+    /// This is the client's own queueing delay, and it is the signal that says the sender is
+    /// outrunning the receiver. Everything else the client can see is ambiguous: a shard that has
+    /// not arrived and a shard that is still queued are the same fact locally, which is why three
+    /// attempts to fix the repair path made it worse instead.
+    pub queue_delay_us: u64,
+    pub queue_delay_max_us: u64,
 }
 
 impl ReceiverStats {
@@ -297,6 +306,16 @@ impl std::error::Error for RecvError {}
 #[derive(Debug)]
 struct PartialFrame {
     first_arrival: Duration,
+    /// When the most recent shard of this frame arrived.
+    ///
+    /// The gap to `first_arrival` is the **drain spread**: how long the client took to *read* the
+    /// frame after the first piece of it appeared. It is the client's own queueing delay, measured
+    /// where it actually happens, and it is the signal the sender needs — a receiver that reads at
+    /// wire speed has a spread of about one burst, and one that is behind has a spread that grows
+    /// with its backlog. Nothing else the client can see distinguishes "this shard is lost" from
+    /// "this shard is still queued behind me", which is why every repair-timing change made things
+    /// worse.
+    last_arrival: Duration,
     target_timestamp_us: u64,
     /// Learned from the first shard that arrives, whichever kind it is.
     is_keyframe: bool,
@@ -390,6 +409,12 @@ impl Receiver {
         &self.stats
     }
 
+    /// The client's own queueing delay — the drain spread of a usable frame, as an EWMA in
+    /// microseconds. See [`ReceiverStats::queue_delay_us`].
+    pub fn queue_delay_us(&self) -> u64 {
+        self.stats.queue_delay_us
+    }
+
     /// Take the counters, resetting them. For a session logger that reports deltas.
     pub fn take_stats(&mut self) -> ReceiverStats {
         std::mem::take(&mut self.stats)
@@ -457,6 +482,7 @@ impl Receiver {
             .entry(header.frame_index)
             .or_insert_with(|| PartialFrame {
                 first_arrival: now,
+                last_arrival: now,
                 target_timestamp_us: header.target_timestamp_us,
                 is_keyframe: header.flags.is_keyframe(),
                 frame_len: header.frame_len,
@@ -490,6 +516,7 @@ impl Receiver {
         }
         *slot = Some(shard);
         entry.received += 1;
+        entry.last_arrival = now;
 
         let completed = entry.has_all_data();
         let frame_index = header.frame_index;
@@ -616,6 +643,25 @@ impl Receiver {
             // not be rebuilt does not exist as bytes anywhere in this process.
             None
         };
+
+        // The client's own queueing delay, measured on the frame the display path is about to see.
+        // Only usable frames: a frame that could not be rebuilt says nothing about the drain, it
+        // says the frame was given up on.
+        if outcome.is_usable() {
+            let spread = frame
+                .last_arrival
+                .saturating_sub(frame.first_arrival)
+                .as_micros() as u64;
+            let ewma = &mut self.stats.queue_delay_us;
+            *ewma = if *ewma == 0 {
+                spread
+            } else {
+                *ewma - *ewma / 8 + spread / 8
+            };
+            if spread > self.stats.queue_delay_max_us {
+                self.stats.queue_delay_max_us = spread;
+            }
+        }
 
         match outcome {
             FrameOutcome::Complete => self.stats.frames_complete += 1,

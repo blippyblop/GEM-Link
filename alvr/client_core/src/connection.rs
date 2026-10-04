@@ -433,6 +433,23 @@ fn connection_pipeline(
     let frame_interval =
         Duration::from_secs_f32(1.0 / negotiated_config.refresh_rate_hint.max(1.0));
     let link_slack = frame_interval / 10;
+    // **These windows are short, and they are correct only for a client that drains at wire speed.**
+    //
+    // Measured on the rig, with the numbers this policy produced: a frame that could not be rebuilt
+    // had **5.4 of its 14.9 shards** when it was declared failed, 21 ms after its first one arrived,
+    // and 22 000 datagrams over the run arrived *after* the frame they belonged to had been
+    // released. The client reads ~480 datagrams/s, so one frame's own ~15 shards take ~30 ms to
+    // read — longer than every window here. So each frame is released a third-read, the parity
+    // needed to repair it is still queued, `decode_striped` fails with enough parity on paper
+    // (`4.5 erasures vs 5.0 parity`), the frame becomes a hole, and the hole blocks the trust gate
+    // until the next clean keyframe — ~140 frames of black per hole.
+    //
+    // Widening the windows was tried and did not help (`repair_delay` at a full frame interval moved
+    // the failure from 21 ms to 28.6 ms and left presented slightly *worse*): the read of a frame's
+    // own shards is itself slower than any window a display path could tolerate. **The fix is the
+    // drain, not these constants** — see the note on the read loop, and SteamLink's answer to the
+    // same problem, which is to bound the sender's rate against a queueing-latency target rather
+    // than to make the receiver more patient.
     let media_release_policy = x_transport::ReleasePolicy {
         straggler_delay: Duration::from_millis(3) + link_slack,
         repair_delay: (Duration::from_millis(3) + Duration::from_millis(6) + link_slack)
@@ -602,6 +619,29 @@ fn connection_pipeline(
                                 // Counted by the socket; the frame is lost and the FEC is what is
                                 // left, which the next release decides.
                             }
+                        }
+                        crate::media_plane::MediaPlaneAction::QueueDelay { micros } => {
+                            // The client's own queueing delay, carried back so the sender can send
+                            // *less*. Every other message either end sends is about a frame; this is
+                            // the only one that is about the receiver, and without it the sender has
+                            // no way to know it is outrunning the client — which is the actual
+                            // fault. See `Feedback::QueueDelay`.
+                            if feedback_peer.is_none() {
+                                feedback_peer = plane.last_sender();
+                                if let Some(peer) = feedback_peer {
+                                    media_feedback_socket.accept_only_from(peer);
+                                }
+                            }
+                            if feedback_peer.is_none() {
+                                continue;
+                            }
+
+                            let feedback = x_transport::Feedback::QueueDelay { micros };
+                            let mut sealed = [0u8; x_transport::MAX_FEEDBACK_LEN];
+                            let Ok(len) = feedback_sender.seal(&feedback, &mut sealed) else {
+                                continue;
+                            };
+                            let _ = media_feedback_socket.send(&sealed[..len]);
                         }
                     }
                 }

@@ -1147,6 +1147,15 @@ fn connection_pipeline(
                                 | FeedbackOutcome::Resume { .. } => {
                                     ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
                                 }
+                                FeedbackOutcome::QueueDelay { micros } => {
+                                    // The client is behind and has said so. The lever is the
+                                    // encoder's bitrate — fewer bits is fewer datagrams, which is
+                                    // the only thing that actually drains the queue — and the
+                                    // bitrate manager is what owns it.
+                                    ctx.bitrate_manager
+                                        .lock()
+                                        .report_client_queue_delay(micros);
+                                }
                                 _ => {}
                             }
                         }
@@ -1240,6 +1249,12 @@ fn connection_pipeline(
                         stats.repairs_refused_evicted,
                         stats.repairs_refused_unknown,
                     );
+                    if stats.queue_delay_reports > 0 {
+                        info!(
+                            "media sender: client reports {} us of queueing delay ({} reports)",
+                            stats.reported_queue_delay_us, stats.queue_delay_reports,
+                        );
+                    }
                 }
             }
         }

@@ -171,6 +171,9 @@ pub enum MediaPlaneAction {
     },
     /// Nothing has progressed for [`crate::stall::HARD_RESET_AFTER`]. Asking has failed.
     Reset { stalled_for: Duration },
+    /// The client's own queueing delay, to be carried back to the sender. The only message either
+    /// end sends that is about the *receiver* rather than a frame.
+    QueueDelay { micros: u32 },
 }
 
 /// The client's video receive path, driven by a socket.
@@ -254,6 +257,9 @@ impl MediaPlaneReceiver {
                     Some(MediaPlaneAction::AskForKeyframe { stalled_for })
                 }
                 PlaneEvent::Reset { stalled_for } => Some(MediaPlaneAction::Reset { stalled_for }),
+                PlaneEvent::QueueDelay { micros } => {
+                    Some(MediaPlaneAction::QueueDelay { micros })
+                }
             })
             .collect();
 
@@ -331,6 +337,9 @@ pub enum PlaneEvent {
     AskForKeyframe { stalled_for: Duration },
     /// No progress for the reset threshold. Asking has failed.
     Reset { stalled_for: Duration },
+    /// How far behind the client is reading, for the sender. See
+    /// [`FeedbackOutcome::QueueDelay`](x_transport::FeedbackOutcome::QueueDelay).
+    QueueDelay { micros: u32 },
 }
 
 /// Counters, because a receive path whose behaviour is only visible in the picture cannot be
@@ -355,6 +364,8 @@ pub struct PlaneStats {
     pub nacks_sent: u64,
     pub keyframe_requests: u64,
     pub resets: u64,
+    /// Queue-delay reports sent to the sender. See [`PlaneEvent::QueueDelay`].
+    pub queue_delay_reports: u64,
     /// Keyframes *released to the display path*, and how many of them had a payload.
     ///
     /// A keyframe is the only thing that clears the trust gate, so "did a clean keyframe ever
@@ -398,6 +409,8 @@ impl PlaneStats {
     }
 }
 
+const QUEUE_REPORT_FRAMES: u32 = 30;
+
 /// The client's video receive path.
 pub struct VideoPlane {
     receiver: Receiver,
@@ -405,6 +418,10 @@ pub struct VideoPlane {
     stall: StuckDetector,
     started: Instant,
     stats: PlaneStats,
+    /// Frames released since the last queue-delay report. The report is deliberately slow: it is a
+    /// property of the receiver measured over many frames, and a control loop fed per-frame noise is
+    /// one that oscillates.
+    frames_since_queue_report: u32,
 }
 
 impl VideoPlane {
@@ -419,6 +436,7 @@ impl VideoPlane {
             stall: StuckDetector::new(now),
             started: now,
             stats: PlaneStats::default(),
+            frames_since_queue_report: 0,
         }
     }
 
@@ -569,7 +587,7 @@ impl VideoPlane {
         //
         // The floor under the whole idea is that a client which is behind cannot distinguish "this
         // shard is lost" from "this shard is still queued behind me". The fix for that is to stop
-        // being behind, not to tune the question.
+        // being behind, not to tune the question — which is what the queue-delay report below is for.
         for frame_index in self.receiver.incomplete_frames() {
             let fragments = self.receiver.nack(frame_index);
             if !fragments.is_empty() {
@@ -577,6 +595,21 @@ impl VideoPlane {
                 events.push(PlaneEvent::Nack {
                     frame_index,
                     fragments,
+                });
+            }
+        }
+
+        // Tell the sender how far behind the client is reading. This is the one signal that lets the
+        // sender fix the problem instead of the receiver working around it: everything the client can
+        // see about a *frame* is ambiguous (lost, or merely queued), but the drain spread is not.
+        self.frames_since_queue_report += 1;
+        if self.frames_since_queue_report >= QUEUE_REPORT_FRAMES {
+            self.frames_since_queue_report = 0;
+            let micros = self.receiver.queue_delay_us();
+            if micros > 0 {
+                self.stats.queue_delay_reports += 1;
+                events.push(PlaneEvent::QueueDelay {
+                    micros: micros.min(u32::MAX as u64) as u32,
                 });
             }
         }

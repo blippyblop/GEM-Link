@@ -44,6 +44,14 @@ pub const MAX_FEEDBACK_LEN: usize = 1 + 8 + 2 + MAX_NACK_FRAGMENTS * 2 + crate::
 const TAG_NACK: u8 = 1;
 const TAG_REQUEST_KEYFRAME: u8 = 2;
 const TAG_STREAM_RESET: u8 = 3;
+/// The client's own queueing delay, in microseconds.
+///
+/// The one thing the client can say that tells the sender it is **outrunning** the receiver. Every
+/// other signal is ambiguous from the client's side — a shard that never arrived and a shard still
+/// queued behind it are the same fact locally — and that ambiguity is what made three attempts at
+/// fixing the repair path worse than leaving it alone. This is not a fact about a frame; it is a
+/// fact about the receiver, and it is what the sender needs in order to send less.
+const TAG_QUEUE_DELAY: u8 = 4;
 
 /// One message from the client to the sender.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +75,12 @@ pub enum Feedback {
     /// exists (the reference client logs `SVLFEC::ReportStreamReset() (m_iLastAcknowledgeFrameNumber
     /// = %d)` for exactly this).
     StreamReset { last_presented: u64 },
+    /// The client's own queueing delay — how long it is taking to read frames, as an EWMA in
+    /// microseconds. See [`TAG_QUEUE_DELAY`].
+    ///
+    /// Sent on its own slow cadence, not per frame: it is a property of the receiver measured over
+    /// many frames, and a control loop fed per-frame noise is a control loop that oscillates.
+    QueueDelay { micros: u32 },
 }
 
 /// Why a feedback datagram could not be read.
@@ -122,6 +136,12 @@ impl Feedback {
                 out.extend_from_slice(&last_presented.to_le_bytes());
                 out
             }
+            Feedback::QueueDelay { micros } => {
+                let mut out = Vec::with_capacity(5);
+                out.push(TAG_QUEUE_DELAY);
+                out.extend_from_slice(&micros.to_le_bytes());
+                out
+            }
         }
     }
 
@@ -169,6 +189,15 @@ impl Feedback {
             TAG_STREAM_RESET => Ok(Feedback::StreamReset {
                 last_presented: u64_at(0)?,
             }),
+            TAG_QUEUE_DELAY => {
+                let micros = u32::from_le_bytes(
+                    body.get(0..4)
+                        .ok_or(FeedbackError::Truncated)?
+                        .try_into()
+                        .expect("4 bytes"),
+                );
+                Ok(Feedback::QueueDelay { micros })
+            }
             other => Err(FeedbackError::UnknownTag(other)),
         }
     }
@@ -179,6 +208,10 @@ impl Feedback {
             Feedback::Nack { frame_index, .. } => *frame_index,
             Feedback::RequestKeyframe { newest_frame } => *newest_frame,
             Feedback::StreamReset { last_presented } => *last_presented,
+            // Not about a frame: it is about the receiver. A caller needing a frame for a deadline
+            // check must not get one from here, and `u64::MAX` makes the deadline rule refuse rather
+            // than repair something arbitrary.
+            Feedback::QueueDelay { .. } => u64::MAX,
         }
     }
 
@@ -187,6 +220,7 @@ impl Feedback {
             Feedback::Nack { .. } => "nack",
             Feedback::RequestKeyframe { .. } => "request-keyframe",
             Feedback::StreamReset { .. } => "stream-reset",
+            Feedback::QueueDelay { .. } => "queue-delay",
         }
     }
 
@@ -360,6 +394,7 @@ mod tests {
             Feedback::StreamReset {
                 last_presented: 1_000_000,
             },
+            Feedback::QueueDelay { micros: 41_000 },
         ];
 
         for message in messages {

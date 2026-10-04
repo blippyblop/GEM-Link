@@ -29,6 +29,13 @@ pub struct BitrateDirectives {
     pub encoder_latency_limiter_bps: Option<f32>,
     pub manual_max_throughput_bps: Option<f32>,
     pub manual_min_throughput_bps: Option<f32>,
+    /// The cap a **client-reported queueing delay** imposed, if any.
+    ///
+    /// This is the one limiter driven by the receiver's own measurement rather than by the server's
+    /// view of the link, and it exists because every other signal is ambiguous from the client's
+    /// side: a shard that never arrived and a shard still queued behind it are the same fact
+    /// locally. The delay is not ambiguous — it says the sender is outrunning the receiver.
+    pub client_queue_limiter_bps: Option<f32>,
     pub requested_bitrate_bps: f32,
 }
 

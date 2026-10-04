@@ -29,6 +29,13 @@ pub struct BitrateManager {
     last_frame_instant: Instant,
     last_update_instant: Instant,
     dynamic_decoder_max_bytes_per_frame: f32,
+    /// The client's own queueing delay, as it last reported it. See
+    /// [`alvr_events::BitrateDirectives::client_queue_limiter_bps`].
+    ///
+    /// Kept as the raw report and turned into a rate only here, because this is the only place that
+    /// knows what the frame interval is — and one frame interval is the target: a client more than a
+    /// frame behind is a client whose frames will be released before they have been read.
+    client_queue_delay_us: Option<u32>,
     previous_config: Option<BitrateConfig>,
     update_needed: bool,
 }
@@ -55,6 +62,7 @@ impl BitrateManager {
             last_frame_instant: Instant::now(),
             last_update_instant: Instant::now(),
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
+            client_queue_delay_us: None,
             previous_config: None,
             update_needed: true,
         }
@@ -62,6 +70,13 @@ impl BitrateManager {
 
     // Note: This is used to calculate the framerate/frame interval. The frame present is the most
     // accurate event for this use.
+    /// The client's own report of how far behind it is reading.
+    ///
+    /// Not a frame fact and not a server fact: it is the receiver telling the sender to send less.
+    pub fn report_client_queue_delay(&mut self, micros: u32) {
+        self.client_queue_delay_us = Some(micros);
+    }
+
     pub fn report_frame_present(&mut self, config: &Switch<BitrateAdaptiveFramerateConfig>) {
         let now = Instant::now();
 
@@ -231,6 +246,29 @@ impl BitrateManager {
                     throughput_bps = f32::max(throughput_bps, min_bps);
 
                     bitrate_directives.manual_min_throughput_bps = Some(min_bps);
+                }
+
+                // **The receiver's own measurement, and the only limiter that comes from it.**
+                //
+                // Every other signal here is the server's view of the link, or a latency the server
+                // measured on its own side. The client's queueing delay is the one fact that says
+                // the sender is outrunning the receiver — and the receiver being behind is what
+                // makes its frames arrive holed, its repairs impossible and its trust gate block,
+                // because a shard that is still queued and a shard that is lost are the same thing
+                // from its side.
+                //
+                // The target is one frame interval: a client less than a frame behind is reading as
+                // fast as frames are produced, which is as good as it gets. Past that the rate is
+                // scaled by how far past, so the correction is proportional — the same shape as
+                // Steam Link's, which selects a bandwidth against the fraction of the stream queued
+                // above ~60 ms.
+                if let Some(queue_us) = self.client_queue_delay_us {
+                    let target_us = self.nominal_frame_interval.as_micros() as f32;
+                    if queue_us as f32 > target_us && queue_us > 0 {
+                        let max_bps = throughput_bps * target_us / queue_us as f32;
+                        throughput_bps = f32::min(throughput_bps, max_bps);
+                        bitrate_directives.client_queue_limiter_bps = Some(max_bps);
+                    }
                 }
 
                 // NB: Here we assign the calculated throughput to the requested bitrate. This is

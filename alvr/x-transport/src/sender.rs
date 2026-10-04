@@ -150,6 +150,13 @@ pub enum FeedbackOutcome {
     /// Authentic and nothing to do — a NACK for a frame that was never ours, or a repair window
     /// that closed between the ask and its arrival.
     Ignored,
+    /// The client is telling the sender how far behind it is reading. **This is the sender's turn
+    /// to act**: the fix for a receiver that is queued is fewer datagrams, and no amount of repair
+    /// timing addresses it.
+    QueueDelay {
+        /// How long the client took to read a frame after its first shard appeared, EWMA.
+        micros: u32,
+    },
 }
 
 /// Counters. Same rule as everywhere else in this tree: a path that can lose a datagram has a
@@ -169,6 +176,11 @@ pub struct SenderStats {
     /// which were therefore not sent again. This is the counter that says the sender is not
     /// answering the same question twice.
     pub repairs_coalesced: u64,
+    /// Queue-delay reports the client sent. Zero on a link where the client never fell behind.
+    pub queue_delay_reports: u64,
+    /// The last queueing delay the client reported, in microseconds. See
+    /// [`FeedbackOutcome::QueueDelay`].
+    pub reported_queue_delay_us: u64,
     pub repairs_refused_expired: u64,
     pub repairs_refused_late: u64,
     pub repairs_refused_evicted: u64,
@@ -334,6 +346,10 @@ pub struct MediaSender {
     /// The window the loss estimate is taken over, in frames.
     loss_window_frames: u64,
     loss_window: LossWindow,
+    /// The last queueing delay the client reported, if any. See
+    /// [`FeedbackOutcome::QueueDelay`] — the caller turns this into a rate, because only the
+    /// caller knows what the encoder's floor is.
+    reported_queue_delay_us: Option<u32>,
     /// The last loss the controller was told about, for the summary and for a caller that wants to
     /// know why the ratio moved.
     observed_loss: f64,
@@ -373,6 +389,7 @@ impl MediaSender {
             // an otherwise clean link does not move the ratio.
             loss_window_frames: 8,
             loss_window: LossWindow::default(),
+            reported_queue_delay_us: None,
             observed_loss: 0.0,
             send_seq: 0,
             pending_keyframe: None,
@@ -678,6 +695,12 @@ impl MediaSender {
                     last_presented: *last_presented,
                 }
             }
+            Feedback::QueueDelay { micros } => {
+                self.stats.queue_delay_reports += 1;
+                self.stats.reported_queue_delay_us = *micros as u64;
+                self.reported_queue_delay_us = Some(*micros);
+                FeedbackOutcome::QueueDelay { micros: *micros }
+            }
         }
     }
 
@@ -756,9 +779,17 @@ impl MediaSender {
         }
     }
 
+    /// The last queueing delay the client reported, in microseconds. `None` until it reports one.
+    ///
+    /// The caller — not this module — decides what to do with it, because the actuator is the
+    /// encoder's bitrate and that is the caller's to set. This module's job was to make the fact
+    /// available; leaving it unread was the same mistake as the feedback that had no carrier.
+    pub fn reported_queue_delay_us(&self) -> Option<u32> {
+        self.reported_queue_delay_us
+    }
+
     /// Whether a frame is still repairable, for a caller deciding whether to answer a NACK at all.
-    pub fn can_repair(&self, frame_index: u64, now: Duration) -> bool {
-        self.cache
+    pub fn can_repair(&self, frame_index: u64, now: Duration) -> bool {        self.cache
             .get(&frame_index)
             .is_some_and(|frame| now < frame.repair_until && now + self.rtt < frame.repair_until)
     }
