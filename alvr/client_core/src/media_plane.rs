@@ -473,14 +473,21 @@ impl PlaneStats {
         "datagrams_in,dropped_by_source,rejected,frames_presented,across_hole,frames_held,\
          held_no_keyframe,held_gap,held_datagram_loss,held_unconfirmed_reference,held_decoder,\
          abandoned,repaired_fec,keyframes_in,keyframes_clean,nacks,nacks_suppressed,\
-         keyframe_requests,resets,acks,read_per_sec"
+         keyframe_requests,resets,acks,read_per_sec,m2p_avg_ms"
     }
 
     /// One counter vector as a CSV row, for the `GEMPLINK_DEBUG_CSV` fixture. Cumulative counts —
     /// deltas are the reader's job, which keeps this honest when rows are missed.
-    pub fn csv_row(&self) -> String {
+    ///
+    /// `m2p_average` is the client's measured total pipeline latency (input sample acquired →
+    /// submitted → predicted vsync), averaged over the statistics window. All device-clock, so
+    /// the display's own response time is the only thing the reader adds.
+    pub fn csv_row_with_m2p(&self, m2p_average: Option<Duration>) -> String {
+        let m2p_ms = m2p_average
+            .map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0))
+            .unwrap_or_default();
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.datagrams_received,
             self.datagrams_dropped_by_source,
             self.datagrams_rejected,
@@ -502,6 +509,7 @@ impl PlaneStats {
             self.resets,
             self.acks_sent,
             self.read_per_sec,
+            m2p_ms,
         )
     }
 

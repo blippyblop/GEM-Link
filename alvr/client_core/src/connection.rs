@@ -524,6 +524,22 @@ fn connection_pipeline(
                     info!("{}", plane.receiver_account());
                     info!("{}", plane.failed_frame_account());
 
+                    // The motion-to-photon average, device-clock: input sample acquired on this
+                    // client → sent → rendered on the PC from it → encoded → back → decoded →
+                    // submitted → predicted vsync. The display's own response time is the known
+                    // constant the reader adds. Also in the dashboard's statistics graphs.
+                    let m2p_average = ctx
+                        .statistics_manager
+                        .lock()
+                        .as_ref()
+                        .map(|stats| stats.average_total_pipeline_latency());
+                    if let Some(m2p) = m2p_average {
+                        info!(
+                            "motion-to-photon (input to predicted vsync): {:.1} ms average",
+                            m2p.as_secs_f64() * 1000.0
+                        );
+                    }
+
                     // The link-debug fixture: `GEMPLINK_DEBUG_CSV=<path>` appends the same
                     // counters as one CSV row per report, for graphing the inevitable
                     // link-quality investigation afterwards. Inert unless set.
@@ -542,7 +558,8 @@ fn connection_pipeline(
                                     crate::media_plane::PlaneStats::csv_header()
                                 );
                             }
-                            let _ = writeln!(file, "{}", plane.stats().csv_row());
+                            let _ =
+                                writeln!(file, "{}", plane.stats().csv_row_with_m2p(m2p_average));
                         }
                     }
                 }
