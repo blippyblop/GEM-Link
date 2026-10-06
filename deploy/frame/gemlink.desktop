@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GemLink
+Exec=/opt/gemlink/run-gemlink.sh
+Categories=Utility;
+Comment=Stream VR from your PC (GemLink)
+Icon=utility
+
+# Steam Frame's non-Steam app launcher picks entries up by these conventions
+# (see deckard-nested-desktop.desktop in the firmware).
+X-Steam-Controller-Template=Desktop
