@@ -774,7 +774,9 @@ fn connection_pipeline(
                     AudioCodec::Opus => alvr_audio::AudioEncoding::Opus {
                         application: alvr_audio::Application::Voip,
                         frame_ms: 20,
-                        bitrate_bps: 24_000,
+                        // User directive 2026-10-06: 3x the initial 24 kbps. DTX still keeps
+                        // silent periods nearly free; in-band FEC stays enabled.
+                        bitrate_bps: 72_000,
                         inband_fec: true,
                         dtx: true,
                         expected_loss_percent: 10,

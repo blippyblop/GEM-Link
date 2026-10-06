@@ -691,7 +691,9 @@ fn connection_pipeline(
         alvr_audio::AudioEncoding::Opus {
             application: alvr_audio::Application::LowDelay,
             frame_ms: 10,
-            bitrate_bps: 96_000,
+            // User directive 2026-10-06: 2x the initial 96 kbps. 192 kbps Opus stereo is
+            // transparent for all game content; bandwidth is free beside the 30 Mbps video.
+            bitrate_bps: 192_000,
             inband_fec: false,
             dtx: false,
             expected_loss_percent: 0,

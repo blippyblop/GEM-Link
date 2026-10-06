@@ -845,7 +845,7 @@ pub enum AudioCodec {
     #[default]
     #[schema(strings(display_name = "Opus (low latency)"))]
     Opus = 0,
-    #[schema(strings(display_name = "Raw PCM"))]
+    #[schema(strings(display_name = "Uncompressed (raw PCM)"))]
     Raw = 1,
 }
 
