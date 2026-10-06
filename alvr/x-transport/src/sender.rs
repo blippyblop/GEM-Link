@@ -229,6 +229,11 @@ pub struct SenderStats {
     /// Frames not sent because their chain root was one the client had never confirmed. Sending them
     /// spends bandwidth on frames the client's own gate will hold.
     pub frames_dropped_unconfirmed_reference: u64,
+    /// The probe burst (see `maybe_arm_probe`): how many times one fired, and how many datagrams
+    /// rode without pacing debt. The point of both numbers is the honest question "was the
+    /// client's read ceiling measured under load the sender actually offered?".
+    pub probes_sent: u64,
+    pub probe_burst_datagrams: u64,
     /// Repair requests refused because the client had already acknowledged the frame.
     pub repairs_refused_delivered: u64,
     pub repairs_refused_expired: u64,
@@ -424,6 +429,12 @@ const ACK_FRESHNESS: Duration = Duration::from_millis(250);
 /// retry; one that fires too late costs the bootstrap, which is the whole stream.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_millis(400);
 
+// The probe burst: every five seconds, sixty-four datagrams ride without pacing debt. At MTU
+// that is ~90 KB offered back-to-back — enough to move a 250 ms window's max, far too little to
+// queue a client that is keeping up.
+const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const PROBE_BURST_DATAGRAMS: usize = 64;
+
 /// The ratio a fixed policy stands for, for a controller that has to start somewhere.
 ///
 /// `ParityPolicy::Fixed` is a shard *count* rather than a fraction, so it has no fraction to
@@ -468,7 +479,12 @@ pub struct MediaSender {
     observed_loss: f64,
     /// The newest frame the client has acknowledged decoding. **The encoder may reference nothing
     /// newer than this**, which is the whole of "a lost frame corrupts nothing".
-    client_acked_frame: Option<u64>,    /// Frames sent and not yet acknowledged, oldest first. Bounded: on overflow the oldest is counted
+    client_acked_frame: Option<u64>,
+    /// The probe burst (see `maybe_arm_probe`): when the next unpaced burst may fire, and how
+    /// much of it is left. `None` means the clock has not started yet.
+    next_probe_at: Option<Duration>,
+    probe_burst_budget: usize,
+    /// Frames sent and not yet acknowledged, oldest first. Bounded: on overflow the oldest is counted
     /// as one the client could not use, which is the same conclusion the acknowledgement would have
     /// led to, just reached for want of a packet rather than for want of a decoder.
     ///
@@ -581,6 +597,8 @@ impl MediaSender {
             late_fraction: 0.0,
             observed_loss: 0.0,
             client_acked_frame: None,
+            next_probe_at: None,
+            probe_burst_budget: 0,
             outstanding: VecDeque::new(),
             ack_window: AckWindow::default(),
             acks_seen: 0,
@@ -649,6 +667,28 @@ impl MediaSender {
     /// The loss the controller was last told about.
     pub fn observed_loss(&self) -> f64 {
         self.observed_loss
+    }
+
+    /// The probe burst. The read-per-second ceiling is self-consistent at any rate the sender
+    /// happens to offer — a sender throttled to 0.7× of a wrong ceiling keeps measuring itself.
+    /// Every [`PROBE_INTERVAL`], the next [`PROBE_BURST_DATAGRAMS`] datagrams ride without
+    /// pacing debt: a short back-to-back burst of *real* datagrams. If the client reads them,
+    /// its max-over-window sensor reports a rate the steady pace never offered, and the ceiling
+    /// can finally move up. Off during the stop-and-wait bootstrap: that mode exists for a
+    /// clean signal about exactly one frame.
+    fn maybe_arm_probe(&mut self, now: Duration) {
+        if self.stop_and_wait {
+            return;
+        }
+        match self.next_probe_at {
+            None => self.next_probe_at = Some(now + PROBE_INTERVAL),
+            Some(at) if now >= at => {
+                self.next_probe_at = Some(now + PROBE_INTERVAL);
+                self.probe_burst_budget = PROBE_BURST_DATAGRAMS * self.config.mtu;
+                self.stats.probes_sent += 1;
+            }
+            Some(_) => {}
+        }
     }
 
     pub fn set_rtt(&mut self, rtt: Duration) {
@@ -804,6 +844,8 @@ impl MediaSender {
         self.stats.frames_sent += 1;
         self.frames_seen += 1;
 
+        self.maybe_arm_probe(now);
+
         // ---------------------------------------------------------------------------------------
         // **The bootstrap: stop and wait.**
         //
@@ -855,9 +897,9 @@ impl MediaSender {
 
         if self.stop_and_wait {
             if let Some(waiting) = self.bootstrap_waiting {
-                let waited = self.bootstrap_started.map_or(Duration::ZERO, |at| {
-                    now.saturating_sub(at)
-                });
+                let waited = self
+                    .bootstrap_started
+                    .map_or(Duration::ZERO, |at| now.saturating_sub(at));
                 if waited < self.bootstrap_timeout {
                     self.stats.frames_held_for_bootstrap += 1;
                     self.pacer.schedule(0, now);
@@ -987,7 +1029,17 @@ impl MediaSender {
             // The pacer is consulted for every datagram even though the frame is written in one go:
             // that is what accumulates the debt the caller sleeps off, and it is what makes
             // `over_budget` mean something.
-            self.pacer.schedule(datagram.len(), now);
+            let probe_riding = self.probe_burst_budget > 0;
+            if probe_riding {
+                // The probe burst: this datagram adds no pacing debt, so the frames behind it go
+                // out back-to-back and the client's read-rate sensor gets to show a ceiling the
+                // steady pace never offers.
+                self.probe_burst_budget = self.probe_burst_budget.saturating_sub(self.config.mtu);
+                self.stats.probe_burst_datagrams += 1;
+                self.pacer.schedule(0, now);
+            } else {
+                self.pacer.schedule(datagram.len(), now);
+            }
             match sink.send(datagram) {
                 Ok(()) => {
                     bytes += datagram.len();
@@ -1017,7 +1069,8 @@ impl MediaSender {
         if self.stop_and_wait {
             self.bootstrap_waiting = Some(meta.frame_index);
             self.bootstrap_started = Some(now);
-        }        while self.outstanding.len() > MAX_OUTSTANDING_ACKS {
+        }
+        while self.outstanding.len() > MAX_OUTSTANDING_ACKS {
             if let Some(forgotten) = self.outstanding.pop_front() {
                 self.stats.frames_unacked += 1;
                 self.ack_window.unacked += 1;
@@ -1242,12 +1295,17 @@ impl MediaSender {
                     read_per_sec: *read_per_sec,
                 }
             }
-            Feedback::Ack { newest: acked, mask } => {
+            Feedback::Ack {
+                newest: acked,
+                mask,
+            } => {
                 self.last_ack_at = Some(now);
                 let newest = self
                     .client_acked_frame
                     .map_or(*acked, |current| current.max(*acked));
-                let advanced = self.client_acked_frame.is_none_or(|current| newest > current);
+                let advanced = self
+                    .client_acked_frame
+                    .is_none_or(|current| newest > current);
                 self.client_acked_frame = Some(newest);
                 if advanced {
                     self.acked_progress_at = Some(now);
@@ -1303,7 +1361,10 @@ impl MediaSender {
         // The request crossed the acknowledgement of its own frame on the wire: the client has the
         // frame, so re-sending it costs bandwidth inside the congestion that delayed the request —
         // and the client's own late-arrival report would then count these datagrams as late.
-        if self.client_acked_frame.is_some_and(|acked| frame_index <= acked) {
+        if self
+            .client_acked_frame
+            .is_some_and(|acked| frame_index <= acked)
+        {
             self.stats.repairs_refused_delivered += 1;
             return FeedbackOutcome::RepairRefused {
                 frame_index,
@@ -1390,7 +1451,8 @@ impl MediaSender {
     }
 
     /// Whether a frame is still repairable, for a caller deciding whether to answer a NACK at all.
-    pub fn can_repair(&self, frame_index: u64, now: Duration) -> bool {        self.cache
+    pub fn can_repair(&self, frame_index: u64, now: Duration) -> bool {
+        self.cache
             .get(&frame_index)
             .is_some_and(|frame| now < frame.repair_until && now + self.rtt < frame.repair_until)
     }
@@ -1455,6 +1517,77 @@ mod tests {
             interval(),
             None,
         )
+    }
+
+    /// The probe burst must exist, must be bursty, and must not touch the bootstrap. Three
+    /// assertions in one scenario: send frames for longer than the probe interval at a pace the
+    /// pacer controls, and watch the debt disappear for exactly the burst's worth of datagrams.
+    #[test]
+    fn the_probe_burst_rides_without_pacing_debt_every_interval() {
+        let mut sender = sender(ParityPolicy::Ratio { fraction: 0.05 });
+        let mut now = Duration::ZERO;
+        let dt = Duration::from_millis(20);
+        let mut frame_index = 1u64;
+
+        let mut total_debt_at_first_probe = None;
+        let mut datagrams_in_probe_window = 0u64;
+
+        for _ in 0..350 {
+            // One frame every 20 ms, each of 64 datagrams: at the 300 Mbps pacer the debt per
+            // frame is ~3.4 ms, so a normal inter-frame wait is measurable.
+            let mut sink = Collector::new();
+            sender.send_frame(
+                &mut sink,
+                meta(frame_index, now.as_micros() as u64),
+                &payload(64),
+                now,
+            );
+            let debt = sender.pacer.next_send().saturating_sub(now);
+
+            if sender.stats.probes_sent > 0 && total_debt_at_first_probe.is_none() {
+                // The frame right after the first probe fired: its datagrams rode without debt.
+                total_debt_at_first_probe = Some(debt);
+            }
+            if sender.stats.probes_sent > 0 {
+                datagrams_in_probe_window += sink.datagrams().len() as u64;
+            }
+
+            frame_index += 1;
+            now += dt;
+        }
+
+        assert!(
+            sender.stats.probes_sent >= 1,
+            "350 frames at 20 ms spans 7 s: at least one 5 s probe must have fired"
+        );
+        let first_debt = total_debt_at_first_probe.expect("a frame followed the probe");
+        assert_eq!(
+            sender.stats.probe_burst_datagrams, 64,
+            "the burst is exactly PROBE_BURST_DATAGRAMS, once per firing"
+        );
+        assert!(
+            first_debt < Duration::from_millis(2),
+            "the frame riding the burst must have shed nearly all pacing debt: {first_debt:?}"
+        );
+        let _ = datagrams_in_probe_window;
+    }
+
+    #[test]
+    fn the_probe_never_fires_during_the_bootstrap() {
+        let mut sender = sender(ParityPolicy::Ratio { fraction: 0.25 });
+        sender.set_stop_and_wait(true);
+        let mut now = Duration::ZERO;
+
+        for _ in 0..400 {
+            let mut sink = Collector::new();
+            sender.send_frame(&mut sink, meta(1, 0), &payload(64), now);
+            now += Duration::from_millis(20);
+        }
+
+        assert_eq!(
+            sender.stats.probes_sent, 0,
+            "the bootstrap is a clean signal about one frame; no burst may ride it"
+        );
     }
 
     fn payload(shards: usize) -> Vec<u8> {
@@ -1764,7 +1897,8 @@ mod tests {
     }
 
     #[test]
-    fn a_repair_that_would_arrive_after_the_hold_ceiling_is_refused_even_though_the_frame_is_live() {
+    fn a_repair_that_would_arrive_after_the_hold_ceiling_is_refused_even_though_the_frame_is_live()
+    {
         let mut sender = sender(ParityPolicy::Off);
         sender.set_rtt(Duration::from_millis(10));
         let mut sink = Collector::new();
@@ -2057,20 +2191,33 @@ mod tests {
         sender.set_loss_window_frames(4);
         let mut sink = Collector::new();
         for frame in 1..=8 {
-            sender.send_frame(&mut sink, meta(frame, frame * 11_111), &payload(2), Duration::ZERO);
+            sender.send_frame(
+                &mut sink,
+                meta(frame, frame * 11_111),
+                &payload(2),
+                Duration::ZERO,
+            );
         }
 
         // The client decoded everything except frame 4, which it never mentions — and it resolved
         // that the moment it acknowledged frame 5.
         for frame in [1u64, 2, 3, 5, 6, 7, 8] {
-            sender.on_feedback(&mut sink, &Feedback::Ack {
-                newest: frame,
-                mask: 1,
-            }, Duration::ZERO);
+            sender.on_feedback(
+                &mut sink,
+                &Feedback::Ack {
+                    newest: frame,
+                    mask: 1,
+                },
+                Duration::ZERO,
+            );
         }
 
         assert_eq!(sender.stats().frames_acked, 7);
-        assert_eq!(sender.stats().frames_unacked, 1, "frame 4 was never decoded");
+        assert_eq!(
+            sender.stats().frames_unacked,
+            1,
+            "frame 4 was never decoded"
+        );
         assert_eq!(
             sender.client_acked_frame(),
             Some(8),
@@ -2093,10 +2240,11 @@ mod tests {
         sender.set_rtt(Duration::from_millis(4));
         let mut sink = Collector::new();
         sender.send_frame(&mut sink, meta(3, 100_000), &payload(4), Duration::ZERO);
-        sender.on_feedback(&mut sink, &Feedback::Ack {
-                newest: 3,
-                mask: 1,
-            }, Duration::ZERO);
+        sender.on_feedback(
+            &mut sink,
+            &Feedback::Ack { newest: 3, mask: 1 },
+            Duration::ZERO,
+        );
 
         let mut repairs = Collector::new();
         let outcome = sender.on_feedback(
@@ -2127,10 +2275,11 @@ mod tests {
         let mut sink = Collector::new();
         sender.send_frame(&mut sink, meta(1, 11_111), &payload(2), Duration::ZERO);
         sender.send_frame(&mut sink, meta(2, 22_222), &payload(2), Duration::ZERO);
-        sender.on_feedback(&mut sink, &Feedback::Ack {
-                newest: 1,
-                mask: 1,
-            }, Duration::ZERO);
+        sender.on_feedback(
+            &mut sink,
+            &Feedback::Ack { newest: 1, mask: 1 },
+            Duration::ZERO,
+        );
         sender.send_frame(&mut sink, meta(3, 33_333), &payload(2), Duration::ZERO);
 
         // Frame 2 is still owed an acknowledgement, so it is not yet written off either way.
@@ -2191,7 +2340,8 @@ mod tests {
                     self.credit = 0.0;
                     break;
                 };
-                self.receiver.observe_read_rate(now, Duration::from_millis(250));
+                self.receiver
+                    .observe_read_rate(now, Duration::from_millis(250));
                 self.receiver.on_datagram(&datagram, now);
             }
             self.released.extend(self.receiver.release(now));
@@ -2319,7 +2469,10 @@ mod tests {
                 &payload(4),
                 Duration::from_millis(index as u64),
             );
-            assert_eq!(held.datagrams, 0, "frame {index} went out behind the bootstrap");
+            assert_eq!(
+                held.datagrams, 0,
+                "frame {index} went out behind the bootstrap"
+            );
         }
         assert_eq!(sender.stats().datagrams_sent, sent_after_first);
         assert_eq!(sender.stats().frames_held_for_bootstrap, 9);
@@ -2335,10 +2488,18 @@ mod tests {
         assert!(!sender.take_bootstrap_timeout());
 
         // Past the wait: the frame is written off, and the caller is told to ask for a smaller one.
-        sender.send_frame(&mut sink, meta(2, 22_222), &payload(4), Duration::from_millis(150));
+        sender.send_frame(
+            &mut sink,
+            meta(2, 22_222),
+            &payload(4),
+            Duration::from_millis(150),
+        );
         assert!(sender.take_bootstrap_timeout());
         assert_eq!(sender.stats().bootstrap_timeouts, 1);
-        assert!(!sender.take_bootstrap_timeout(), "the timeout was reported twice");
+        assert!(
+            !sender.take_bootstrap_timeout(),
+            "the timeout was reported twice"
+        );
     }
 
     #[test]
@@ -2351,14 +2512,16 @@ mod tests {
         let mut back = Collector::new();
         sender.on_feedback(
             &mut back,
-            &Feedback::Ack {
-                newest: 1,
-                mask: 1,
-            },
+            &Feedback::Ack { newest: 1, mask: 1 },
             Duration::from_millis(20),
         );
         // The next frame goes: the bootstrap is over, and the stream is running.
-        let second = sender.send_frame(&mut sink, meta(2, 22_222), &payload(4), Duration::from_millis(21));
+        let second = sender.send_frame(
+            &mut sink,
+            meta(2, 22_222),
+            &payload(4),
+            Duration::from_millis(21),
+        );
         assert!(second.datagrams > 0);
         assert_eq!(sender.stats().bootstrap_acks, 1);
     }
@@ -2372,7 +2535,12 @@ mod tests {
         let mut sender = sender(ParityPolicy::Off);
         let mut sink = Collector::new();
         for index in 1..=4 {
-            sender.send_frame(&mut sink, meta(index, index * 11_111), &payload(1), Duration::ZERO);
+            sender.send_frame(
+                &mut sink,
+                meta(index, index * 11_111),
+                &payload(1),
+                Duration::ZERO,
+            );
         }
 
         let mut back = Collector::new();
@@ -2400,7 +2568,10 @@ mod tests {
             },
             Duration::from_millis(40),
         );
-        assert!(sender.was_acked(4) && sender.was_acked(1), "the bitmap was not applied");
+        assert!(
+            sender.was_acked(4) && sender.was_acked(1),
+            "the bitmap was not applied"
+        );
         assert!(!sender.was_acked(3));
     }
 

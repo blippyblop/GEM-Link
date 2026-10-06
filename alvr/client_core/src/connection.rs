@@ -255,6 +255,11 @@ fn connection_pipeline(
             },
         )))
         .to_con()?;
+
+    alvr_common::smoke("handshake", || {
+        format!("ConnectionAccepted sent to {server_ip}")
+    });
+
     let config_packet =
         proto_control_socket.recv::<StreamConfigPacket>(HANDSHAKE_ACTION_TIMEOUT)?;
     dbg_connection!("connection_pipeline: stream config received");
@@ -265,6 +270,18 @@ fn connection_pipeline(
 
     let settings = stream_config.settings;
     let negotiated_config = stream_config.negotiated_config;
+
+    alvr_common::smoke("negotiated", || {
+        format!(
+            "view {}x{}, {} Hz, game audio {} Hz, codec {:?}, mic {} kbps",
+            negotiated_config.view_resolution.x,
+            negotiated_config.view_resolution.y,
+            negotiated_config.refresh_rate_hint,
+            negotiated_config.game_audio_sample_rate,
+            negotiated_config.audio_codec,
+            negotiated_config.microphone_bitrate_kbps,
+        )
+    });
 
     *ctx.max_prediction.write() = Duration::from_millis(settings.headset.max_prediction_ms);
 

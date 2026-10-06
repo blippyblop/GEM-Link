@@ -919,8 +919,8 @@ impl Receiver {
                     self.stats.max_erasures = erasures as u16;
                 }
                 // What the frame actually had, and how long it was given to get it.
-                self.stats.failed_waited_us += now.saturating_sub(frame.first_arrival).as_micros()
-                    as u64;
+                self.stats.failed_waited_us +=
+                    now.saturating_sub(frame.first_arrival).as_micros() as u64;
                 self.stats.failed_shards_present +=
                     frame.shards.iter().filter(|s| s.is_some()).count() as u64;
                 self.stats.failed_shards_total += frame.shards.len() as u64;
@@ -1636,7 +1636,11 @@ mod tests {
              {released:?}"
         );
         assert_eq!(receiver.stats().frames_held_late, 1);
-        assert_eq!(receiver.in_flight(), 1, "the reassembly state is still alive");
+        assert_eq!(
+            receiver.in_flight(),
+            1,
+            "the reassembly state is still alive"
+        );
 
         // And then the shard that was missing arrives, 500 ms late. Under the old rule this frame was
         // already gone: the datagram would have been counted `late` and dropped, and the frame
@@ -1706,7 +1710,10 @@ mod tests {
             &mut seq,
         );
         let released = receiver.release(Duration::from_millis(10));
-        assert!(released.is_empty(), "one frame behind a hole is not pressure");
+        assert!(
+            released.is_empty(),
+            "one frame behind a hole is not pressure"
+        );
 
         // Two newer frames: the stream has moved on, so the hole goes.
         send(

@@ -297,3 +297,18 @@ impl<T, E: Error + Send + Sync + 'static> ToAny<T> for Result<T, E> {
         }
     }
 }
+
+/// One log line per bring-up stage, ever (the Phase 0a smoke instrumentation). The question it
+/// answers is "how far did bring-up get on this device" — a stage that repeats every frame or
+/// every packet must not turn that answer into noise, so later calls with the same stage are
+/// dropped. Stage names are the bring-up ladder: display, runtime, session, lobby, discovery,
+/// handshake, negotiated, decoder-config, first-video-frame, xrEndFrame.
+pub fn smoke(stage: &'static str, message: impl FnOnce() -> String) {
+    static SMOKED_STAGES: OnceLock<Mutex<std::collections::HashSet<&'static str>>> =
+        OnceLock::new();
+    let stages = SMOKED_STAGES.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut stages = stages.lock();
+    if stages.insert(stage) {
+        log::info!("smoke[{stage}] {}", message());
+    }
+}

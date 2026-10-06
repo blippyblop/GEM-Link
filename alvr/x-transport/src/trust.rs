@@ -436,7 +436,12 @@ mod tests {
     ///
     /// `chain_root` is what the frame says it was encoded against, which the encoder fills in from
     /// the client's acknowledgements. Zero means "not stated".
-    fn send(gate: &mut SendGate, is_keyframe: bool, chain_root: u64, accepted: bool) -> SendDecision {
+    fn send(
+        gate: &mut SendGate,
+        is_keyframe: bool,
+        chain_root: u64,
+        accepted: bool,
+    ) -> SendDecision {
         let decision = gate.may_transmit(is_keyframe, chain_root);
         if decision == SendDecision::Transmit {
             gate.on_send_result(accepted);
@@ -513,7 +518,10 @@ mod tests {
 
         // The network refuses frame 2. Counted, and the stream continues.
         assert_eq!(send(&mut gate, false, 1, false), SendDecision::Transmit);
-        assert!(!gate.is_suppressed(), "a stated reference is enough to go on");
+        assert!(
+            !gate.is_suppressed(),
+            "a stated reference is enough to go on"
+        );
         assert_eq!(gate.discarded(), 1);
         assert_eq!(gate.suppressed_frames(), 0);
 
@@ -685,7 +693,10 @@ mod tests {
         let mut gate = TrustGate::new();
         assert_eq!(present(&mut gate, 1, true, false), FrameTrust::Trusted);
         // The decoder refuses frame 2.
-        assert_eq!(gate.may_present(2, false, false, 0, false), FrameTrust::Trusted);
+        assert_eq!(
+            gate.may_present(2, false, false, 0, false),
+            FrameTrust::Trusted
+        );
         gate.on_decoder_result(false);
         assert!(!gate.is_trusted());
         assert_eq!(
@@ -761,7 +772,10 @@ mod tests {
         assert_eq!(present(&mut trust, 1, true, false), FrameTrust::Trusted);
 
         // Frame 2 is discarded on the way out. It is never acknowledged.
-        assert_eq!(send(&mut send_gate, false, 1, false), SendDecision::Transmit);
+        assert_eq!(
+            send(&mut send_gate, false, 1, false),
+            SendDecision::Transmit
+        );
         assert_eq!(send_gate.discarded(), 1);
 
         // Frames 3 and 4 are encoded against frame 1 — the newest confirmed frame — and they go.
@@ -774,10 +788,7 @@ mod tests {
 
         // The client sees 1, then 3: a hole of one frame, chained to a frame it decoded. It presents,
         // because nothing it will decode depends on the missing frame.
-        assert_eq!(
-            present_chained(&mut trust, 3, 1, true),
-            FrameTrust::Trusted
-        );
+        assert_eq!(present_chained(&mut trust, 3, 1, true), FrameTrust::Trusted);
         assert_eq!(trust.trusted_across_gap(), 1);
         assert_eq!(trust.missed_frames(), 1, "the hole is still counted");
         assert!(trust.is_trusted());

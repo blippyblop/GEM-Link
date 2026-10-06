@@ -24,7 +24,23 @@
 //! network. Ours could not, which is how a 1.5 % client-side discard came to look like a network
 //! problem for two days.
 
-use std::time::{Duration, Instant};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
+
+/// The rig sweep fixture (see `pump`): the datagrams-per-second a `FRAMESIM_READ_LIMIT` env var
+/// asks this client to read at, or `None` when unset. Read once; a knob that flips mid-session
+/// would make the sensor's history lie.
+fn read_limit_per_sec() -> Option<f64> {
+    static LIMIT: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("FRAMESIM_READ_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|limit| *limit > 0.0)
+    })
+}
 
 use x_transport::{
     DeliveredFrame, FrameTrust, Receiver, RecvEvent, ReleasePolicy, UntrustedReason,
@@ -627,7 +643,24 @@ impl VideoPlane {
             Some(Instant::now() + budget)
         };
 
+        // The rig sweep fixture (ROADMAP coverage gap): `FRAMESIM_READ_LIMIT` paces the reads to
+        // simulate a client that cannot keep up, which is the client the budget and the ladder
+        // were built for and the one qemu at full speed refuses to be. Inert unless the env var
+        // is set to a positive datagrams-per-second number. The pacing sits *before* the read so
+        // the socket buffer overflows like a real slow client's, not like a paused one.
+        let read_limit = read_limit_per_sec();
+        let mut last_read = Instant::now();
+
         loop {
+            if let Some(limit) = read_limit {
+                let min_interval = Duration::from_secs_f64(1.0 / limit);
+                let elapsed = last_read.elapsed();
+                if elapsed < min_interval {
+                    thread::sleep(min_interval - elapsed);
+                }
+            }
+            last_read = Instant::now();
+
             match source.recv(&mut buffer, Duration::ZERO) {
                 SourceEvent::Datagram => {
                     self.stats.datagrams_received += 1;

@@ -352,6 +352,17 @@ pub fn entry_point(display: DisplayConnection) {
             .map(|s| s.runtime_version.into_raw()),
     );
 
+    alvr_common::smoke("runtime", || {
+        let props = xr_instance.properties();
+        match props {
+            Ok(props) => format!(
+                "runtime '{}' v{}, detected platform {platform}",
+                props.runtime_name, props.runtime_version
+            ),
+            Err(e) => format!("runtime properties unavailable ({e}); platform {platform}"),
+        }
+    });
+
     let graphics_context = Rc::new(GraphicsContext::new_gl());
 
     let mut last_lobby_message = String::new();
@@ -368,6 +379,10 @@ pub fn entry_point(display: DisplayConnection) {
 
         let (xr_session, mut xr_frame_waiter, mut xr_frame_stream) =
             create_session(&xr_instance, xr_system, &graphics_context, &display);
+
+        alvr_common::smoke("session", || {
+            "xrSession created (OpenGL, PRIMARY_STEREO)".to_string()
+        });
 
         let views_config = xr_instance
             .enumerate_view_configuration_views(
@@ -459,6 +474,8 @@ pub fn entry_point(display: DisplayConnection) {
             UVec2::min(default_view_resolution * 2, max_view_resolution),
             &last_lobby_message,
         );
+
+        alvr_common::smoke("lobby", || "interactive lobby live".to_string());
 
         // For Meta/Quest enabling body tracking would disable multimodal input
         let lobby_body_tracking_config = if platform.is_pico() {
@@ -700,6 +717,12 @@ pub fn entry_point(display: DisplayConnection) {
                 xr::EnvironmentBlendMode::OPAQUE,
                 layers,
             );
+
+            if res.is_ok() {
+                alvr_common::smoke("xrEndFrame", || {
+                    "first frame accepted by the compositor".to_string()
+                });
+            }
 
             if let Err(e) = res {
                 let time = to_xr_time(display_time);

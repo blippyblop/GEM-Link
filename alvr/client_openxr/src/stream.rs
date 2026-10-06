@@ -345,6 +345,8 @@ impl StreamContext {
         };
 
         if let Some(config) = maybe_config {
+            let codec = config.codec;
+            let config_bytes = config.config_buffer.len();
             let (mut sink, source) = video_decoder::create_decoder(config.clone(), {
                 let ctx = Arc::clone(&self.core_context);
                 move |maybe_timestamp: Result<Duration>| match maybe_timestamp {
@@ -353,6 +355,10 @@ impl StreamContext {
                 }
             });
             self.decoder = Some((config, source));
+
+            alvr_common::smoke("decoder-config", || {
+                format!("{codec:?} decoder created, {config_bytes} config bytes")
+            });
 
             self.core_context.set_decoder_input_callback(Box::new(
                 move |timestamp, buffer| -> bool { sink.push_nal(timestamp, buffer) },
@@ -400,6 +406,13 @@ impl StreamContext {
             }
 
             release_buffer = Some(frame.buffer);
+
+            alvr_common::smoke("first-video-frame", || {
+                format!(
+                    "first decoded frame out of the decoder at {:?}",
+                    frame.timestamp
+                )
+            });
 
             // Keep displaying new images even when their metadata is unavailable.
             (

@@ -43,5 +43,9 @@ fn main() {
         std::process::exit(EXIT_NO_DISPLAY);
     }
 
+    alvr_common::smoke("display", || {
+        "display connection ready — handing off to the OpenXR loader".to_string()
+    });
+
     alvr_client_openxr::entry_point(display);
 }
