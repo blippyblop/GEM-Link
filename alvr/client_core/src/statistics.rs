@@ -16,6 +16,21 @@ pub struct StatisticsManager {
     max_history_size: usize,
     prev_vsync: Instant,
     total_pipeline_latency_average: SlidingWindowAverage<Duration>,
+    /// Recent decode-stage durations (packet arrival → decoded), for the decode-budget check.
+    /// Bounded; one sample per decoded frame.
+    decode_samples: VecDeque<Duration>,
+}
+
+/// The decode-budget question, answered with a distribution: p50, p95, max. The budget is the
+/// frame interval — see the check in the client's report loop.
+fn percentiles(samples: &[Duration], fraction: f64) -> Option<Duration> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<Duration> = Vec::from(samples);
+    sorted.sort();
+    let index = ((sorted.len() as f64 - 1.0) * fraction).round() as usize;
+    Some(sorted[index])
 }
 
 impl StatisticsManager {
@@ -28,7 +43,23 @@ impl StatisticsManager {
                 Duration::ZERO,
                 max_history_size,
             ),
+            decode_samples: VecDeque::new(),
         }
+    }
+
+    /// The decode-stage distribution: (p50, p95, max) over the recent window. The budget check
+    /// compares p95 against the frame interval — a decoder that exceeds its frame's period does
+    /// not add latency, it adds *queueing*, which is the failure mode the ladder cannot fix.
+    pub fn decode_time_percentiles(
+        &self,
+    ) -> (Option<Duration>, Option<Duration>, Option<Duration>) {
+        // Flatten honestly: a percentile over a split VecDeque's slices is not a percentile.
+        let all: Vec<Duration> = self.decode_samples.iter().copied().collect();
+        (
+            percentiles(&all, 0.50),
+            percentiles(&all, 0.95),
+            all.last().copied(),
+        )
     }
 
     pub fn report_input_acquired(&mut self, target_timestamp: Duration) {
@@ -71,6 +102,12 @@ impl StatisticsManager {
         {
             frame.client_stats.video_decode =
                 Instant::now().saturating_duration_since(frame.video_packet_received);
+
+            self.decode_samples
+                .push_back(frame.client_stats.video_decode);
+            while self.decode_samples.len() > 256 {
+                self.decode_samples.pop_front();
+            }
         }
     }
 

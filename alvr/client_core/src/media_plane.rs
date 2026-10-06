@@ -468,12 +468,13 @@ pub struct PlaneStats {
 }
 
 impl PlaneStats {
-    /// The header for [`Self::csv_row`], so the fixture file is self-describing.
+    /// The header for [`Self::csv_row_with`], so the fixture file is self-describing.
     pub fn csv_header() -> &'static str {
         "datagrams_in,dropped_by_source,rejected,frames_presented,across_hole,frames_held,\
          held_no_keyframe,held_gap,held_datagram_loss,held_unconfirmed_reference,held_decoder,\
          abandoned,repaired_fec,keyframes_in,keyframes_clean,nacks,nacks_suppressed,\
-         keyframe_requests,resets,acks,read_per_sec,m2p_avg_ms"
+         keyframe_requests,resets,acks,read_per_sec,m2p_avg_ms,decode_p50_ms,decode_p95_ms,\
+         decode_budget_ok"
     }
 
     /// One counter vector as a CSV row, for the `GEMPLINK_DEBUG_CSV` fixture. Cumulative counts —
@@ -481,13 +482,33 @@ impl PlaneStats {
     ///
     /// `m2p_average` is the client's measured total pipeline latency (input sample acquired →
     /// submitted → predicted vsync), averaged over the statistics window. All device-clock, so
-    /// the display's own response time is the only thing the reader adds.
-    pub fn csv_row_with_m2p(&self, m2p_average: Option<Duration>) -> String {
-        let m2p_ms = m2p_average
-            .map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0))
-            .unwrap_or_default();
+    /// the display's own response time is the only thing the reader adds. The decode percentiles
+    /// feed the decode-budget sweep (doc 55): bitrate/codec arms are comparable on p95.
+    pub fn csv_row_with(
+        &self,
+        m2p_average: Option<Duration>,
+        decode_percentiles: Option<(Option<Duration>, Option<Duration>, Option<Duration>)>,
+        frame_interval: Duration,
+    ) -> String {
+        let ms = |d: Option<Duration>| {
+            d.map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0))
+                .unwrap_or_default()
+        };
+        let m2p_ms = ms(m2p_average);
+        let (decode_p50_ms, decode_p95_ms, budget_ok) = match decode_percentiles {
+            Some((p50, p95, _)) => (
+                ms(p50),
+                ms(p95),
+                match p95 {
+                    Some(p95) if p95 < frame_interval => "1".to_string(),
+                    Some(_) => "0".to_string(),
+                    None => String::new(),
+                },
+            ),
+            None => (String::new(), String::new(), String::new()),
+        };
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.datagrams_received,
             self.datagrams_dropped_by_source,
             self.datagrams_rejected,
@@ -510,6 +531,9 @@ impl PlaneStats {
             self.acks_sent,
             self.read_per_sec,
             m2p_ms,
+            decode_p50_ms,
+            decode_p95_ms,
+            budget_ok,
         )
     }
 

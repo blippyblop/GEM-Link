@@ -491,6 +491,7 @@ fn connection_pipeline(
 
     let video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
+        let frame_interval = frame_interval;
         let mut plane = crate::media_plane::MediaPlaneReceiver::new(
             media_socket,
             media_release_policy,
@@ -540,6 +541,39 @@ fn connection_pipeline(
                         );
                     }
 
+                    // The decode budget: p95 of the decode stage against the frame interval. A
+                    // decoder over its frame's period does not add latency — it adds queueing,
+                    // which no later stage can recover. Violations are warned and logged, never
+                    // traded against: the latency objective and integrity are upstream of this.
+                    let decode_percentiles = ctx
+                        .statistics_manager
+                        .lock()
+                        .as_ref()
+                        .map(|stats| stats.decode_time_percentiles());
+                    if let Some((p50, p95, _max)) = decode_percentiles {
+                        let ms = |d: Option<Duration>| {
+                            d.map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0))
+                                .unwrap_or_else(|| "?".into())
+                        };
+                        let budget_ok = p95.is_none_or(|p95| p95 < frame_interval);
+                        info!(
+                            "decode: p50 {} ms, p95 {} ms against a {:.1} ms frame interval — budget {}",
+                            ms(p50),
+                            ms(p95),
+                            frame_interval.as_secs_f64() * 1000.0,
+                            if budget_ok {
+                                "OK"
+                            } else {
+                                "VIOLATED (decoder queueing will follow)"
+                            }
+                        );
+                        if !budget_ok {
+                            warn!(
+                                "decode p95 exceeds the frame interval; lower bitrate/resolution or change codec"
+                            );
+                        }
+                    }
+
                     // The link-debug fixture: `GEMPLINK_DEBUG_CSV=<path>` appends the same
                     // counters as one CSV row per report, for graphing the inevitable
                     // link-quality investigation afterwards. Inert unless set.
@@ -558,8 +592,15 @@ fn connection_pipeline(
                                     crate::media_plane::PlaneStats::csv_header()
                                 );
                             }
-                            let _ =
-                                writeln!(file, "{}", plane.stats().csv_row_with_m2p(m2p_average));
+                            let _ = writeln!(
+                                file,
+                                "{}",
+                                plane.stats().csv_row_with(
+                                    m2p_average,
+                                    decode_percentiles,
+                                    frame_interval
+                                )
+                            );
                         }
                     }
                 }
