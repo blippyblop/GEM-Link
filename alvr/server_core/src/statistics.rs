@@ -6,6 +6,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Microseconds on this machine's monotonic clock, measured from process start — comparable
+/// within one session, which is what a trace is for. `Instant` has no absolute epoch.
+fn stage_us(instant: Instant) -> u128 {
+    static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    instant
+        .duration_since(*PROCESS_START.get_or_init(Instant::now))
+        .as_nanos()
+        / 1_000
+}
+
 const FULL_REPORT_INTERVAL: Duration = Duration::from_millis(500);
 const EPS_INTERVAL: Duration = Duration::from_micros(1);
 
@@ -289,6 +299,41 @@ impl StatisticsManager {
 
     pub fn motion_to_photon_latency_average(&self) -> Duration {
         self.motion_to_photon_latency_average.get_average()
+    }
+
+    /// One row of the per-frame timing trace, in the stage order Valve's own driver_vrlink emits
+    /// (`Present ID, App Submit, Encode Start, Encode End, …`), so a GemLink session and a
+    /// vrlink session produce mergeable traces: same stages, PC clock throughout, one row per
+    /// frame that has reached encode. Timestamps are microseconds on the server's monotonic
+    /// clock. A frame only reaches this trace once it has been encoded (its byte count is the
+    /// completeness marker); earlier-stage times are real by then. Frames that never got
+    /// tracking or never encoded are not traced. See `VD_RE/55-benchmark-protocol.md`.
+    pub fn trace_row(&self, frame_index: u64) -> Option<String> {
+        // Newest first, matching the history's push_front order. An unencoded frame (no bytes)
+        // has default-filled stages that would read as real times — refuse it rather than lie.
+        let frame = self
+            .history_buffer
+            .front()
+            .filter(|f| f.video_packet_bytes > 0)?;
+        Some(format!(
+            "{},{},{},{},{},{},{},{}",
+            frame_index,
+            stage_us(frame.frame_present),
+            stage_us(frame.frame_composed),
+            stage_us(frame.frame_encoded),
+            stage_us(frame.tracking_received),
+            frame.video_packet_bytes,
+            frame.total_pipeline_latency.as_nanos() / 1_000,
+            self.motion_to_photon_latency_average
+                .get_average()
+                .as_nanos()
+                / 1_000,
+        ))
+    }
+
+    pub fn trace_header() -> &'static str {
+        "present_id,app_submit_us,encode_start_us,encode_end_us,tracking_received_us,\
+         video_packet_bytes,total_pipeline_latency_us,m2p_avg_us"
     }
 
     pub fn tracker_pose_time_offset(&self) -> Duration {

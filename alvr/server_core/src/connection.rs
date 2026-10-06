@@ -1669,6 +1669,30 @@ fn connection_pipeline(
                     let decoder_latency = client_stats.video_decode;
                     let (network_latency, game_latency) = stats.report_statistics(client_stats);
 
+                    // The per-frame benchmark trace (VD_RE/55): the same stage list Valve's
+                    // driver_vrlink emits, one row per encoded frame, for offline comparison
+                    // against a vrlink session. `GEMPLINK_TRACE_CSV=<path>` enables it.
+                    if let Some(path) = trace_csv_path() {
+                        let header_needed = !path.exists();
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                        {
+                            use std::io::Write;
+                            if header_needed {
+                                let _ = writeln!(
+                                    file,
+                                    "{}",
+                                    crate::statistics::StatisticsManager::trace_header()
+                                );
+                            }
+                            if let Some(row) = stats.trace_row(timestamp.as_nanos() as u64) {
+                                let _ = writeln!(file, "{row}");
+                            }
+                        }
+                    }
+
                     ctx.events_sender
                         .send(ServerCoreEvent::GameRenderLatencyFeedback(game_latency))
                         .ok();
@@ -2068,4 +2092,16 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: End");
 
     Ok(())
+}
+
+/// `GEMPLINK_TRACE_CSV=<path>` enables the per-frame benchmark trace (VD_RE/55). Read once.
+fn trace_csv_path() -> Option<std::path::PathBuf> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("GEMPLINK_TRACE_CSV")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .clone()
 }

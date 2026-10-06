@@ -6,7 +6,7 @@ mod haptics;
 mod input_mapping;
 mod logging_backend;
 mod sockets;
-mod statistics;
+pub mod statistics;
 mod tracking;
 mod web_server;
 
