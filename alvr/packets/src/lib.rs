@@ -113,6 +113,8 @@ pub struct ClientNegotiatedStreamingConfig {
     pub refresh_rate_hint: f32,
     pub game_audio_sample_rate: u32,
     pub audio_codec: AudioCodec,
+    /// The server's configured microphone bitrate (kbps); the client encodes the mic.
+    pub microphone_bitrate_kbps: u32,
     pub foveated_encoding: Option<AlvrFoveatedEncodingParams>,
     pub encoding_gamma: f32,
     pub enable_hdr: bool,

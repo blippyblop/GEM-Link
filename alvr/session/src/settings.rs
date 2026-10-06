@@ -803,6 +803,13 @@ pub struct GameAudioConfig {
     #[schema(strings(display_name = "Mute desktop audio when streaming"))]
     pub mute_when_streaming: bool,
 
+    #[schema(strings(
+        display_name = "Bitrate",
+        notice = r"Opus stereo for game audio. Transparent from 192 kbps; use the top of the range for provably-safe headroom."
+    ))]
+    #[schema(gui(slider(min = 96, max = 1024)), suffix = "kbps")]
+    pub bitrate_kbps: u32,
+
     pub buffering: AudioBufferingConfig,
 }
 
@@ -834,6 +841,13 @@ pub enum MicrophoneDevicesConfig {
 pub struct MicrophoneConfig {
     #[cfg_attr(target_os = "linux", schema(flag = "hidden"))]
     pub devices: MicrophoneDevicesConfig,
+
+    #[schema(strings(
+        display_name = "Bitrate",
+        notice = r"Opus mono for the headset microphone, with in-band FEC and DTX. Silence stays nearly free regardless of the setting."
+    ))]
+    #[schema(gui(slider(min = 24, max = 512)), suffix = "kbps")]
+    pub bitrate_kbps: u32,
 
     pub buffering: AudioBufferingConfig,
 }
@@ -1993,6 +2007,7 @@ pub fn session_settings_default() -> SettingsDefault {
                         content: default_custom_audio_device.clone(),
                     },
                     mute_when_streaming: true,
+                    bitrate_kbps: 192,
                     buffering: AudioBufferingConfigDefault {
                         gui_collapsed: true,
                         average_buffering_ms: 50,
@@ -2011,6 +2026,7 @@ pub fn session_settings_default() -> SettingsDefault {
                         },
                         variant: MicrophoneDevicesConfigDefaultVariant::Automatic,
                     },
+                    bitrate_kbps: 72,
                     buffering: AudioBufferingConfigDefault {
                         gui_collapsed: true,
                         average_buffering_ms: 50,

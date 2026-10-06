@@ -283,6 +283,7 @@ fn main() {
             refresh_rate_hint: 90.0,
             game_audio_sample_rate: 48000,
             audio_codec: alvr_session::AudioCodec::Raw,
+            microphone_bitrate_kbps: 72,
             foveated_encoding: Some(foveation_params.clone()),
             encoding_gamma: 1.0,
             enable_hdr: false,

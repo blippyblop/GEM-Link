@@ -691,9 +691,12 @@ fn connection_pipeline(
         alvr_audio::AudioEncoding::Opus {
             application: alvr_audio::Application::LowDelay,
             frame_ms: 10,
-            // User directive 2026-10-06: 2x the initial 96 kbps. 192 kbps Opus stereo is
-            // transparent for all game content; bandwidth is free beside the 30 Mbps video.
-            bitrate_bps: 192_000,
+            // User-configurable (96–1024 kbps, default 192). Transparent from 192; bandwidth is
+            // free beside the 30 Mbps video.
+            bitrate_bps: match &initial_settings.audio.game_audio {
+                Switch::Enabled(config) => config.bitrate_kbps.clamp(96, 1024) * 1000,
+                Switch::Disabled => 192_000,
+            },
             inband_fec: false,
             dtx: false,
             expected_loss_percent: 0,
@@ -1045,6 +1048,10 @@ fn connection_pipeline(
             refresh_rate_hint: fps,
             game_audio_sample_rate,
             audio_codec,
+            microphone_bitrate_kbps: match &initial_settings.audio.microphone {
+                Switch::Enabled(config) => config.bitrate_kbps.clamp(24, 512),
+                Switch::Disabled => 72,
+            },
             foveated_encoding,
             encoding_gamma,
             enable_hdr,
