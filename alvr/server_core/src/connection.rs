@@ -1450,8 +1450,9 @@ fn connection_pipeline(
                     };
                     info!(
                         "encoder: {mean_bytes:.0} B/frame ({mean_mbps:.2} Mbps at {fps:.0} fps), asked \
-                         for {asked_mbps:.2} Mbps, sending 1 frame in {divisor}; client reads \
-                         {read_ceiling} datagram(s)/s, budget {} datagram(s)/s",
+                         for {asked_mbps:.2} Mbps, sending 1 frame in {divisor}; read ceiling \
+                         {read_ceiling} datagram(s)/s (high-water, floored at 80), budget {} \
+                         datagram(s)/s",
                         budget.unwrap_or(0.0).round() as u64
                     );
                     info!(

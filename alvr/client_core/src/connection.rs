@@ -523,6 +523,28 @@ fn connection_pipeline(
                     info!("{}", plane.stats().summary());
                     info!("{}", plane.receiver_account());
                     info!("{}", plane.failed_frame_account());
+
+                    // The link-debug fixture: `GEMPLINK_DEBUG_CSV=<path>` appends the same
+                    // counters as one CSV row per report, for graphing the inevitable
+                    // link-quality investigation afterwards. Inert unless set.
+                    if let Some(path) = crate::media_plane::debug_csv_path() {
+                        let header_needed = !path.exists();
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                        {
+                            use std::io::Write;
+                            if header_needed {
+                                let _ = writeln!(
+                                    file,
+                                    "{}",
+                                    crate::media_plane::PlaneStats::csv_header()
+                                );
+                            }
+                            let _ = writeln!(file, "{}", plane.stats().csv_row());
+                        }
+                    }
                 }
 
                 for action in actions {

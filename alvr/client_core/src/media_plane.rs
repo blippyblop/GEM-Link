@@ -42,6 +42,19 @@ fn read_limit_per_sec() -> Option<f64> {
     })
 }
 
+/// `GEMPLINK_DEBUG_CSV=<path>` turns on the per-report CSV fixture (see the stats loop in
+/// `connection.rs`). Read once.
+pub fn debug_csv_path() -> Option<std::path::PathBuf> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("GEMPLINK_DEBUG_CSV")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .clone()
+}
+
 use x_transport::{
     DeliveredFrame, FrameTrust, Receiver, RecvEvent, ReleasePolicy, UntrustedReason,
 };
@@ -455,6 +468,43 @@ pub struct PlaneStats {
 }
 
 impl PlaneStats {
+    /// The header for [`Self::csv_row`], so the fixture file is self-describing.
+    pub fn csv_header() -> &'static str {
+        "datagrams_in,dropped_by_source,rejected,frames_presented,across_hole,frames_held,\
+         held_no_keyframe,held_gap,held_datagram_loss,held_unconfirmed_reference,held_decoder,\
+         abandoned,repaired_fec,keyframes_in,keyframes_clean,nacks,nacks_suppressed,\
+         keyframe_requests,resets,acks,read_per_sec"
+    }
+
+    /// One counter vector as a CSV row, for the `GEMPLINK_DEBUG_CSV` fixture. Cumulative counts —
+    /// deltas are the reader's job, which keeps this honest when rows are missed.
+    pub fn csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.datagrams_received,
+            self.datagrams_dropped_by_source,
+            self.datagrams_rejected,
+            self.frames_presented,
+            self.frames_trusted_across_gap,
+            self.frames_held,
+            self.held_no_keyframe,
+            self.held_gap,
+            self.held_datagram_loss,
+            self.held_unconfirmed_reference,
+            self.held_decoder,
+            self.frames_abandoned,
+            self.frames_repaired,
+            self.keyframes_in,
+            self.keyframes_clean,
+            self.nacks_sent,
+            self.nacks_suppressed,
+            self.keyframe_requests,
+            self.resets,
+            self.acks_sent,
+            self.read_per_sec,
+        )
+    }
+
     pub fn summary(&self) -> String {
         format!(
             "video plane: {} datagrams in ({} dropped by source, {} rejected), {} frames presented \
