@@ -856,9 +856,9 @@ pub struct MicrophoneConfig {
 #[derive(SettingsSchema, Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[schema(gui = "button_group")]
 pub enum AudioCodec {
-    #[default]
     #[schema(strings(display_name = "Opus (low latency)"))]
     Opus = 0,
+    #[default]
     #[schema(strings(display_name = "Uncompressed (raw PCM)"))]
     Raw = 1,
 }
@@ -880,7 +880,7 @@ pub struct AudioConfig {
 
     #[schema(strings(
         display_name = "Codec",
-        notice = r"Opus encodes both directions at low latency (Steam Link-style). Raw PCM is the fallback and the vrlink behavior."
+        notice = r"Default: uncompressed PCM — vrlink's behavior, zero codec delay, bandwidth is free. Opus trades a few ms of codec delay for ~1.5 Mbps less traffic."
     ))]
     pub codec: AudioCodec,
 }
@@ -2035,7 +2035,7 @@ pub fn session_settings_default() -> SettingsDefault {
                 },
             },
             codec: AudioCodecDefault {
-                variant: AudioCodecDefaultVariant::Opus,
+                variant: AudioCodecDefaultVariant::Raw,
             },
         },
         headset: HeadsetConfigDefault {
