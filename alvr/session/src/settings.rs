@@ -838,6 +838,17 @@ pub struct MicrophoneConfig {
     pub buffering: AudioBufferingConfig,
 }
 
+#[repr(u8)]
+#[derive(SettingsSchema, Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[schema(gui = "button_group")]
+pub enum AudioCodec {
+    #[default]
+    #[schema(strings(display_name = "Opus (low latency)"))]
+    Opus = 0,
+    #[schema(strings(display_name = "Raw PCM"))]
+    Raw = 1,
+}
+
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct AudioConfig {
     #[schema(strings(display_name = "Headset speaker"))]
@@ -852,6 +863,12 @@ pub struct AudioConfig {
     )]
     #[cfg_attr(not(windows), schema(strings(display_name = "Headset microphone")))]
     pub microphone: Switch<MicrophoneConfig>,
+
+    #[schema(strings(
+        display_name = "Codec",
+        notice = r"Opus encodes both directions at low latency (Steam Link-style). Raw PCM is the fallback and the vrlink behavior."
+    ))]
+    pub codec: AudioCodec,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -2000,6 +2017,9 @@ pub fn session_settings_default() -> SettingsDefault {
                         batch_ms: 10,
                     },
                 },
+            },
+            codec: AudioCodecDefault {
+                variant: AudioCodecDefaultVariant::Opus,
             },
         },
         headset: HeadsetConfigDefault {

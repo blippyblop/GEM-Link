@@ -6,8 +6,8 @@ use alvr_common::{
     semver::Version,
 };
 use alvr_session::{
-    ClientsidePostProcessingConfig, CodecType, PassthroughMode, PerformanceLevel, SessionConfig,
-    Settings,
+    AudioCodec, ClientsidePostProcessingConfig, CodecType, PassthroughMode, PerformanceLevel,
+    SessionConfig, Settings,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,12 @@ pub const fn media_port(stream_port: u16) -> u16 {
 }
 pub const STATISTICS: u16 = 4;
 
+// Bits for VideoStreamingCapabilities::audio_codecs. The client advertises what it can decode
+// (and encode, for the microphone); the server picks and names the choice in
+// ClientNegotiatedStreamingConfig::audio_codec.
+pub const AUDIO_CODEC_RAW_BIT: u32 = 1 << 0;
+pub const AUDIO_CODEC_OPUS_BIT: u32 = 1 << 1;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoStreamingCapabilitiesExt {
     // Nothing for now
@@ -61,6 +67,7 @@ pub struct VideoStreamingCapabilities {
     pub prefer_10bit: bool,
     pub preferred_encoding_gamma: f32,
     pub prefer_hdr: bool,
+    pub audio_codecs: u32,
     pub ext_str: String,
 }
 
@@ -105,6 +112,7 @@ pub struct ClientNegotiatedStreamingConfig {
     pub view_resolution: UVec2,
     pub refresh_rate_hint: f32,
     pub game_audio_sample_rate: u32,
+    pub audio_codec: AudioCodec,
     pub foveated_encoding: Option<AlvrFoveatedEncodingParams>,
     pub encoding_gamma: f32,
     pub enable_hdr: bool,

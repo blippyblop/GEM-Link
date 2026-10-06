@@ -302,7 +302,12 @@ pub fn run_transport(scenario: &TransportScenario, seed: u64) -> TransportMetric
     let mut receiver = Receiver::new(release_policy, schedule.clone().map(MediaKeys::rotating));
 
     let mut sender = MediaSender::new(
-        SenderConfig::matching_policy(scenario.mtu, scenario.parity(), &release_policy),
+        SenderConfig::matching_policy(
+            scenario.mtu,
+            scenario.parity(),
+            &release_policy,
+            frame_interval,
+        ),
         PacerConfig::for_rate(scenario.bitrate_mbps as u64 * 1_000_000, frame_interval),
         frame_interval,
         schedule.clone(),
@@ -657,7 +662,13 @@ pub fn transport_scenarios() -> Vec<TransportScenario> {
             Duration::from_secs_f64(rtt_ms / 1000.0),
             Duration::from_secs_f64(1.0 / 90.0),
         );
-        let window_ms = policy.deadline.as_secs_f64() * 1000.0;
+        // The policy no longer carries a hard deadline (frames are held while the stream is
+        // stalled, abandoned only under slot pressure); the worst a frame can legitimately wait
+        // is its repair window plus the hold the stream's progress grants it.
+        let frame_interval = Duration::from_secs_f64(1.0 / 90.0);
+        let window_ms = (policy.repair_delay + policy.late_hold_frames as u32 * frame_interval)
+            .as_secs_f64()
+            * 1000.0;
         TransportScenario {
             name: name.to_string(),
             profile,
@@ -765,7 +776,11 @@ pub fn transport_scenarios() -> Vec<TransportScenario> {
             // repair round is worth, so its budget is deliberately "anything".
             max_missing_pct: 100.0,
             max_missing_tail_pct: 100.0,
-            max_late_pct: 0.0,
+            // And late too, since the hold-based release policy: a frame whose predecessor has a
+            // hole is held until the stream moves on, which the metric reads as late. That is the
+            // designed trade — display across a gap beats a hole — so the control publishes it
+            // rather than enforcing a tail it exists to violate.
+            max_late_pct: 100.0,
             ..base("x", "ncm_wired")
         },
         // Controls. Without these the gate cannot tell "the FEC fixed it" from "the profile

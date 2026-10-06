@@ -18,7 +18,7 @@ use alvr_packets::{
     HAPTICS, Haptics, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
     VideoPacketHeader, VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
 };
-use alvr_session::{SocketProtocol, settings_schema::Switch};
+use alvr_session::{AudioCodec, SocketProtocol, settings_schema::Switch};
 use alvr_sockets::media::MediaSocket;
 use alvr_sockets::media_key::{MediaKeyExchange, MediaKeyRole};
 use alvr_sockets::{
@@ -216,9 +216,15 @@ fn connection_pipeline(
 
     *connection_state_lock = ConnectionState::Connecting;
 
-    // TODO: Don't fetch cpal sample rate, get directly from AAudio
-    let microphone_sample_rate =
-        alvr_audio::input_sample_rate(&alvr_audio::new_input(None).to_con()?).to_con()?;
+    // The mic probe must never fail the connection: a headset with no usable capture device
+    // still streams video. A zero rate tells the server there is no microphone.
+    let microphone_sample_rate = match alvr_audio::new_input(None) {
+        Ok(device) => alvr_audio::input_sample_rate(&device).to_con().unwrap_or(0),
+        Err(e) => {
+            warn!("No microphone available, streaming without one: {e:?}");
+            0
+        }
+    };
 
     dbg_connection!("connection_pipeline: Send stream capabilities");
     proto_control_socket
@@ -240,6 +246,8 @@ fn connection_pipeline(
                         prefer_10bit: capabilities.prefer_10bit,
                         preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
                         prefer_hdr: capabilities.prefer_hdr,
+                        audio_codecs: alvr_packets::AUDIO_CODEC_RAW_BIT
+                            | alvr_packets::AUDIO_CODEC_OPUS_BIT,
                         ext_str: String::new(),
                     }
                     .with_ext(VideoStreamingCapabilitiesExt {}),
@@ -726,6 +734,19 @@ fn connection_pipeline(
 
     let game_audio_thread = if let Switch::Enabled(config) = settings.audio.game_audio {
         let device = alvr_audio::new_output(None).to_con()?;
+        info!(
+            "Audio out open: {} Hz, 2ch, codec {:?}",
+            negotiated_config.game_audio_sample_rate, negotiated_config.audio_codec
+        );
+
+        let game_audio_decoding = match negotiated_config.audio_codec {
+            AudioCodec::Opus => alvr_audio::AudioDecoding::Opus {
+                sample_rate: negotiated_config.game_audio_sample_rate,
+                frame_ms: 10,
+            },
+            AudioCodec::Raw => alvr_audio::AudioDecoding::Raw,
+        };
+
         thread::spawn({
             let ctx = Arc::clone(&ctx);
             move || {
@@ -737,6 +758,7 @@ fn connection_pipeline(
                         negotiated_config.game_audio_sample_rate,
                         config.buffering.clone(),
                         &mut game_audio_receiver,
+                        game_audio_decoding,
                     ));
                 }
             }
@@ -746,32 +768,51 @@ fn connection_pipeline(
     };
 
     let microphone_thread = if matches!(settings.audio.microphone, Switch::Enabled(_)) {
-        let device = alvr_audio::new_input(None).to_con()?;
+        match alvr_audio::new_input(None) {
+            Ok(device) => {
+                let microphone_encoding = match negotiated_config.audio_codec {
+                    AudioCodec::Opus => alvr_audio::AudioEncoding::Opus {
+                        application: alvr_audio::Application::Voip,
+                        frame_ms: 20,
+                        bitrate_bps: 24_000,
+                        inband_fec: true,
+                        dtx: true,
+                        expected_loss_percent: 10,
+                    },
+                    AudioCodec::Raw => alvr_audio::AudioEncoding::Raw,
+                };
 
-        let microphone_sender = stream_socket.request_stream(AUDIO);
+                let microphone_sender = stream_socket.request_stream(AUDIO);
 
-        thread::spawn({
-            let ctx = Arc::clone(&ctx);
-            move || {
-                while is_streaming(&ctx) {
+                thread::spawn({
                     let ctx = Arc::clone(&ctx);
-                    match audio::record_audio_blocking(
-                        Arc::new(move || is_streaming(&ctx)),
-                        microphone_sender.clone(),
-                        &device,
-                        1,
-                        false,
-                    ) {
-                        Ok(()) => break,
-                        Err(e) => {
-                            error!("Audio record error: {e}");
+                    move || {
+                        while is_streaming(&ctx) {
+                            let ctx = Arc::clone(&ctx);
+                            match audio::record_audio_blocking(
+                                Arc::new(move || is_streaming(&ctx)),
+                                microphone_sender.clone(),
+                                &device,
+                                1,
+                                false,
+                                microphone_encoding,
+                            ) {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    error!("Audio record error: {e}");
 
-                            continue;
+                                    continue;
+                                }
+                            }
                         }
                     }
-                }
+                })
             }
-        })
+            Err(e) => {
+                warn!("Microphone enabled but no capture device available: {e:?}");
+                thread::spawn(|| ())
+            }
+        }
     } else {
         thread::spawn(|| ())
     };

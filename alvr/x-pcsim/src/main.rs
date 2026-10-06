@@ -282,6 +282,7 @@ fn main() {
             view_resolution: UVec2::new(view_w, view_h),
             refresh_rate_hint: 90.0,
             game_audio_sample_rate: 48000,
+            audio_codec: alvr_session::AudioCodec::Raw,
             foveated_encoding: Some(foveation_params.clone()),
             encoding_gamma: 1.0,
             enable_hdr: false,

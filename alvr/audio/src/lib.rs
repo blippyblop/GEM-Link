@@ -24,6 +24,33 @@ use std::{collections::VecDeque, sync::Arc, thread, time::Duration};
 
 pub use cpal::Device;
 
+mod opus;
+pub use opus::{Application, OpusDecoder, OpusEncoder, nearest_opus_rate};
+
+/// What the sender puts on the AUDIO stream. Raw PCM is one i16 chunk per device callback
+/// (the upstream behavior); Opus accumulates callback chunks into codec frames and sends one
+/// self-contained packet per frame, so a lost packet is concealable instead of a silent hole.
+#[derive(Clone, Copy, Debug)]
+pub enum AudioEncoding {
+    Raw,
+    Opus {
+        application: Application,
+        frame_ms: u32,
+        bitrate_bps: u32,
+        inband_fec: bool,
+        dtx: bool,
+        expected_loss_percent: i32,
+    },
+}
+
+/// What the receiver expects from the AUDIO stream. The rate is the negotiated stream rate,
+/// which is always a rate libopus accepts when Opus is negotiated.
+#[derive(Clone, Copy, Debug)]
+pub enum AudioDecoding {
+    Raw,
+    Opus { sample_rate: u32, frame_ms: u32 },
+}
+
 fn device_from_custom_config(
     host: &Host,
     config: &CustomAudioDeviceConfig,
@@ -252,6 +279,7 @@ pub fn record_audio_blocking(
     device: &Device,
     channels_count: u16,
     mute: bool,
+    encoding: AudioEncoding,
 ) -> Result<()> {
     let config = device
         .default_input_config()
@@ -278,6 +306,92 @@ pub fn record_audio_blocking(
 
     let state = Arc::new(Mutex::new(AudioRecordState::Recording));
 
+    // For Opus, the callback accumulates samples and encodes whole frames; the encoder is built
+    // here, where the device's real rate is known, mapped to the nearest rate libopus accepts.
+    struct OpusCapture {
+        encoder: OpusEncoder,
+        device_rate: u32,
+        opus_rate: u32,
+        channels: usize,
+        accumulator: Vec<i16>,
+        carry: Vec<i16>,
+    }
+
+    impl OpusCapture {
+        fn ingest(&mut self, input: &[i16], send: &mut dyn FnMut(&[u8])) -> Result<()> {
+            // Carry the last frame across calls so the linear resampler stays continuous.
+            let samples: Vec<i16> = if self.opus_rate == self.device_rate {
+                input.to_vec()
+            } else {
+                let mut joined = Vec::with_capacity(self.carry.len() + input.len());
+                joined.extend_from_slice(&self.carry);
+                joined.extend_from_slice(input);
+                let frames = joined.len() / self.channels;
+
+                let mut resampled = Vec::new();
+                opus::resample_linear(
+                    &joined,
+                    self.channels,
+                    self.device_rate,
+                    self.opus_rate,
+                    &mut resampled,
+                );
+
+                self.carry.clear();
+                if frames > 0 {
+                    self.carry
+                        .extend_from_slice(&joined[(frames - 1) * self.channels..]);
+                }
+                resampled
+            };
+
+            self.accumulator.extend_from_slice(&samples);
+
+            let frame_len = self.encoder.frame_samples() * self.channels;
+            while self.accumulator.len() >= frame_len {
+                let packet = self
+                    .encoder
+                    .encode(&self.accumulator[..frame_len])?
+                    .to_vec();
+                self.accumulator.drain(..frame_len);
+                send(&packet);
+            }
+            Ok(())
+        }
+    }
+
+    let capture_codec = match encoding {
+        AudioEncoding::Raw => None,
+        AudioEncoding::Opus {
+            application,
+            frame_ms,
+            bitrate_bps,
+            inband_fec,
+            dtx,
+            expected_loss_percent,
+        } => {
+            let device_rate = stream_config.sample_rate.0;
+            let opus_rate = opus::nearest_opus_rate(device_rate);
+            Some(Arc::new(Mutex::new(OpusCapture {
+                encoder: OpusEncoder::new(
+                    opus_rate,
+                    channels_count as usize,
+                    application,
+                    frame_ms,
+                    bitrate_bps,
+                    inband_fec,
+                    dtx,
+                    expected_loss_percent,
+                )?,
+                device_rate,
+                opus_rate,
+                channels: channels_count as usize,
+                accumulator: Vec::new(),
+                carry: Vec::new(),
+            })))
+        }
+    };
+
     let stream = device.build_input_stream_raw(
         &stream_config,
         config.sample_format(),
@@ -302,7 +416,25 @@ pub fn record_audio_blocking(
                 let data = downmix_audio(data, config.channels(), channels_count);
 
                 if is_running() {
-                    sender.send_header_with_payload(&(), &data).ok();
+                    if let Some(capture) = &capture_codec {
+                        // The downmixed bytes are little-endian i16 frames; the encoder wants
+                        // them as samples.
+                        let samples: Vec<i16> = data
+                            .chunks_exact(2)
+                            .map(|c| i16::from_ne_bytes([c[0], c[1]]))
+                            .collect();
+                        let mut send_result = Ok(());
+                        let ingest_result = capture.lock().ingest(&samples, &mut |packet| {
+                            if let Err(e) = sender.send_header_with_payload(&(), packet) {
+                                send_result = Err(e);
+                            }
+                        });
+                        if let Err(e) = ingest_result.or(send_result) {
+                            *state.lock() = AudioRecordState::Err(Some(e));
+                        }
+                    } else {
+                        sender.send_header_with_payload(&(), &data).ok();
+                    }
                 } else {
                     *state.lock() = AudioRecordState::ShouldStop;
                 }
@@ -381,7 +513,15 @@ pub fn receive_samples_loop(
     channels_count: usize,
     batch_frames_count: usize,
     average_buffer_frames_count: usize,
+    decoding: AudioDecoding,
 ) -> Result<()> {
+    let mut decoder = match decoding {
+        AudioDecoding::Raw => None,
+        AudioDecoding::Opus {
+            sample_rate,
+            frame_ms,
+        } => Some(OpusDecoder::new(sample_rate, channels_count, frame_ms)?),
+    };
     let mut recovery_sample_buffer = vec![];
     while is_running() {
         let data = match receiver.recv(Duration::from_millis(500)) {
@@ -389,66 +529,87 @@ pub fn receive_samples_loop(
             Err(ConnectionError::TryAgain(_)) => continue,
             Err(ConnectionError::Other(e)) => return Err(e),
         };
-        let (_, packet) = data.get()?;
 
-        let new_samples = packet
-            .chunks_exact(2)
-            .map(|c| i16::from_ne_bytes([c[0], c[1]]).to_sample::<f32>())
-            .collect::<Vec<_>>();
+        let new_samples: Vec<f32> = if let Some(decoder) = decoder.as_mut() {
+            let mut pcm = Vec::new();
+            if data.had_packet_loss() {
+                // Loss concealment replaces the whole packet, so the raw path's clear-and-fade
+                // machinery does not apply.
+                info!("Audio packet loss! (concealing)");
+                decoder.decode(None, &mut pcm)?;
+            }
+            let (_, packet) = data.get()?;
+            decoder.decode(Some(packet), &mut pcm)?;
+            pcm.into_iter()
+                .map(|sample| sample.to_sample::<f32>())
+                .collect()
+        } else {
+            let (_, packet) = data.get()?;
+            packet
+                .chunks_exact(2)
+                .map(|c| i16::from_ne_bytes([c[0], c[1]]).to_sample::<f32>())
+                .collect::<Vec<_>>()
+        };
 
         let mut sample_buffer_ref = sample_buffer.lock();
 
-        if data.had_packet_loss() {
-            info!("Audio packet loss!");
+        if decoder.is_some() {
+            // Opus: a lost packet was already replaced by concealment above, so the raw path's
+            // clear-and-fade recovery machinery does not apply. Overflow is handled below.
+            sample_buffer_ref.extend(&new_samples);
+        } else {
+            if data.had_packet_loss() {
+                info!("Audio packet loss!");
 
-            if sample_buffer_ref.len() / channels_count < batch_frames_count {
-                sample_buffer_ref.clear();
-            } else {
-                // clear remaining samples
-                sample_buffer_ref.drain(batch_frames_count * channels_count..);
-            }
-
-            recovery_sample_buffer.clear();
-        }
-
-        if sample_buffer_ref.len() / channels_count < batch_frames_count {
-            recovery_sample_buffer.extend(sample_buffer_ref.drain(..));
-        }
-
-        if sample_buffer_ref.is_empty() || data.had_packet_loss() {
-            recovery_sample_buffer.extend(&new_samples);
-
-            if recovery_sample_buffer.len() / channels_count
-                > average_buffer_frames_count + batch_frames_count
-            {
-                // Fade-in
-                for f in 0..batch_frames_count {
-                    let volume = f as f32 / batch_frames_count as f32;
-                    for c in 0..channels_count {
-                        recovery_sample_buffer[f * channels_count + c] *= volume;
-                    }
+                if sample_buffer_ref.len() / channels_count < batch_frames_count {
+                    sample_buffer_ref.clear();
+                } else {
+                    // clear remaining samples
+                    sample_buffer_ref.drain(batch_frames_count * channels_count..);
                 }
 
-                if data.had_packet_loss()
-                    && sample_buffer_ref.len() / channels_count == batch_frames_count
+                recovery_sample_buffer.clear();
+            }
+
+            if sample_buffer_ref.len() / channels_count < batch_frames_count {
+                recovery_sample_buffer.extend(sample_buffer_ref.drain(..));
+            }
+
+            if sample_buffer_ref.is_empty() || data.had_packet_loss() {
+                recovery_sample_buffer.extend(&new_samples);
+
+                if recovery_sample_buffer.len() / channels_count
+                    > average_buffer_frames_count + batch_frames_count
                 {
-                    // Add a fade-out to make a cross-fade.
+                    // Fade-in
                     for f in 0..batch_frames_count {
-                        let volume = 1. - f as f32 / batch_frames_count as f32;
+                        let volume = f as f32 / batch_frames_count as f32;
                         for c in 0..channels_count {
-                            recovery_sample_buffer[f * channels_count + c] +=
-                                sample_buffer_ref[f * channels_count + c] * volume;
+                            recovery_sample_buffer[f * channels_count + c] *= volume;
                         }
                     }
 
-                    sample_buffer_ref.clear();
-                }
+                    if data.had_packet_loss()
+                        && sample_buffer_ref.len() / channels_count == batch_frames_count
+                    {
+                        // Add a fade-out to make a cross-fade.
+                        for f in 0..batch_frames_count {
+                            let volume = 1. - f as f32 / batch_frames_count as f32;
+                            for c in 0..channels_count {
+                                recovery_sample_buffer[f * channels_count + c] +=
+                                    sample_buffer_ref[f * channels_count + c] * volume;
+                            }
+                        }
 
-                sample_buffer_ref.extend(recovery_sample_buffer.drain(..));
-                info!("Audio recovered");
+                        sample_buffer_ref.clear();
+                    }
+
+                    sample_buffer_ref.extend(recovery_sample_buffer.drain(..));
+                    info!("Audio recovered");
+                }
+            } else {
+                sample_buffer_ref.extend(&new_samples);
             }
-        } else {
-            sample_buffer_ref.extend(&new_samples);
         }
 
         // todo: use smarter policy with EventTiming
@@ -531,6 +692,7 @@ pub fn play_audio_loop(
     sample_rate: u32,
     config: AudioBufferingConfig,
     receiver: &mut StreamReceiver<()>,
+    decoding: AudioDecoding,
 ) -> Result<()> {
     // Size of a chunk of frames. It corresponds to the duration if a fade-in/out in frames.
     let batch_frames_count = sample_rate as usize * config.batch_ms as usize / 1000;
@@ -559,6 +721,7 @@ pub fn play_audio_loop(
         channels_count as _,
         batch_frames_count,
         average_buffer_frames_count,
+        decoding,
     )
     .ok();
 

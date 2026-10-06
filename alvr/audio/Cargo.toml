@@ -14,6 +14,7 @@ alvr_sockets.workspace = true
 cpal = "0.16"
 rodio = "0.21"
 serde = "1"
+opusic-sys = "0.5"
 
 [target.'cfg(windows)'.dependencies]
 widestring = "1"

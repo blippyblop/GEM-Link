@@ -665,6 +665,70 @@ fn connection_pipeline(
 
     let initial_settings = session_manager_lock.settings().clone();
 
+    // Audio codec negotiation: the client advertises what it can decode and encode; the server
+    // picks and announces the choice. The Linux dev server keeps raw PCM for now (its PipeWire
+    // speaker-capture path is raw-only); the shipping Windows server does Opus both directions.
+    let audio_codec = if cfg!(target_os = "linux") {
+        alvr_session::AudioCodec::Raw
+    } else {
+        match initial_settings.audio.codec {
+            alvr_session::AudioCodec::Opus
+                if streaming_caps.audio_codecs & alvr_packets::AUDIO_CODEC_OPUS_BIT != 0 =>
+            {
+                alvr_session::AudioCodec::Opus
+            }
+            _ => alvr_session::AudioCodec::Raw,
+        }
+    };
+    let opus_audio = audio_codec == alvr_session::AudioCodec::Opus;
+    if opus_audio {
+        info!("Audio codec: Opus (low latency, in-band FEC on the microphone)");
+    } else {
+        info!("Audio codec: raw PCM");
+    }
+
+    let audio_encoding = if opus_audio {
+        alvr_audio::AudioEncoding::Opus {
+            application: alvr_audio::Application::LowDelay,
+            frame_ms: 10,
+            bitrate_bps: 96_000,
+            inband_fec: false,
+            dtx: false,
+            expected_loss_percent: 0,
+        }
+    } else {
+        alvr_audio::AudioEncoding::Raw
+    };
+
+    // The microphone path runs in VoIP mode with in-band FEC: that is vrlink's "Audio FEC"
+    // property, done inside the codec. A lost mic packet is concealed, not a hole.
+    let mic_encoding = if opus_audio {
+        alvr_audio::AudioEncoding::Opus {
+            application: alvr_audio::Application::Voip,
+            frame_ms: 20,
+            bitrate_bps: 24_000,
+            inband_fec: true,
+            dtx: true,
+            expected_loss_percent: 10,
+        }
+    } else {
+        alvr_audio::AudioEncoding::Raw
+    };
+
+    let mic_decoding = if opus_audio && streaming_caps.microphone_sample_rate > 0 {
+        alvr_audio::AudioDecoding::Opus {
+            sample_rate: alvr_audio::nearest_opus_rate(streaming_caps.microphone_sample_rate),
+            frame_ms: 20,
+        }
+    } else {
+        alvr_audio::AudioDecoding::Raw
+    };
+    // The playback rate must equal the decode rate.
+    let mic_playback_rate = match mic_decoding {
+        alvr_audio::AudioDecoding::Opus { sample_rate, .. } => sample_rate,
+        alvr_audio::AudioDecoding::Raw => streaming_caps.microphone_sample_rate,
+    };
+
     // Fresh instrumentation per session: counters that accumulate across connections are
     // worse than none, because they look like a rate.
     crate::reset_send_gate();
@@ -961,6 +1025,14 @@ fn connection_pipeline(
             0
         };
 
+    // With Opus the stream rate must be one libopus accepts; the capture path maps the device
+    // rate the same way, so encoder and decoder agree.
+    let game_audio_sample_rate = if opus_audio && game_audio_sample_rate != 0 {
+        alvr_audio::nearest_opus_rate(game_audio_sample_rate)
+    } else {
+        game_audio_sample_rate
+    };
+
     let wired = client_ip.is_loopback();
 
     dbg_connection!("connection_pipeline: send streaming config");
@@ -970,6 +1042,7 @@ fn connection_pipeline(
             view_resolution: transcoding_view_resolution,
             refresh_rate_hint: fps,
             game_audio_sample_rate,
+            audio_codec,
             foveated_encoding,
             encoding_gamma,
             enable_hdr,
@@ -1185,9 +1258,9 @@ fn connection_pipeline(
                                         / report_interval.as_secs_f64())
                                         as u32;
                                     last_reported_datagrams = now_sent;
-                                    report_interval = now.saturating_sub(last_report_at).max(
-                                        Duration::from_millis(1),
-                                    );
+                                    report_interval = now
+                                        .saturating_sub(last_report_at)
+                                        .max(Duration::from_millis(1));
                                     last_report_at = now;
                                     manager.report_client_read_rate(read_per_sec, offered);
                                 }
@@ -1278,10 +1351,8 @@ fn connection_pipeline(
                 // a frame the client is holding — the loop closes on itself, and only an intra frame
                 // the client can present opens it.
                 let acknowledged = video_sender.client_acked_frame().is_some()
-                    && !video_sender.acknowledgements_stale(
-                        timebase.from_local(arrived),
-                        ACK_STALE_AFTER,
-                    );
+                    && !video_sender
+                        .acknowledgements_stale(timebase.from_local(arrived), ACK_STALE_AFTER);
                 let observed_parity = video_sender.stats().overhead_fraction() as f32;
                 video_sender.set_stop_and_wait(!acknowledged);
                 video_sender.set_frame_divisor({
@@ -1358,8 +1429,7 @@ fn connection_pipeline(
                         .bitrate_manager
                         .lock()
                         .effective_bitrate_bps()
-                        .unwrap_or(0.0)
-                        as f64
+                        .unwrap_or(0.0) as f64
                         / 1e6;
                     let (divisor, read_ceiling, budget) = {
                         let manager = ctx.bitrate_manager.lock();
@@ -1447,6 +1517,7 @@ fn connection_pipeline(
                         &device,
                         2,
                         config.mute_when_streaming,
+                        audio_encoding,
                     ) {
                         error!("Audio record error: {e:?}");
                     }
@@ -1502,9 +1573,10 @@ fn connection_pipeline(
                 },
                 &sink,
                 1,
-                streaming_caps.microphone_sample_rate,
+                mic_playback_rate,
                 config.buffering,
                 &mut microphone_receiver,
+                mic_decoding,
             ));
         })
     } else {
@@ -1547,6 +1619,9 @@ fn connection_pipeline(
                     audio_info,
                     &mut microphone_receiver,
                     mic,
+                    // The Linux dev server keeps raw PCM: its PipeWire speaker capture has no
+                    // encoder path yet, so it negotiates Raw and both directions follow.
+                    alvr_audio::AudioDecoding::Raw,
                 );
             })
         } else {
