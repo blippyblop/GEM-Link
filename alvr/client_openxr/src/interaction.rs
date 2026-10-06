@@ -59,6 +59,9 @@ fn get_controller_offset(platform: Platform, is_right_hand: bool) -> Pose {
             position: Vec3::new(0.0, 0.0, 0.055),
             orientation: Quat::IDENTITY,
         },
+        // The Frame: measured on hardware at first light; identity until then. The grip-pose
+        // convention above (Z down the grip, X out of the palm) still applies.
+        Platform::SteamFrame => Pose::IDENTITY,
         _ => Pose::IDENTITY,
     };
 
@@ -217,6 +220,11 @@ impl InteractionContext {
             p if p.is_pico() => PICO4S_CONTROLLER_PROFILE_PATH,
             p if p.is_vive() => FOCUS3_CONTROLLER_PROFILE_PATH,
             p if p.is_yvr() => YVR_CONTROLLER_PROFILE_PATH,
+            // The Frame: the device runtime advertises this profile itself (verified in the
+            // firmware we hold: vrclient.so carries
+            // /interaction_profiles/valve/frame_controller[_valve], and vrlink binds the same
+            // paths it covers — capsense, dpad, bumper, view included).
+            p if p.is_steam_frame() => FRAME_CONTROLLER_PROFILE_PATH,
             _ => QUEST_CONTROLLER_PROFILE_PATH,
         };
         let controllers_profile_id = alvr_common::hash_string(controllers_profile_path);
@@ -300,6 +308,13 @@ impl InteractionContext {
             "/user/hand/right/input/aim/pose",
         ));
 
+        // Haptics are the only bindings the Frame runtime may not carry (vrlink's binary shows
+        // legacy SteamVR haptic actions, not an OpenXR output path), and a suggestion is atomic:
+        // one unknown path fails the whole batch. Everything else is poses and buttons; on a
+        // failed full suggestion, retry without the haptics rather than lose input — and if
+        // that fails too, say so and run without controller bindings instead of taking the
+        // session down.
+        let haptic_bindings_start = bindings.len();
         bindings.push(binding(
             &left_vibration_action,
             "/user/hand/left/output/haptic",
@@ -309,6 +324,10 @@ impl InteractionContext {
             "/user/hand/right/output/haptic",
         ));
 
+        let multimodal_handle = check_ext_object(
+            "MultimodalMeta",
+            MultimodalMeta::new(xr_session.clone(), xr_system),
+        );
         let multimodal_handle = check_ext_object(
             "MultimodalMeta",
             MultimodalMeta::new(xr_session.clone(), xr_system),
@@ -349,15 +368,41 @@ impl InteractionContext {
             ));
         }
 
-        // Apply bindings:
-        xr_instance
-            .suggest_interaction_profile_bindings(
-                xr_instance
-                    .string_to_path(controllers_profile_path)
-                    .unwrap(),
-                &bindings,
-            )
+        // Apply bindings — with the degrade ladder described above: full set, then no haptics,
+        // then an error and a session without controller input.
+        let profile_path = xr_instance
+            .string_to_path(controllers_profile_path)
             .unwrap();
+        match xr_instance.suggest_interaction_profile_bindings(profile_path, &bindings) {
+            Ok(()) => info!(
+                "interaction profile {controllers_profile_path}: {} bindings (with haptics)",
+                bindings.len()
+            ),
+            Err(full_error) => {
+                warn!("binding suggestion failed ({full_error}); retrying without haptics");
+                let without_haptics: Vec<_> = bindings
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        !(haptic_bindings_start..haptic_bindings_start + 2).contains(index)
+                    })
+                    .map(|(_, binding)| *binding)
+                    .collect();
+                match xr_instance
+                    .suggest_interaction_profile_bindings(profile_path, &without_haptics)
+                {
+                    Ok(()) => info!(
+                        "interaction profile {controllers_profile_path}: {} bindings \
+                         (no haptics)",
+                        without_haptics.len()
+                    ),
+                    Err(e) => error!(
+                        "binding suggestion failed again ({e}); continuing WITHOUT controller \
+                         bindings — inputs will not work this session"
+                    ),
+                }
+            }
+        }
 
         let left_grip_space = left_grip_action
             .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)

@@ -221,6 +221,13 @@ pub fn entry_point(display: DisplayConnection) {
         | Platform::Pico4Enterprise => ("_pico_old", LEGACY_OPENXR_VERSION),
         p if p.is_vive() => ("", LEGACY_OPENXR_VERSION),
         p if p.is_yvr() => ("_yvr", LEGACY_OPENXR_VERSION),
+        // The Frame's bundled runtime is OpenXR 1.0 (1.0.3.16 in the firmware we hold), and the
+        // provisional platform cannot know yet that this is the Frame — the runtime has not
+        // answered at this point. On aarch64 Linux, ask for 1.0: a 1.1 runtime must accept it,
+        // while a 1.0 runtime rejects a 1.1 request outright.
+        p if std::env::consts::OS == "linux" && std::env::consts::ARCH == "aarch64" => {
+            ("", LEGACY_OPENXR_VERSION)
+        }
         _ => ("", CURRENT_OPENXR_VERSION),
     };
     // Where the loader lives is a deployment fact, not a constant. On the Frame it sits in
