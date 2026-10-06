@@ -7,6 +7,15 @@ Consolidated 2026-10-01 ([ADR-0010](docs/adr/ADR-0010-goals-and-gates-consolidat
 other docs link here instead of restating the targets. If a number appears in two
 places, this file wins.*
 
+> **Status refresh 2026-10-05** (session 18; detail in
+> `VD_RE/53-session-18-loss-stops-poisoning.md`): the media plane is wired **end to end, both
+> directions** — the server sends through it and the client acknowledges what it decodes — and a
+> live SteamVR session reached **389 frames presented, 0 held, 0 holes, 385 acks** on the emulated
+> client (from 2 presented / 1027 holes / 0 acks at the start of the session). The root cause of
+> the holes was `fec_repairable` counting parity the frame declared but did not have. The device
+> client **builds** for aarch64-linux; it has not yet run on hardware, so decode, presentation and
+> the field half of the score remain the open work (M3).
+
 ## North star
 
 One device, tuned relentlessly: the **Steam Frame** — 2160×2160/eye LCD (panel
@@ -59,7 +68,9 @@ hardware test — never an opinion. Status is per 2026-10-01.
 1. **SteamVR is the primary path; desktop is the modular second source** (ADR-0005,
    ADR-0009).
    *Measured by:* the `frame_*` gating scenarios **and** a hardware session log.
-   **Status:** server half ✅ (2026-10-01) · client half ⬜ (M3).
+   **Status:** server half ✅ (2026-10-01) · client half 🚧 — the receive path is the real one and is
+   proven against the live streamer under qemu (session 18: 389 presented / 0 held / 385 acks);
+   what is unproven is on-device decode + presentation (M3, ⛔ needs hardware).
 2. **The envelope holds** — 2160²-class presets at 90–120 Hz inside 300 Mbps using
    **gaze-driven foveated encoding** (HEVC/H.264 on the Frame; its kernel decodes
    neither AV1 nor 10-bit today, ADR-0008 — fixed foveation is the fallback).
@@ -95,7 +106,12 @@ hardware test — never an opinion. Status is per 2026-10-01.
 ### M1 — Latency & trust (weeks 5–12) — **the first shippable target**
 - [x] **SteamVR source (`server_openvr`) builds + streams as Source #1** (ADR-0005): real HL2 VR → SteamVR compositor → GemLink driver → NVENC → UDP → real `client_core`, ~70 fps (2026-10-01)
 - [x] `x-crypto`: Noise-XX handshake + AEAD transport (ADR-0006), identity fingerprints + pairing pins + tamper tests; `bench secure` gated
-- [ ] **Wire the encryption end-to-end** — `SecureControlSocket` into `client_core`/`server_core`, plus media-plane key derivation and per-datagram AEAD. Design trap: the secure control socket holds **one** `NoiseSocket` behind a `Mutex` — it must not go on the video hot path; the media plane needs per-packet nonce/sequence without a shared lock. (Closes DoD #5 / the SECURITY.md promise.)
+- [x] **Wire the encryption end-to-end** — `SecureControlSocket` into `client_core`/`server_core`,
+  plus media-plane key derivation and per-datagram AEAD. The design trap was real and cost a
+  session: the media key exchange deadlocked between two real ends (the initiator's last Noise
+  message has no reply, so the server waited on one), fixed and regression-tested
+  (`94030ba5`). Media datagrams are sealed under a derived key and a client that demands sealed
+  media receives every frame. (Closes DoD #5 / the SECURITY.md promise.)
 - [x] Gaze pipeline: OpenXR eye-gaze (Frame) → predicted foveation centers → encoder per-frame centers
 - [x] **Gaze tier measured (2026-10-01, `bench gaze` — real driver math, CI-gated):** 90 %-settle **66.7 ms** (2.2× the 30 ms gaze-filter τ), effective sweep-tracking lag **22 ms**, per-sample update cost **~2 µs** (≤100 µs gate)
 - [ ] Zero-copy GPU pipeline (DDA texture → encoder, no CPU stage) + per-frame metadata sidecar (timestamps, foveation params, motion vectors)
@@ -103,6 +119,11 @@ hardware test — never an opinion. Status is per 2026-10-01.
 - [ ] Explain `refresh=72 Hz` — the HMD negotiates 72 against a 90–120 Hz envelope (`steamvr_hmd_init_config`; the harness advertises `[60,72,80,90,120]`)
 - **Gate → `v0.2.0` = the first shippable target:** SteamVR path end-to-end (real session → driver → encoder → stream) **and** an end-to-end encrypted session; gaze tracks scripted gaze ≤ 1 frame behind; encode-path drop below M0.
   - *Measured 2026-10-01:* video path ✅ (server half, real game); gaze lag 22 ms ✅; encrypted scenario green ✅ — **wiring still open**.
+  - *Measured 2026-10-05 (session 18):* **wiring closed** — secure control plane + per-datagram
+    media AEAD under derived nonces, live between the real streamer and the real client; a client
+    that refuses unsealed media delivers zero frames, and the key-exchange deadlock between two
+    real ends is fixed and regression-tested. What is left for `v0.2.0` is the client on hardware
+    (M3).
 
 ### M2 — Desktop mode (second source plug-in; weeks 9–20)
 - [x] `x-dda`: `DuplicateOutput1` capture built and exercised — `LastPresentTime` gating, immediate release, protected-content refusal
@@ -110,12 +131,20 @@ hardware test — never an opinion. Status is per 2026-10-01.
 - [ ] `x-dda` HDR formats + suspend/resume; multi-monitor + per-session LUID pinning
 - **Gate → `v0.3.0`:** desktop session streamed **without SteamVR installed** (the modular second source; the SteamVR path stays primary)
 
-### M3 — Client & runtime (weeks 15–32) 🚧 **long pole — the device side is at zero**
+### M3 — Client & runtime (weeks 15–32) 🚧 **long pole — nothing has run on hardware yet**
 - [x] **Runtime decided: stay on Valve's SteamVR runtime** (ADR-0009) — the client is an OpenXR application on the bundled runtime; a second runtime is out of scope. No GPL code merge.
-- [ ] Frame client binary: `client_core` port to aarch64 Linux — **the Android→Linux port *is* this milestone**: 39 `#[cfg(target_os = "android")]` gates across `client_core` (22), `client_openxr` (11), `system_info` (6). Entry point (`c_api.rs` is JNI-only; `graphics.rs::session_create_info` is `unimplemented!()`), `Platform::SteamFrame`, GLES `SessionCreateInfo` (the vendored `openxr-0.21.1` opengles arm is Android-only), interaction gates
+- [x] **Frame client binary, built** (`client_core` port to aarch64 Linux): the Linux entry point,
+  `Platform::SteamFrame`, the GLES session-info path and the display binding landed in session 14;
+  session 18 confirmed the whole client crate **builds and links for aarch64-linux in this
+  container** (`cargo build --bin alvr_client_openxr --target aarch64-unknown-linux-gnu`).
+  🚧 **It has never executed on hardware** — first run, then V4L2 decode, then GL presentation are
+  the remaining items, phased in `VD_RE/53-session-18-loss-stops-poisoning.md` §5.
 - [ ] **Linux client audio** — `client_core::audio` is `#[cfg(target_os = "android")]` (NDK) and the module only exists on Android. `alvr_audio` already ships a Linux path (`cpal` + `linux.rs::try_load_pipewire()`), so this is plumbing rather than research. Not optional — there is no "audio off" flag.
-- [ ] **V4L2 iris decode backend** (`client_core/src/video_decoder` currently has Android/MediaCodec only)
-- [ ] Presentation into the Frame's native compositor
+- [x] **V4L2 iris decode backend exists** (`client_core/src/video_decoder/v4l2/` — the Frame's
+  stateful M2M path, modelled on Valve's `SVLCodecV4L2`). 🚧 written, never opened a `/dev/videoN`;
+  `sudo modprobe vicodec` on pavserv remains the one-command unblock for testing it off-device.
+- [ ] Presentation into the Frame's native compositor — the staging/display code exists
+  (`graphics/src/staging.rs`, cleared to a no-signal grey rather than black) and has never run.
 - [ ] **Client-side de-foveation + sharpen** — today we spend the foveation bitrate saving and recover nothing; without it the 300 Mbps envelope is not real (DoD #2)
 - [ ] Client-side extrapolation (synthesis-once rule), using the Phase-1 sidecar
 - **Gate → `v0.4.0`:** GemLink server → Frame client end-to-end on the SteamVR runtime; CTS count published.
@@ -124,7 +153,10 @@ hardware test — never an opinion. Status is per 2026-10-01.
 - [ ] Frame-agnostic typed chunks (video/audio/tracking/events), per-class reliability; **media-plane AEAD** (with M1)
 - [x] **The media plane itself** (`x-transport`, [ADR-0013](docs/adr/ADR-0013-media-plane.md)): fixed-width frame-indexed packetisation, striped GF(2⁸) Cauchy FEC, a pacer that backpressures instead of discarding, per-datagram AEAD with **derived** nonces (so loss cannot desynchronise the cipher), and a receiver whose output type cannot carry an unreconstructable frame. 72 unit tests.
 - [x] **Measured in the bench** (`bench transport`, CI-gated): every impairment profile plus controls that prove the mechanisms are doing work. At 300 Mbps / 90 Hz / 1400-byte MTU (≈300 datagrams per frame — the size that forced the FEC to be striped): **100 % of frames delivered at up to 1.07 % datagram loss**, against **0–12.5 %** for the same links with the FEC off; **0 frames presented without a payload** on every scenario.
-- [ ] **Not wired.** `server_core` still sends through `alvr_sockets`; the live path is untouched. This is also where ADR-0011's send-side half belongs (suppress rather than transmit a frame whose reference was just discarded).
+- [x] **Wired, both directions** (session 18): `server_core` sends through the media plane and the
+  client's receiver report flows back; ADR-0011's send-side half is in force (`SendGate` holds on a
+  stated reference rather than on a keyframe), and the client-side gate now presents across holes
+  on a confirmed reference — measured 389 presented / 0 held on the emulated client.
 - [ ] **Burst loss is not modelled.** The bench's loss is i.i.d. per datagram, which is kinder than reality; the block interleaving exists for bursts specifically and is not yet exercised by one.
 - [ ] **Congestion is not modelled.** The pacer takes its rate as an input. A real controller and the media plane must not be tuned against each other without a scenario that separates them.
 - [ ] Hot codec/config/foveation switch (no teardown)
@@ -136,7 +168,11 @@ hardware test — never an opinion. Status is per 2026-10-01.
 - [ ] **Measure the WLAN optimizer** — it has never been A/B'd. The instrument is its own log line (per interface, per opcode, before and after); the experiment is the delivery tail on `frame_wifi7_160` with the setting on and off **within one capture** (the grey-frame lesson: the link's own noise is larger than the effect). Until that runs this is parity, not an improvement.
 - [ ] **Measure host scheduling** — same shape: the instrument is the `SchedReport` log line, the experiment is the delivery tail with `connection.host_scheduling` on and off. The claim ("the 15.6 ms tick is quantising our waits") is checkable directly by timing the send loop with the setting off.
 - [ ] **Live cross-machine latency** — a round-trip probe on the control channel (sequence number echoed by the client), an EWMA/min-filter estimator, and somewhere to show it. This is also DoD #3's missing instrument, so it is the highest-value item left in this group.
-- [ ] **Client-measured bandwidth → bitrate** — VD has the client measure and report; we estimate server-side. `ClientStatistics` gains a field, and the adaptive bitrate consumes it.
+- [x] **Client-measured delivery → sender rate** (session 18): the client reports datagrams read/s,
+  the missing-shard share, the drain spread and acknowledgements (cursor + bitmap); the sender
+  solves a delivery budget from it (70 % of the measured rate), then the frame rate and bytes per
+  frame, with a stop-and-wait bootstrap sized to that budget. Known gap: the loop settles into any
+  self-consistent rate, so the sender still needs its **probe burst** to find the real ceiling.
 - [ ] **In-VR link state** — the data exists now (`LinkResolution`); nothing renders it. The peer could also report its own class, retiring the hidden-SSID heuristic.
 - [ ] SoftAP-topology aware discovery (server joins the Frame AP or NCM tether); known RF failure modes as bench profiles (reg-race TX cap, CQM churn, GI/LTF pinning)
 - **Gate → `v0.5.0`:** mid-session codec switch, zero dropped frames on the impairment profiles
@@ -157,3 +193,13 @@ hardware test — never an opinion. Status is per 2026-10-01.
 - **Nothing measures trustworthiness of a displayed frame.** The client reported "0 errors, 0 skipped" while 41 % of the frames it displayed were HEVC reconstruction garbage from dropped references (ADR-0011). Until "frames displayed that could not be reconstructed" is counted, the never-show-a-bogus-frame gate has no instrument.
 - **CI builds neither `client_core` nor the harnesses** (`x-framesim`, `x-pcsim`) — "main stays shippable" and "measured, not vibes" both have a hole exactly where the newest code lives.
 - **No glass-to-glass measurement exists** (no shared clock between PC and client), so DoD #3's field bar is **⛔ blocked on hardware** and every "is it good enough vs X" question is currently unanswerable. See `docs/BENCH.md` §"Not yet measured".
+
+> **Refresh 2026-10-05 (session 18):** the *first* gap is closed on the emulated path — the trust
+> gate counts held/untrusted frames by reason and the sender counts every refusal, so "frames the
+> client could not reconstruct" is now a first-class number (`held_*`, `frames_abandoned`,
+> `frames_unacked`); run r41 measured **0 held / 0 holes** with the gate idle, which is the
+> ADR-0011 gate passing its first live measurement. The other two gaps stand. One new gap, found
+> live: **the delivery budget can only measure what the sender offered**, so without a periodic
+> probe burst it converges on any self-consistent rate — 222 datagrams/s and 21 datagrams/s were
+> both "the ceiling" on the same client, in runs an hour apart. That is the top transport item
+> left (`53-session-18-loss-stops-poisoning.md` §5).
