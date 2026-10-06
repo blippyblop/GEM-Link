@@ -10,6 +10,7 @@ license.workspace = true
 alvr_common.workspace = true
 alvr_session.workspace = true
 alvr_sockets.workspace = true
+alvr_packets.workspace = true
 
 cpal = "0.16"
 rodio = "0.21"
