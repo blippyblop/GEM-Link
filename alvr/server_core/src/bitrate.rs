@@ -383,7 +383,9 @@ impl BitrateManager {
     /// spend a keyframe on a client that cannot receive one. See [`Self::degrade_divisor`].
     pub fn is_degrading(&self) -> bool {
         self.degrade_divisor > 1
-            || self.client_missing_permille.is_some_and(|m| m as u32 > NACK_DROWNING_PERMILLE)
+            || self
+                .client_missing_permille
+                .is_some_and(|m| m as u32 > NACK_DROWNING_PERMILLE)
     }
 
     /// Record that the client decoded a frame. See [`ClientAck`].
@@ -553,7 +555,8 @@ impl BitrateManager {
         let nominal_bitrate_bps = match &config.mode {
             BitrateMode::ConstantMbps(bitrate_mbps) => *bitrate_mbps as f32 * 1e6,
             BitrateMode::Adaptive {
-                max_throughput_mbps, ..
+                max_throughput_mbps,
+                ..
             } => match max_throughput_mbps {
                 Switch::Enabled(mbps) => *mbps as f32 * 1e6,
                 Switch::Disabled => 0.0,
@@ -663,9 +666,9 @@ impl BitrateManager {
             let latency_budget_us = self.nominal_frame_interval.as_micros() as f32;
             // Quality is the third rung: it is the bitrate that comes down, and only once the frame
             // rate has already been reduced to its floor.
-            let by_deficit = self.client_missing_permille.map(|missing| {
-                bitrate_bps * (1.0 - missing.min(1000) as f32 / 1000.0).max(0.05)
-            });
+            let by_deficit = self
+                .client_missing_permille
+                .map(|missing| bitrate_bps * (1.0 - missing.min(1000) as f32 / 1000.0).max(0.05));
             // The same number, carried forward as state: the deficit says how much too much is being
             // sent, and the answer has to survive between reports or the rate climbs straight back to
             // the setting the moment a report reads clean.
@@ -810,7 +813,8 @@ impl BitrateManager {
             let nominal_fps = 1.0 / self.nominal_frame_interval.as_secs_f32().max(1e-6);
             let target_fps = self.frame_rate_for_budget(nominal_fps);
             if target_fps > 0.0 {
-                return ((nominal_fps / target_fps).round() as u32).clamp(1, DEGRADE_MAX_FRAME_DIVISOR);
+                return ((nominal_fps / target_fps).round() as u32)
+                    .clamp(1, DEGRADE_MAX_FRAME_DIVISOR);
             }
         }
 
@@ -841,6 +845,8 @@ impl BitrateManager {
         //    it completes are the small ones, and it completes them promptly. This rung is a
         //    controller with state — see `report_client_missing` — because the answer to "a third of
         //    every frame is missing" is a *rate*, not a multiple of the last sample.
-        by_queue.max(self.degrade_divisor).min(DEGRADE_MAX_FRAME_DIVISOR)
+        by_queue
+            .max(self.degrade_divisor)
+            .min(DEGRADE_MAX_FRAME_DIVISOR)
     }
 }

@@ -681,12 +681,18 @@ impl ServerCoreContext {
     /// long as the bitrate stayed still.
     /// Whether the stream is in its bootstrap. See `BitrateManager::is_bootstrap`.
     pub fn client_bootstrapping(&self) -> bool {
-        self.connection_context.bitrate_manager.lock().is_bootstrap()
+        self.connection_context
+            .bitrate_manager
+            .lock()
+            .is_bootstrap()
     }
 
     /// Whether the degradation ladder is engaged. See `BitrateManager::is_degrading`.
     pub fn client_degrading(&self) -> bool {
-        self.connection_context.bitrate_manager.lock().is_degrading()
+        self.connection_context
+            .bitrate_manager
+            .lock()
+            .is_degrading()
     }
 
     pub fn client_ack_state(&self) -> (bool, u64, u64) {

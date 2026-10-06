@@ -1090,7 +1090,10 @@ mod tests {
         }
         for event in plane.release(now + Duration::from_millis(20)) {
             if let PlaneEvent::Present { frame_index, .. } = event {
-                assert!(plane.on_decoded(frame_index), "frame {frame_index} decoded twice");
+                assert!(
+                    plane.on_decoded(frame_index),
+                    "frame {frame_index} decoded twice"
+                );
             }
         }
         assert_eq!(plane.stats().frames_presented, 4);

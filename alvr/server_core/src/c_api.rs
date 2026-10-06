@@ -576,7 +576,6 @@ pub unsafe extern "C" fn alvr_get_dynamic_encoder_params(
     }
 
     false
-    
 }
 
 #[unsafe(no_mangle)]
