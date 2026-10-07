@@ -69,3 +69,9 @@ the session environment from the running compositor process
 - Loader: `/opt/steamvr/bin/linuxarm64/libopenxr_loader.so`
 - Runtime manifest: `/opt/steamvr/steamxr_linuxarm64.json` (SteamVR 2.17.10, OpenXR 1.0)
 - Valve's own launcher: `/opt/steamvr/tools/vrlink/bin/linuxarm64/run_vrlink.sh`
+
+## Toolchain reference
+
+How the binary was built and how to rebuild it: `/workspace/tools/README-frame-build.md`
+(cross toolchain, cmake-based deps, qemu verification against the firmware rootfs,
+troubleshooting index). The agent-facing summary is the `frame-compile` skill.
