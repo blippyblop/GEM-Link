@@ -8351,6 +8351,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "x-compare"
+version = "0.1.0"
+dependencies = [
+ "alvr_common",
+ "anyhow",
+]
+
+[[package]]
 name = "x-crypto"
 version = "21.0.0-dev14"
 dependencies = [

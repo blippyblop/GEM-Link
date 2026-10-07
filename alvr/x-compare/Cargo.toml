@@ -1,0 +1,15 @@
+[package]
+name = "x-compare"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alvr_common.workspace = true
+anyhow = "1"
+
+
+[[bin]]
+name = "x-compare"
+path = "src/main.rs"
